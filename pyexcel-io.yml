@@ -1,0 +1,47 @@
+overrides: "pyexcel.yaml"
+project: "pyexcel-io"
+name: pyexcel-io
+nick_name: io
+version: 0.6.8
+current_version: 0.6.8
+release: 0.6.8
+copyright_year: 2015-2026
+moban_command: false
+is_on_conda: true
+dependencies:
+  - lml>=0.0.4
+test_dependencies:
+  - pyexcel
+  - pyexcel-xls==0.5.9
+  - SQLAlchemy
+  - pyexcel-xlsxw
+  - chardet
+  - pytest
+  - PyYAML
+extra_dependencies:
+  - extra:
+    - chardet
+  - xls:
+    - pyexcel-xls>=0.6.0
+  - xlsx:
+    - pyexcel-xlsx>=0.6.0
+  - ods:
+    - pyexcel-ods3>=0.6.0
+keywords:
+  - API
+  - tsv
+  - tsvz
+  - csv
+  - csvz
+  - django
+  - sqlalchemy
+sphinx_extensions:
+  - sphinx.ext.autosummary
+  - sphinx.ext.doctest
+  - sphinx.ext.intersphinx
+  - sphinx.ext.viewcode
+  - sphinx.ext.autodoc
+description: A python library to read and write structured data in csv, zipped csv format and to/from databases
+python_requires: ">=3.6"
+min_python_version: "3.6"
+use_pytest: true
