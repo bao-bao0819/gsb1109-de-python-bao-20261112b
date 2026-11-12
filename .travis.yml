@@ -1,0 +1,30 @@
+language: python
+
+dist: focal
+
+python:
+  - "2.7"
+  - "3.6"
+  - "3.7"
+  - "3.8"
+  - "3.9"
+  - "3.10"
+  - "3.11"
+  - "3.12"
+  - "pypy"
+  - "pypy3"
+
+sudo: false
+
+matrix:
+  fast_finish: true
+
+install:
+  - pip install tox-travis
+  - pip install codecov
+
+script:
+  - tox
+
+after_success:
+  - codecov
