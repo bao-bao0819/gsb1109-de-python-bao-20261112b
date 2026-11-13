@@ -5,6 +5,18 @@ Change Log
 ==========
 
 
+Unreleased
+==========
+
+* New ``fitodo`` command and :mod:`fitdecode.odometer` module: audit the
+  wrapping cumulative odometer (``record.distance``). Given a known maximum
+  speed, each gap between two absolute readings is reported as uniquely
+  determined, ambiguous (all plausible rollover counts, including a possible
+  device restart, are listed instead of assuming the shortest increment), or
+  impossible, in which case the two conflicting observations are named
+  explicitly.
+
+
 v0.11.0 (2025-08-06)
 ====================
 

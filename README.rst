@@ -62,6 +62,14 @@ multiples times::
     $ # exclude FILE_ID and EVENT messages:
     $ fitjson -f=-file_id -f=-event -o out_file.json in_file.fit
 
+``fitodo`` command audits the wrapping cumulative odometer (``record.distance``)
+of a FIT file. Given a known maximum speed, it lists the distance segments that
+are uniquely determined, the intervals that still admit several explanations
+(rollover and/or device restart), and the pairs of observations that contradict
+each other. It never assumes the shortest increment::
+
+    $ fitodo --max-speed 12 --speed-unit ms -o audit.txt in_file.fit
+
 
 Installation
 ============
