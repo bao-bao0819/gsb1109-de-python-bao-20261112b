@@ -7,6 +7,7 @@ Reference
 
     reference/reader
     reference/processors
+    reference/cleaning
     reference/records
     reference/types
     reference/exceptions

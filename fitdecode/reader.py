@@ -6,6 +6,7 @@ import io
 import struct
 import warnings
 
+from . import cleaning
 from . import processors
 from . import profile
 from . import records
@@ -147,12 +148,21 @@ class FitReader:
       context-sensitive data due to its instance being shared with other readers
       and/or by multiple threads (typically `DefaultDataProcessor`).
 
+    Speed cleaning:
+
+    * *clean_speed* can be set to a true value so that each `FitDataMessage`
+      gets a pre-computed `fitdecode.cleaning.SpeedCleaning` object, available
+      as the `FitDataMessage.cleaning` attribute and through the
+      `FitDataMessage.speed_cleaning` property.
+    * It stays disabled by default to keep decoding fast when the caller only
+      needs the raw decoded fields.
+
     """
 
     def __init__(
             self, fileish, *, processor=_UNSET, check_crc=CrcCheck.WARN,
             error_handling=ErrorHandling.WARN, keep_raw_chunks=False,
-            data_bag=_UNSET):
+            data_bag=_UNSET, clean_speed=False):
         # backward compatibility
         if check_crc is True:
             check_crc = CrcCheck.RAISE
@@ -177,6 +187,7 @@ class FitReader:
         else:
             self._processor = processor
         self._keep_raw = keep_raw_chunks
+        self._clean_speed = bool(clean_speed)
 
         # per-stream state (private)
         self._fd = None  # the file object to read from
@@ -708,7 +719,17 @@ class FitReader:
                             cmp_field,         # field
                             cmp_parent_field,  # parent_field
                             cmp_value,         # value
-                            cmp_raw_value))    # raw_value
+                            cmp_raw_value,     # raw_value
+                            # the component's own scale produced this value, so
+                            # it is its resolution even when the dynamic field
+                            # uses a different scale
+                            expansion_parent=field,
+                            expansion_parent_def_num=field_def.def_num,
+                            quantization_step=(
+                                (1.0 / component.scale)
+                                if component.scale else 1.0),
+                            quantization_units=(
+                                component.units or field.units)))
 
                 decoded_value = self._apply_scale_offset(
                     field, field.render(raw_value))
@@ -763,7 +784,10 @@ class FitReader:
             record_header.time_offset,
             def_mesg,
             message_fields,
-            self._keep_chunk(record_chunks))
+            self._keep_chunk(record_chunks),
+            cleaning=(
+                cleaning.clean_speed(message_fields)
+                if self._clean_speed else None))
 
         if self._processor:
             self._processor.on_process_message(self, data_message)

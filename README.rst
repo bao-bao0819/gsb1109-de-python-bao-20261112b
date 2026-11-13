@@ -62,6 +62,10 @@ multiples times::
     $ # exclude FILE_ID and EVENT messages:
     $ fitjson -f=-file_id -f=-event -o out_file.json in_file.fit
 
+Both commands also accept ``--clean-speed`` to reconcile the speed reported
+directly by a device with speed expanded from combined fields such as
+``compressed_speed_distance``. See `fitdecode.cleaning`.
+
 
 Installation
 ============

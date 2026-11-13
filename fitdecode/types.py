@@ -6,6 +6,8 @@ import struct
 
 __all__ = []
 
+_UNSET = object()
+
 
 class BaseType:
     __slots__ = ('name', 'identifier', 'fmt', 'size', 'parse')
@@ -235,18 +237,63 @@ class DevFieldDefinition:
         return self.field.type
 
 
+_INTEGER_BASE_TYPE_NAMES = frozenset((
+    'enum', 'sint8', 'uint8', 'sint16', 'uint16', 'sint32', 'uint32',
+    'uint8z', 'uint16z', 'uint32z', 'sint64', 'uint64', 'uint64z', 'byte'))
+
+
+def _quantization_step(field):
+    """Resolution of a field's encoded value, in its own units."""
+    if field is None:
+        return None
+
+    scale = field.scale
+    if scale:
+        return 1.0 / scale
+
+    base_type = field.base_type
+    if base_type is not None and base_type.name in _INTEGER_BASE_TYPE_NAMES:
+        return 1.0
+
+    return None
+
+
 class FieldData:
     __slots__ = (
-        'field_def', 'field', 'parent_field', 'value', 'raw_value', 'units')
+        'field_def', 'field', 'parent_field', 'value', 'raw_value', 'units',
+        'expansion_parent', 'expansion_parent_def_num', 'quantization_step',
+        'quantization_units')
 
     def __init__(self, field_def, field, parent_field, value, raw_value,
-                 units=None):
+                 units=None, expansion_parent=None,
+                 expansion_parent_def_num=None, quantization_step=_UNSET,
+                 quantization_units=None):
         self.field_def = field_def  #: `FieldDefinition` object
         self.field = field
         self.parent_field = parent_field
         self.value = value
         self.raw_value = raw_value
         self.units = units
+
+        #: `Field` this field was expanded from, or `None` when the field was
+        #: read directly from the stream. Use together with
+        #: ``expansion_parent_def_num`` to tell apart genuinely distinct
+        #: observations from repeated expansions of the same parent field.
+        self.expansion_parent = expansion_parent
+        #: Definition number of `expansion_parent` in the source message.
+        self.expansion_parent_def_num = expansion_parent_def_num
+
+        #: Resolution of the encoded value, in ``quantization_units``. It is
+        #: kept in the field's native units even when a data processor changes
+        #: ``units`` (e.g. m/s to km/h).
+        if quantization_units is None:
+            quantization_units = field.units if field is not None else units
+        self.quantization_units = quantization_units
+
+        if quantization_step is _UNSET:
+            self.quantization_step = _quantization_step(self.field)
+        else:
+            self.quantization_step = quantization_step
 
         if not self.units and self.field:
             # Default to units on field, otherwise None.

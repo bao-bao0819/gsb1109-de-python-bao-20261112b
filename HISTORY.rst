@@ -5,6 +5,23 @@ Change Log
 ==========
 
 
+v0.12.0 (unreleased)
+====================
+
+* New ``fitdecode.cleaning`` module to reconcile speed values reported
+  directly with values expanded from combined fields such as
+  ``compressed_speed_distance``. Compatibility is decided from each field's
+  quantization step; a common range is exposed when sources agree, and both
+  values plus their provenance are preserved when they do not.
+* `FieldData` gets ``expansion_parent``, ``expansion_parent_def_num`` and
+  ``quantization_step`` so expanded fields can be traced back to their source
+  field. Expansions of the same parent field count as one observation.
+* `FitReader` gets the opt-in ``clean_speed`` argument, and
+  `FitDataMessage` gets the ``cleaning`` attribute and ``speed_cleaning``
+  property.
+* ``fitjson`` and ``fittxt`` get a ``--clean-speed`` option.
+
+
 v0.11.0 (2025-08-06)
 ====================
 

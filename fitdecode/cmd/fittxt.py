@@ -65,6 +65,21 @@ def txt_encode(obj):
             type_name=obj.type.name,
             size=obj.size)
 
+    if isinstance(obj, fitdecode.cleaning.SpeedCleaning):
+        data = obj.as_dict()
+        return PrintableObject(
+            compatible=obj.compatible,
+            units=obj.units,
+            range=data['range'],
+            values=data['values'],
+            observations=obj.observation_count)
+
+    if isinstance(obj, fitdecode.cleaning.SpeedSource):
+        return PrintableObject(**obj.as_dict())
+
+    if isinstance(obj, fitdecode.cleaning.SpeedObservation):
+        return PrintableObject(**obj.as_dict())
+
     if isinstance(obj, fitdecode.types.FieldData):
         return PrintableObject(
             name=obj.name,
@@ -108,7 +123,7 @@ def txt_encode(obj):
             dev_field_defs=obj.dev_field_defs)
 
     if isinstance(obj, fitdecode.FitDataMessage):
-        return PrintableObject(
+        props = dict(
             _label=(
                 f'chunk#{obj.chunk.index} - fit_data - {obj.name} '
                 f'(loc#{obj.local_mesg_num} glob#{obj.global_mesg_num})'),
@@ -119,6 +134,9 @@ def txt_encode(obj):
                 is_developer_data=obj.is_developer_data),
             global_mesg_num=obj.global_mesg_num,
             fields=obj.fields)
+        if obj.cleaning is not None:
+            props['speed_cleaning'] = obj.cleaning
+        return PrintableObject(**props)
 
     if __debug__:
         print(type(obj))
@@ -351,6 +369,13 @@ def parse_args(args=None):
         help='Do not output the extended global stats in header')
 
     parser.add_argument(
+        '--clean-speed', action='store_true',
+        help=(
+            'Reconcile speed values reported directly and speed values '
+            'expanded from combined fields. The reconciled range is printed '
+            'in the data message header.'))
+
+    parser.add_argument(
         '--filter', '-f', action='append',
         help=(
             'Message name(s) (or global numbers) to filter-in or out, '
@@ -391,7 +416,8 @@ def main(args=None):
                 options.infile,
                 processor=fitdecode.StandardUnitsDataProcessor(),
                 check_crc=options.nocrc,
-                keep_raw_chunks=True) as fit:
+                keep_raw_chunks=True,
+                clean_speed=options.clean_speed) as fit:
             for frame in fit:
                 if (options.nodef and
                         frame.frame_type == fitdecode.FIT_FRAME_DEFINITION):

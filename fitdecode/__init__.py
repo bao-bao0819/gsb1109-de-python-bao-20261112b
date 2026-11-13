@@ -10,9 +10,11 @@ from .exceptions import *
 from .records import *
 from .reader import *
 from .processors import *
+from .cleaning import *
 
 from . import types
 from . import profile
 from . import utils
 from . import processors
+from . import cleaning
 from . import reader

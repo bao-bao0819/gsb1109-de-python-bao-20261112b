@@ -55,6 +55,14 @@ class RecordJSONEncoder(json.JSONEncoder):
                 ('def_num', obj.def_num),
                 ('raw_value', obj.raw_value)))
 
+        if isinstance(obj, fitdecode.cleaning.SpeedCleaning):
+            return OrderedDict(obj.as_dict())
+        if isinstance(obj, fitdecode.cleaning.SpeedSource):
+            return OrderedDict(obj.as_dict())
+
+        if isinstance(obj, fitdecode.cleaning.SpeedObservation):
+            return OrderedDict(obj.as_dict())
+
         if isinstance(obj, fitdecode.FitHeader):
             crc = obj.crc if obj.crc else 0
             return OrderedDict((
@@ -89,7 +97,7 @@ class RecordJSONEncoder(json.JSONEncoder):
                 ('chunk', obj.chunk)))
 
         if isinstance(obj, fitdecode.FitDataMessage):
-            return OrderedDict((
+            extra = OrderedDict((
                 ('frame_type', 'data_message'),
                 ('name', obj.name),
                 ('header', OrderedDict((
@@ -98,6 +106,11 @@ class RecordJSONEncoder(json.JSONEncoder):
                     ('is_developer_data', obj.is_developer_data)))),
                 ('fields', obj.fields),
                 ('chunk', obj.chunk)))
+
+            if obj.cleaning is not None:
+                extra['speed_cleaning'] = obj.cleaning
+
+            return extra
 
         # fall back to original to raise a TypeError
         return super().default(obj)
@@ -169,6 +182,15 @@ def parse_args(args=None):
         help='Do not output unknown FIT messages (e.g. "unknown_140")')
 
     parser.add_argument(
+        '--clean-speed', action='store_true',
+        help=(
+            'Reconcile speed values reported directly and speed values '
+            'expanded from combined fields (e.g. compressed_speed_distance). '
+            'Adds a "speed_cleaning" object to every data message that has '
+            'speed. Expanded duplicates of the same parent field are counted '
+            'as one observation.'))
+
+    parser.add_argument(
         '--filter', '-f', action='append',
         help=(
             'Message name(s) (or global numbers) to filter-in or out, '
@@ -196,7 +218,8 @@ def main(args=None):
                 options.infile,
                 processor=fitdecode.StandardUnitsDataProcessor(),
                 check_crc=options.nocrc,
-                keep_raw_chunks=True) as fit:
+                keep_raw_chunks=True,
+                clean_speed=options.clean_speed) as fit:
             for frame in fit:
                 if (options.nodef and
                         frame.frame_type == fitdecode.FIT_FRAME_DEFINITION):

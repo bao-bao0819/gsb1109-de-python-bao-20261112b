@@ -121,11 +121,12 @@ class FitDataMessage:
 
         'def_mesg',
         'fields',
-        'chunk')
+        'chunk',
+        'cleaning')
 
     def __init__(
             self, is_developer_data, local_mesg_num, time_offset, def_mesg,
-            fields, chunk):
+            fields, chunk, cleaning=None):
         #: Is this a "developer" message?
         self.is_developer_data = is_developer_data
 
@@ -143,6 +144,11 @@ class FitDataMessage:
 
         #: `FitChunk` or `None` (depends on ``keep_raw_chunks`` option)
         self.chunk = chunk
+
+        #: Optional pre-computed `fitdecode.cleaning.SpeedCleaning` object.
+        #: It is set by `FitReader` when the ``clean_speed`` option is enabled,
+        #: or may be set manually. See the `speed_cleaning` property.
+        self.cleaning = cleaning
 
     def __iter__(self):
         """Iterate over the `FieldData` object in this mesage"""
@@ -162,6 +168,26 @@ class FitDataMessage:
     def mesg_type(self):
         """The `MessageType` object this message is associated to"""
         return self.def_mesg.mesg_type
+
+    @property
+    def speed_cleaning(self):
+        """
+        `fitdecode.cleaning.SpeedCleaning` reconciling the speed fields of this
+        message, or `None` if it carries no usable speed value.
+
+        The result is cached on first access, so the same object is returned
+        until the fields are modified. Use
+        `fitdecode.cleaning.clean_speed` with a *field_names* argument to
+        consider a different set of fields.
+        """
+        if self.cleaning is None:
+            from . import cleaning
+            self.cleaning = cleaning.clean_speed(self.fields)
+        return self.cleaning
+
+    def has_speed(self):
+        """Does this message carry any usable speed value?"""
+        return self.speed_cleaning is not None
 
     def has_field(self, field_name_or_num):
         """
