@@ -15,6 +15,7 @@ Reference
     runners-inline.rst
     job.rst
     runners-local.rst
+    utils-metrics.rst
     utils-parse.rst
     protocols.rst
     runners-spark.rst

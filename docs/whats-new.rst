@@ -4,6 +4,25 @@ What's New
 For a complete list of changes, see `CHANGES.txt
 <https://github.com/Yelp/mrjob/blob/master/CHANGES.txt>`_
 
+.. _v0.7.5:
+
+0.7.5
+-----
+
+Combinable metrics
+^^^^^^^^^^^^^^^^^^^
+
+:py:mod:`mrjob.metrics` adds :py:class:`~mrjob.metrics.StoreSales`, a
+metric that can be folded row-by-row in a mapper (including at the end of
+the mapper task), then merged in combiners and reducers. Merging is
+associative and commutative, and partial metrics are never rounded; only
+:py:meth:`~mrjob.metrics.StoreSales.settled` rounds, so a report is
+independent of how input was split and of how many times a combiner ran.
+
+A partial metric that cancels out to zero is still emitted and merged, so
+stores whose sales net to zero (or whose net item count is zero) remain in
+the report. See :py:mod:`mrjob.examples.mr_store_sales` for a complete job.
+
 .. _v0.7.4:
 
 0.7.4
