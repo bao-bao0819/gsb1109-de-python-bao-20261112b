@@ -38,6 +38,10 @@ $ q "select count(*) from some_db.sqlite3:::albums a left join another_db.sqlite
 
 Detailed examples are in [here](https://harelba.github.io/q/#examples)
 
+## Cross-store SQLite archives (beyond the ATTACH limit)
+
+When data is split into one SQLite database per store and a query references more databases than SQLite allows to attach simultaneously, q keeps the query correct automatically: databases within the limit are attached directly, and every further table is copied into q's private adhoc database and joined in the same connected query. Cross-store summaries and conditional `LEFT JOIN`s therefore keep their NULL rows and one-to-many fan-out instead of degrading into per-store numbers concatenated afterwards. See [doc/CROSS_STORE_SQLITE.markdown](doc/CROSS_STORE_SQLITE.markdown) for the query shape, the `tools/cross_store_query.py` helper and the control-versus-over-limit validation procedure.
+
 ## Installation.
 **New Major Version `3.1.6` is out with a lot of significant additions.**
 

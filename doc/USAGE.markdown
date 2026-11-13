@@ -86,7 +86,10 @@ Options:
                         dbs. This is a compile time definition of sqlite. q's
                         performance will slow down once this limit is reached
                         for a query, since it will perform table copies in
-                        order to avoid that limit.
+                        order to avoid that limit. The copied tables still
+                        participate in the same connected query, so cross-store
+                        joins and summaries return identical rows to the
+                        direct-attach path; see CROSS_STORE_SQLITE.markdown.
   --overwrite-qsql=OVERWRITE_QSQL
                         When used, qsql files (both caches and store-to-db)
                         will be overwritten if they already exist. Use with
