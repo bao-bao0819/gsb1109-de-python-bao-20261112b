@@ -31,6 +31,9 @@ class RecordJSONEncoder(json.JSONEncoder):
                 ('offset', obj.offset),
                 ('size', len(obj.bytes))))
 
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return bytes(obj).hex()
+
         if isinstance(obj, fitdecode.types.FieldDefinition):
             return OrderedDict((
                 ('name', obj.name),
@@ -165,6 +168,21 @@ def parse_args(args=None):
         help='Do not output FIT local message definitions.')
 
     parser.add_argument(
+        '--datadict', action='store_true',
+        help=(
+            'Export a data dictionary instead of the raw frame stream. Each '
+            'definition message is snapshot with its byte order, base types '
+            'and field widths, and data messages are merged into business '
+            'tables whose columns are shared only while their encoding stays '
+            'compatible.'))
+
+    parser.add_argument(
+        '--raw-bytes', action='store_true',
+        help=(
+            'With --datadict, include the hexadecimal original bytes of every '
+            'cell (implies keep_raw_chunks).'))
+
+    parser.add_argument(
         '--nounk', action='store_true',
         help='Do not output unknown FIT messages (e.g. "unknown_140")')
 
@@ -189,6 +207,37 @@ def parse_args(args=None):
 def main(args=None):
     options = parse_args(args)
 
+    if options.datadict:
+        return _dump_data_dictionary(options)
+    return _dump_frames(options)
+
+
+def _dump_data_dictionary(options):
+    try:
+        with fitdecode.FitReader(
+                options.infile,
+                processor=fitdecode.StandardUnitsDataProcessor(),
+                check_crc=options.nocrc,
+                keep_raw_chunks=True) as fit:
+            dictionary = fitdecode.datadict.build_data_dictionary(fit)
+    except Exception:
+        print(
+            'WARNING: the following error occurred while parsing FIT file. '
+            'Output file might be incomplete or corrupted.',
+            file=sys.stderr)
+        print('', file=sys.stderr)
+        traceback.print_exc()
+        return 1
+
+    indent = '\t' if options.pretty else None
+    json.dump(
+        dictionary.to_dict(include_raw_bytes=options.raw_bytes),
+        fp=options.output, cls=RecordJSONEncoder, indent=indent)
+
+    return 0
+
+
+def _dump_frames(options):
     frames = []
 
     try:

@@ -5,6 +5,25 @@ Change Log
 ==========
 
 
+Unreleased
+==========
+
+* New ``fitdecode.datadict`` module to export a data dictionary of a FIT
+  stream. Each definition message is snapshot individually with its byte
+  order, base types and field widths, so records decoded before and after a
+  local message redefinition keep the exact definition they were using
+* Data messages sharing a global message number are merged into business
+  tables whose columns are reused only while their on-disk encoding (byte
+  order, base type and width) stays compatible; an incompatible redefinition
+  creates an additional immutable column variant and never rewrites the
+  previously recorded rows
+* Each row and cell carries its frame/field offset and width, allowing any
+  record to be traced back to the exact original bytes; ``encode_field_value``
+  re-encodes regular numeric values byte-for-byte
+* ``fitjson``: added ``--datadict`` and ``--raw-bytes`` options to export the
+  data dictionary as JSON
+
+
 v0.11.0 (2025-08-06)
 ====================
 
