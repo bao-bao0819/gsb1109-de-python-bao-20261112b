@@ -17,6 +17,17 @@ from sqlalchemy.schema import CreateTable
 from sqlalchemy.sql import select
 from sqlalchemy.types import BOOLEAN, DATE, DATETIME, DECIMAL, FLOAT, TEXT, TIMESTAMP, VARCHAR, Interval
 
+from agatesql.decimal_storage import (
+    DecimalStorageContract,
+    DecimalStorageType,
+    install_sqlite_decimal_support,
+    resolve_decimal_contracts,
+    validate_decimal_contracts,
+)
+
+# The public contract names are re-exported from this module for convenience.
+DecimalContract = DecimalStorageContract
+
 SQL_TYPE_MAP = {
     agate.Boolean: None,  # See below
     agate.Number: None,  # See below
@@ -81,6 +92,8 @@ def from_sql(cls, connection_or_string, table_name):
         The name of a table in the referenced database.
     """
     engine, connection = get_engine_and_connection(connection_or_string)
+
+    install_sqlite_decimal_support(connection, engine)
 
     metadata = MetaData()
     sql_table = Table(table_name, metadata, autoload_with=connection)
@@ -178,9 +191,16 @@ def make_sql_column(column_name, column, sql_type_kwargs=None, sql_column_kwargs
 
 
 def make_sql_table(table, table_name, dialect=None, db_schema=None, constraints=True, unique_constraint=[],
-                   connection=None, min_col_len=1, col_len_multiplier=1):
+                   connection=None, min_col_len=1, col_len_multiplier=1, decimal_contracts=None,
+                   decimal_contract=None):
     """
     Generates a SQL alchemy table from an agate table.
+
+    :param decimal_contracts:
+        A mapping of column names to :class:`.DecimalStorageContract` instances.
+    :param decimal_contract:
+        A default :class:`.DecimalStorageContract` for all Number columns not
+        named in ``decimal_contracts``.
     """
     metadata = MetaData()
     sql_table = Table(table_name, metadata, schema=db_schema)
@@ -190,10 +210,19 @@ def make_sql_table(table, table_name, dialect=None, db_schema=None, constraints=
     SQL_TYPE_MAP[agate.Number] = NUMBER_MAP.get(dialect, DECIMAL)
     SQL_TYPE_MAP[agate.TimeDelta] = INTERVAL_MAP.get(dialect, Interval)
 
+    contracts = resolve_decimal_contracts(table, decimal_contracts, decimal_contract)
+    if contracts and dialect not in (None, 'sqlite'):
+        raise ValueError('Decimal storage contracts are only supported for SQLite.')
+
     for column_name, column in table.columns.items():
         sql_column_type = None
         sql_type_kwargs = {}
         sql_column_kwargs = {}
+
+        contract = contracts.get(column_name)
+        if contract is not None:
+            sql_column_type = DecimalStorageType
+            sql_type_kwargs = {'scale': contract.decimal_places}
 
         if constraints:
             if isinstance(column.data_type, agate.Text) and dialect in ('ingres', 'mysql'):
@@ -212,7 +241,8 @@ def make_sql_table(table, table_name, dialect=None, db_schema=None, constraints=
             # PostgreSQL and SQLite don't have scale default 0.
             # @see https://www.postgresql.org/docs/9.2/static/datatype-numeric.html
             # @see https://www.sqlite.org/datatype3.html
-            if isinstance(column.data_type, agate.Number) and dialect in ('ingres', 'mssql', 'mysql', 'oracle'):
+            if isinstance(column.data_type, agate.Number) and contract is None \
+                    and dialect in ('ingres', 'mssql', 'mysql', 'oracle'):
                 # Ingres has precision range 1-39 and default 5, scale default 0.
                 # @see https://docs.actian.com/ingres/11.2/index.html#page/SQLRef/Storage_Formats_of_Data_Types.htm
                 # MySQL has precision range 1-65 and default 10, scale default 0.
@@ -241,7 +271,8 @@ def make_sql_table(table, table_name, dialect=None, db_schema=None, constraints=
 def to_sql(self, connection_or_string, table_name, overwrite=False,
            create=True, create_if_not_exists=False, insert=True, prefixes=[],
            db_schema=None, constraints=True, unique_constraint=[], chunk_size=None,
-           min_col_len=1, col_len_multiplier=1):
+           min_col_len=1, col_len_multiplier=1, decimal_contracts=None,
+           decimal_contract=None):
     """
     Write this table to the given SQL database.
 
@@ -273,13 +304,29 @@ def to_sql(self, connection_or_string, table_name, overwrite=False,
         The minimum length of text columns.
     :param col_len_multiplier:
         Multiply the maximum column length by this multiplier to accomodate larger values in later runs.
+    :param decimal_contracts:
+        A mapping of column names to :class:`.DecimalStorageContract` instances.
+        Contracted Number columns are stored exactly in SQLite as canonical
+        decimal text with numeric comparison semantics.
+    :param decimal_contract:
+        A default :class:`.DecimalStorageContract` applied to every Number
+        column not named in ``decimal_contracts``.
     """
     engine, connection = get_engine_and_connection(connection_or_string)
 
+    install_sqlite_decimal_support(connection, engine)
+
+    contracts = resolve_decimal_contracts(self, decimal_contracts, decimal_contract)
     dialect = connection.engine.dialect.name
+    if contracts and dialect != 'sqlite':
+        raise ValueError('Decimal storage contracts are only supported for SQLite.')
+    if insert:
+        validate_decimal_contracts(self, contracts)
+
     sql_table = make_sql_table(self, table_name, dialect=dialect, db_schema=db_schema, constraints=constraints,
                                unique_constraint=unique_constraint, connection=connection,
-                               min_col_len=min_col_len, col_len_multiplier=col_len_multiplier)
+                               min_col_len=min_col_len, col_len_multiplier=col_len_multiplier,
+                               decimal_contracts=contracts)
 
     if create:
         if overwrite:
@@ -291,6 +338,7 @@ def to_sql(self, connection_or_string, table_name, overwrite=False,
         insert = sql_table.insert()
         for prefix in prefixes:
             insert = insert.prefix_with(prefix)
+
         if chunk_size is None:
             connection.execute(insert, [dict(zip(self.column_names, row)) for row in self.rows])
         else:
@@ -310,7 +358,8 @@ def to_sql(self, connection_or_string, table_name, overwrite=False,
             engine.dispose()
 
 
-def to_sql_create_statement(self, table_name, dialect=None, db_schema=None, constraints=True, unique_constraint=[]):
+def to_sql_create_statement(self, table_name, dialect=None, db_schema=None, constraints=True, unique_constraint=[],
+                            decimal_contracts=None, decimal_contract=None):
     """
     Generates a CREATE TABLE statement for this SQL table, but does not execute
     it.
@@ -325,9 +374,15 @@ def to_sql_create_statement(self, table_name, dialect=None, db_schema=None, cons
         Generate constraints such as ``nullable`` for table columns.
     :param unique_constraint:
         The names of the columns to include in a UNIQUE constraint.
+    :param decimal_contracts:
+        A mapping of column names to :class:`.DecimalStorageContract` instances.
+    :param decimal_contract:
+        A default :class:`.DecimalStorageContract` applied to every Number
+        column not named in ``decimal_contracts``.
     """
     sql_table = make_sql_table(self, table_name, dialect=dialect, db_schema=db_schema, constraints=constraints,
-                               unique_constraint=unique_constraint)
+                               unique_constraint=unique_constraint, decimal_contracts=decimal_contracts,
+                               decimal_contract=decimal_contract)
 
     if dialect:
         sql_dialect = dialects.registry.load(dialect)()
@@ -337,7 +392,7 @@ def to_sql_create_statement(self, table_name, dialect=None, db_schema=None, cons
     return str(CreateTable(sql_table).compile(dialect=sql_dialect)).strip() + ';'
 
 
-def sql_query(self, query, table_name='agate'):
+def sql_query(self, query, table_name='agate', decimal_contracts=None, decimal_contract=None):
     """
     Convert this agate table into an intermediate, in-memory sqlite table,
     run a query against it, and then return the results as a new agate table.
@@ -349,14 +404,22 @@ def sql_query(self, query, table_name='agate'):
         with semicolons.
     :param table_name:
         The name to use for the table in the queries, defaults to ``agate``.
+    :param decimal_contracts:
+        A mapping of column names to :class:`.DecimalStorageContract` instances.
+    :param decimal_contract:
+        A default :class:`.DecimalStorageContract` applied to every Number
+        column not named in ``decimal_contracts``.
     """
     _, connection = get_engine_and_connection()
+
+    install_sqlite_decimal_support(connection)
 
     # Execute the specified SQL queries
     queries = query.split(';')
     rows = None
 
-    self.to_sql(connection, table_name)
+    self.to_sql(connection, table_name, decimal_contracts=decimal_contracts,
+                decimal_contract=decimal_contract)
 
     for q in queries:
         if q:

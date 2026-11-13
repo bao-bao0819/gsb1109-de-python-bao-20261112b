@@ -3,6 +3,15 @@
 
 * Add Python 3.13 and 3.14 support. Drop support for end-of-life versions 3.8 and 3.9.
 
+Unreleased
+----------
+
+* Add optional :class:`.DecimalStorageContract` column contracts for exact
+  :class:`decimal.Decimal` storage in SQLite. Contracted columns round-trip
+  without precision loss, support numeric range predicates and ordering, and
+  raise :class:`.DecimalStorageError` with the original row for out-of-contract
+  values instead of rounding them.
+
 0.7.2 - January 9, 2024
 -----------------------
 

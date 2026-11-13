@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 
 import agatesql
+from agatesql.decimal_storage import DecimalStorageContract, DecimalStorageError
 
 
 class TestSQL(agate.AgateTestCase):
@@ -276,3 +277,243 @@ class TestSQL(agate.AgateTestCase):
         finally:
             connection.close()
             engine.dispose()
+
+
+class TestDecimalStorageContract(agate.AgateTestCase):
+    def setUp(self):
+        self.rows = (
+            (Decimal('0.00000000000001'), 'tiny'),
+            (Decimal('99999999999999999999'), 'huge'),
+            (Decimal('12345678901234567890'), 'large'),
+            (Decimal('-1.5'), 'negative'),
+            (Decimal('1.500'), 'alternate-spelling'),
+            (Decimal('2'), 'integer'),
+            (None, 'missing'),
+        )
+        self.column_names = ['measurement', 'label']
+        self.column_types = [agate.Number(), agate.Text()]
+        self.table = agate.Table(self.rows, self.column_names, self.column_types)
+        self.contract = DecimalStorageContract(
+            minimum='-100000000000000000000',
+            maximum='100000000000000000000',
+            decimal_places=20,
+        )
+
+        self.engine = create_engine('sqlite:///:memory:')
+        self.connection = self.engine.connect()
+
+    def tearDown(self):
+        self.connection.close()
+        self.engine.dispose()
+
+    def test_round_trip_is_exact(self):
+        self.table.to_sql(self.connection, 'test', decimal_contracts={'measurement': self.contract})
+
+        table = agate.Table.from_sql(self.connection, 'test')
+
+        self.assertColumnTypes(table, [agate.Number, agate.Text])
+        self.assertRows(table, self.rows)
+        self.assertEqual(type(table.rows[0][0]), Decimal)
+        self.assertEqual(table.rows[0][0].as_tuple(), Decimal('0.00000000000001').as_tuple())
+        self.assertEqual(table.rows[1][0], Decimal('99999999999999999999'))
+        self.assertEqual(table.rows[4][0], Decimal('1.500'))
+
+    def test_storage_is_text_not_binary_float(self):
+        self.table.to_sql(self.connection, 'test', decimal_contracts={'measurement': self.contract})
+
+        stored = self.connection.exec_driver_sql(
+            'SELECT measurement, typeof(measurement) FROM test WHERE label = ?', ('tiny',)
+        ).fetchone()
+        self.assertEqual(stored, ('0.00000000000001', 'text'))
+
+        stored = self.connection.exec_driver_sql(
+            'SELECT measurement, typeof(measurement) FROM test WHERE label = ?', ('huge',)
+        ).fetchone()
+        self.assertEqual(stored, ('99999999999999999999', 'text'))
+
+    def test_order_by_is_numeric(self):
+        self.table.to_sql(self.connection, 'test', decimal_contracts={'measurement': self.contract})
+
+        values = self.connection.exec_driver_sql(
+            'SELECT measurement FROM test WHERE measurement IS NOT NULL ORDER BY measurement'
+        ).scalars().all()
+        self.assertEqual(values, [
+            '-1.5',
+            '0.00000000000001',
+            '1.500',
+            '2',
+            '12345678901234567890',
+            '99999999999999999999',
+        ])
+
+    def test_range_filter_is_numeric(self):
+        self.table.to_sql(self.connection, 'test', decimal_contracts={'measurement': self.contract})
+
+        labels = self.connection.exec_driver_sql(
+            "SELECT label FROM test WHERE measurement BETWEEN '-2' AND '3' ORDER BY measurement"
+        ).scalars().all()
+        self.assertEqual(labels, ['negative', 'tiny', 'alternate-spelling', 'integer'])
+
+        labels = self.connection.exec_driver_sql(
+            'SELECT label FROM test WHERE measurement > 10000000000000000000 ORDER BY measurement'
+        ).scalars().all()
+        self.assertEqual(labels, ['large', 'huge'])
+
+    def test_equal_values_with_different_spellings_match(self):
+        self.table.to_sql(self.connection, 'test', decimal_contracts={'measurement': self.contract})
+
+        labels = self.connection.exec_driver_sql(
+            "SELECT label FROM test WHERE measurement = '1.5'"
+        ).scalars().all()
+        self.assertEqual(labels, ['alternate-spelling'])
+
+    def test_sql_query_can_use_contract(self):
+        results = self.table.sql_query(
+            "SELECT measurement FROM agate WHERE measurement BETWEEN '-2' AND '2' ORDER BY measurement",
+            decimal_contract=self.contract,
+        )
+
+        self.assertColumnTypes(results, [agate.Number])
+        self.assertRows(results, [
+            (Decimal('-1.5'),),
+            (Decimal('0.00000000000001'),),
+            (Decimal('1.500'),),
+            (Decimal('2'),),
+        ])
+
+    def test_create_statement_uses_exact_decimal_storage(self):
+        statement = self.table.to_sql_create_statement(
+            'test_table',
+            decimal_contracts={'measurement': self.contract},
+        )
+
+        self.assertIn('measurement AGATE_DECIMAL_TEXT(20) COLLATE AGATE_DECIMAL', statement)
+
+    def test_contract_default_applies_to_all_number_columns(self):
+        table = agate.Table(
+            ((Decimal('1.5'), Decimal('2.5')),),
+            ['a', 'b'],
+            [agate.Number(), agate.Number()],
+        )
+        table.to_sql(self.connection, 'test', decimal_contract=DecimalStorageContract(decimal_places=2))
+
+        statement = self.connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE name = 'test'"
+        ).scalar()
+        self.assertEqual(statement.count('AGATE_DECIMAL_TEXT(2) COLLATE AGATE_DECIMAL'), 2)
+
+    def test_decimal_places_violation_reports_original_row(self):
+        table = agate.Table(
+            (
+                (Decimal('1.25'), 'ok'),
+                (Decimal('-1.25'), 'ok'),
+                (Decimal('1.2345'), 'too-precise'),
+            ),
+            ['measurement', 'label'],
+            [agate.Number(), agate.Text()],
+        )
+
+        with self.assertRaises(DecimalStorageError) as context:
+            table.to_sql(
+                self.connection,
+                'test',
+                decimal_contracts={'measurement': DecimalStorageContract(decimal_places=3)},
+            )
+
+        error = context.exception
+        self.assertEqual(error.column_name, 'measurement')
+        self.assertEqual(error.row_index, 2)
+        self.assertEqual(error.row_number, 3)
+        self.assertEqual(error.value, Decimal('1.2345'))
+        self.assertEqual(error.reason, 'decimal_places')
+        self.assertIn('row 3', error.args[0])
+
+        # Nothing was silently rounded, and no table was created.
+        self.assertFalse(self.connection.dialect.has_table(self.connection, 'test'))
+
+    def test_minimum_violation_reports_original_row(self):
+        table = agate.Table(
+            ((Decimal('0.5'),), (Decimal('-0.5'),)),
+            ['measurement'],
+            [agate.Number()],
+        )
+
+        with self.assertRaises(DecimalStorageError) as context:
+            table.to_sql(
+                self.connection,
+                'test',
+                decimal_contracts={'measurement': DecimalStorageContract(minimum='0')},
+            )
+
+        error = context.exception
+        self.assertEqual(error.row_index, 1)
+        self.assertEqual(error.row_number, 2)
+        self.assertEqual(error.reason, 'minimum')
+        self.assertFalse(self.connection.dialect.has_table(self.connection, 'test'))
+
+    def test_maximum_violation(self):
+        table = agate.Table(
+            ((Decimal('10.0001'),),),
+            ['measurement'],
+            [agate.Number()],
+        )
+
+        with self.assertRaises(DecimalStorageError) as context:
+            table.to_sql(
+                self.connection,
+                'test',
+                decimal_contracts={'measurement': DecimalStorageContract(maximum='10')},
+            )
+
+        self.assertEqual(context.exception.reason, 'maximum')
+
+    def test_trailing_zeroes_do_not_count_as_decimal_places(self):
+        table = agate.Table(
+            ((Decimal('1.2300'),),),
+            ['measurement'],
+            [agate.Number()],
+        )
+        table.to_sql(
+            self.connection,
+            'test',
+            decimal_contracts={'measurement': DecimalStorageContract(decimal_places=2)},
+        )
+
+        self.assertRows(agate.Table.from_sql(self.connection, 'test'), [(Decimal('1.2300'),)])
+
+    def test_chunked_insert_with_contract_is_exact(self):
+        table = agate.Table(
+            ((Decimal('0.00000000000001'),), (Decimal('99999999999999999999'),), (Decimal('-1.5'),)),
+            ['measurement'],
+            [agate.Number()],
+        )
+        table.to_sql(
+            self.connection,
+            'test',
+            chunk_size=1,
+            decimal_contracts={'measurement': self.contract},
+        )
+
+        self.assertRows(agate.Table.from_sql(self.connection, 'test'), table.rows)
+
+    def test_contract_dict_form(self):
+        table = agate.Table(((Decimal('1.5'),),), ['measurement'], [agate.Number()])
+        table.to_sql(
+            self.connection,
+            'test',
+            decimal_contracts={'measurement': {'minimum': '0', 'maximum': '10', 'decimal_places': 1}},
+        )
+
+        self.assertRows(agate.Table.from_sql(self.connection, 'test'), [(Decimal('1.5'),)])
+
+    def test_contract_rejects_unknown_column(self):
+        with self.assertRaises(ValueError):
+            self.table.to_sql(self.connection, 'test', decimal_contracts={'missing': self.contract})
+
+    def test_contract_rejects_non_number_column(self):
+        with self.assertRaises(ValueError):
+            self.table.to_sql(self.connection, 'test', decimal_contracts={'label': self.contract})
+
+    def test_contract_rejects_inverted_range(self):
+        with self.assertRaises(ValueError):
+            DecimalStorageContract(minimum='10', maximum='0')

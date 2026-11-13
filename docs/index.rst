@@ -47,6 +47,47 @@ The first argument to either function can be any valid `sqlalchemy connection st
 
 That's all there is to it.
 
+Exact decimal storage in SQLite
+===============================
+
+SQLite stores numbers as 64-bit integers or IEEE-754 doubles, so values such
+as ``0.00000000000001`` and ``99999999999999999999`` can lose precision when
+written to a ``FLOAT`` column. If a publisher declares the legal range and the
+allowed number of decimal places for a column, pass a
+:class:`.DecimalStorageContract` to :meth:`.to_sql`:
+
+.. code-block:: python
+
+    from agatesql import DecimalStorageContract
+
+    contract = DecimalStorageContract(
+        minimum='-100000000000000000000',
+        maximum='100000000000000000000',
+        decimal_places=20,
+    )
+    table.to_sql('sqlite:///measurements.db', 'samples', decimal_contracts={'reading': contract})
+
+Contracted columns are stored as canonical decimal text, so values round-trip
+exactly. They also use a decimal collation, so ``ORDER BY``, ``=``, ``<``,
+``BETWEEN`` and other range predicates compare by numeric value, including
+negative values and values with different numbers of integer digits:
+
+.. code-block:: sql
+
+    SELECT reading FROM samples WHERE reading BETWEEN -1 AND 1 ORDER BY reading
+
+Use ``decimal_contract`` instead of ``decimal_contracts`` to apply the same
+contract to every Number column. A value outside the contract raises
+:class:`.DecimalStorageError`; it is never rounded. The exception identifies
+the original column and row through ``column_name``, ``row_index`` (zero-based),
+``row_number`` (one-based), ``row`` and, when available, ``row_name``.
+
+.. autoclass:: agatesql.decimal_storage.DecimalStorageContract
+
+.. autoexception:: agatesql.decimal_storage.DecimalStorageError
+
+.. autoclass:: agatesql.decimal_storage.DecimalStorageType
+
 ===
 API
 ===
