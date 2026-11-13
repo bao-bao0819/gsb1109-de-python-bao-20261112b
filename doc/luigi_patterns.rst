@@ -421,3 +421,50 @@ you need to implement:
                    f'Task {self._task_process.task}: time: {elapsed:.2f}s, memory: {used_memory / 1024:.2f}MB '
                )
                self._task_process.status_reporter.report_task_statistics({"memory": used_memory / 1024, "elapsed": elapsed})
+
+Checking a sealed multi-file delivery
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a workflow depends on several external files and a seal that names the
+exact generation of each file, checking only that the files exist can report a
+mixture of an old and a new generation as complete.  The
+:mod:`luigi.contrib.inventory` module provides
+:class:`~luigi.contrib.inventory.SealedInventoryTask` for this case:
+
+.. code-block:: python
+
+    import luigi
+    from luigi.contrib.inventory import SealedInventoryTask
+
+    class DailyInventory(SealedInventoryTask):
+        date = luigi.DateParameter()
+
+        def seal(self):
+            return luigi.LocalTarget(f"/data/inventory/{self.date}/seal.json")
+
+        def artifacts(self):
+            base = f"/data/inventory/{self.date}"
+            return {
+                "stock": luigi.LocalTarget(f"{base}/stock.csv"),
+                "locations": luigi.LocalTarget(f"{base}/locations.csv"),
+                "lots": luigi.LocalTarget(f"{base}/lots.csv"),
+            }
+
+The task distinguishes three outcomes through
+:meth:`~luigi.contrib.inventory.SealedInventoryTask.inventory_status`:
+``NOT_READY`` when the seal or an artifact is still missing or being replaced,
+``READY`` when every artifact matches the digest and size of one stable seal,
+and ``MISMATCH`` when all artifacts are present but disagree with the seal.  An
+empty artifact is accepted as zero stock only when the seal explicitly declares
+it with size zero and the empty digest.  Only ``READY`` makes the task
+complete.
+
+The seal is read before and after all artifacts.  If the seal or any artifact
+changes during the check, the entire check is retried; if it never stabilizes,
+the task stays ``NOT_READY`` instead of accepting a mixed generation.  By
+default a ``MISMATCH`` raises
+:class:`~luigi.contrib.inventory.InventorySealMismatch`, so Luigi reports a
+broken task rather than a pending one.  Set ``mismatch_is_fatal = False`` to
+leave a contradictory delivery pending while its seal is corrected.  When the
+seal arrives later in a long-running worker, enable ``retry-external-tasks`` so
+the external task is re-checked.
