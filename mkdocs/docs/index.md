@@ -434,6 +434,29 @@ Options:
                         feedback on this
 ```
 
+### Weighted percentiles
+The `percentile()` aggregate is also available in a 3-argument form for data that
+already contains an observation count:
+
+`percentile(<expr>,<repeat-count>,<percentile-in-the-range-0-to-1>)`
+
+The repeat count is treated as that many identical observations of the value, and
+the result is the same strict percentile (linear interpolation between adjacent
+sorted positions) that the 2-argument form would return if the observations were
+physically expanded. The counts are never expanded internally, so repeat counts
+of hundreds of millions are handled in constant memory.
+
+Rules:
+
+* Repeat counts must be non-negative integers. A negative count is an error.
+* Rows with a repeat count of `0` have no effect on the result. A group whose
+  repeat counts are all `0` returns `NULL`.
+* All rows of the same group must use the same percentile parameter. Using
+  different percentiles within one group is an error.
+* Splitting one value across several rows, or changing row order, does not
+  change the result.
+
+
 ### Setting the default values for parameters
 It's possible to set default values for parameters which are used often by configuring them in the file `~/.qrc`.
 

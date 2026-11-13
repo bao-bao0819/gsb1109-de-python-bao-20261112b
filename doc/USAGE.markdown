@@ -212,6 +212,29 @@ The format of F is as a list of X=f separated by commas, where X is a column num
 * X - column number - This is the SELECTed column (or expression) number, not the one from the original table. E.g, 1 is the first SELECTed column, 3 is the third SELECTed column.
 * f - A python formatting string such as {} - See https://www.w3schools.com/python/ref_string_format.asp for details if needed.
 
+### Weighted percentiles
+The `percentile()` aggregate is also available in a 3-argument form for data that
+already contains an observation count:
+
+`percentile(<expr>,<repeat-count>,<percentile-in-the-range-0-to-1>)`
+
+The repeat count is treated as that many identical observations of the value, and
+the result is the same strict percentile (linear interpolation between adjacent
+sorted positions) that the 2-argument form would return if the observations were
+physically expanded. The counts are never expanded internally, so repeat counts
+of hundreds of millions are handled in constant memory.
+
+Rules:
+
+* Repeat counts must be non-negative integers. A negative count is an error.
+* Rows with a repeat count of `0` have no effect on the result. A group whose
+  repeat counts are all `0` returns `NULL`.
+* All rows of the same group must use the same percentile parameter. Using
+  different percentiles within one group is an error.
+* Splitting one value across several rows, or changing row order, does not
+  change the result.
+
+
 ## EXAMPLES
 Example 1: `ls -ltrd * | q "select c1,count(1) from - group by c1"`
 

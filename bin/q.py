@@ -58,6 +58,7 @@ import io
 import json
 import datetime
 import hashlib
+import bisect
 
 if six.PY2:
     assert False, 'Python 2 is not longer supported by q'
@@ -180,22 +181,194 @@ def percentile(l, p):
         return l[int(k)]
     return (c-k) * l[int(f)] + (k-f) * l[int(c)]
 
+_last_udf_error = None
+
+def _record_udf_error(msg):
+    global _last_udf_error
+    _last_udf_error = msg
+    raise ValueError(msg)
+
+def _get_last_udf_error():
+    return _last_udf_error
+
+def _clear_last_udf_error():
+    global _last_udf_error
+    _last_udf_error = None
+
 # TODO Streaming Percentile to prevent memory consumption blowup for large datasets
 class StrictPercentile(object):
     def __init__(self):
         self.values = []
         self.p = None
+        self.p_initialized = False
 
     def step(self,value,p):
-        if self.p is None:
-          self.p = p
+        if p is not None:
+            try:
+                p = float(p)
+            except (TypeError, ValueError):
+                _record_udf_error(
+                    "percentile parameter must be a number in the range 0 to 1 (got %r)" % (p,))
+        if not self.p_initialized:
+            self.p = p
+            self.p_initialized = True
+        elif p != self.p:
+            _record_udf_error(
+                "all rows in a group must use the same percentile parameter (got %r and %r)" % (self.p, p))
         self.values.append(value)
 
     def finalize(self):
-        if len(self.values) == 0 or (self.p < 0 or self.p > 1):
+        if len(self.values) == 0 or self.p is None or (self.p < 0 or self.p > 1):
             return None
         else:
             return percentile(sorted(self.values),self.p)
+
+class WeightedPercentile(object):
+    """Percentile of observations given as (value, repeat-count) pairs.
+
+    A positive repeat count stands for that many identical observations.
+    Counts are accumulated per distinct value, so no expansion is ever
+    performed, regardless of how large the repeat counts are.
+
+    The argument order is (value, repeat-count, percentile). For
+    convenience, (value, percentile, repeat-count) is accepted as well,
+    but only when it is the sole interpretation that is structurally
+    valid for every row of the group.
+    """
+
+    def __init__(self):
+        self.rows = []
+        self.order = None
+
+    @staticmethod
+    def _is_valid_percentile(value):
+        if value is None or isinstance(value,bool):
+            return False
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(value) and 0 <= value <= 1
+
+    @staticmethod
+    def _is_valid_repeat_count(value):
+        if value is None or isinstance(value,bool):
+            return False
+        try:
+            if isinstance(value, float):
+                return math.isfinite(value) and value == math.floor(value) and value >= 0
+            return int(value) >= 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _as_percentile(raw_value):
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            _record_udf_error(
+                "percentile parameter must be a number in the range 0 to 1 (got %r)" % (raw_value,))
+        if not math.isfinite(value) or value < 0 or value > 1:
+            _record_udf_error(
+                "percentile parameter must be a number in the range 0 to 1 (got %r)" % (raw_value,))
+        return value
+
+    @staticmethod
+    def _as_repeat_count(raw_repeat_count):
+        if raw_repeat_count is None:
+            _record_udf_error("repeat count must be a non-negative integer (got NULL)")
+        try:
+            if isinstance(raw_repeat_count, float):
+                if not math.isfinite(raw_repeat_count) or raw_repeat_count != math.floor(raw_repeat_count):
+                    _record_udf_error(
+                        "repeat count must be a non-negative integer (got %r)" % (raw_repeat_count,))
+                repeat_count = int(raw_repeat_count)
+            elif isinstance(raw_repeat_count, bool):
+                _record_udf_error(
+                    "repeat count must be a non-negative integer (got %r)" % (raw_repeat_count,))
+            else:
+                repeat_count = int(raw_repeat_count)
+        except (TypeError, ValueError):
+            _record_udf_error(
+                "repeat count must be a non-negative integer (got %r)" % (raw_repeat_count,))
+
+        if repeat_count < 0:
+            _record_udf_error(
+                "repeat count must be a non-negative integer - negative repeat counts are not allowed (got %r)" % (raw_repeat_count,))
+        return repeat_count
+
+    def _resolve_argument_order(self):
+        if self.order is not None:
+            return self.order
+
+        primary_valid = all(
+            self._is_valid_repeat_count(second) and self._is_valid_percentile(third)
+            for _,second,third in self.rows
+        )
+        reverse_valid = all(
+            self._is_valid_percentile(second) and self._is_valid_repeat_count(third)
+            for _,second,third in self.rows
+        )
+
+        if primary_valid:
+            self.order = 'count-percentile'
+        elif reverse_valid:
+            self.order = 'percentile-count'
+        else:
+            self.order = 'count-percentile'
+        return self.order
+
+    def step(self,value,second,third):
+        self.rows.append((value,second,third))
+
+    def finalize(self):
+        order = self._resolve_argument_order()
+        value_counts = {}
+        total_count = 0
+        percentile = None
+        percentile_initialized = False
+
+        for value,second,third in self.rows:
+            if order == 'count-percentile':
+                raw_repeat_count,raw_percentile = second,third
+            else:
+                raw_percentile,raw_repeat_count = second,third
+
+            p = self._as_percentile(raw_percentile)
+            if not percentile_initialized:
+                percentile = p
+                percentile_initialized = True
+            elif p != percentile:
+                _record_udf_error(
+                    "all rows in a group must use the same percentile parameter (got %r and %r)" % (percentile, p))
+
+            repeat_count = self._as_repeat_count(raw_repeat_count)
+            if repeat_count == 0 or value is None:
+                continue
+            value_counts[value] = value_counts.get(value,0) + repeat_count
+            total_count += repeat_count
+
+        if total_count == 0:
+            return None
+
+        sorted_values = sorted(value_counts)
+        cumulative_counts = []
+        cumulative = 0
+        for value in sorted_values:
+            cumulative += value_counts[value]
+            cumulative_counts.append(cumulative)
+
+        def value_at_rank(rank):
+            return sorted_values[bisect.bisect_left(cumulative_counts,rank + 1)]
+
+        k = percentile*(total_count - 1)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if c == f:
+            return value_at_rank(int(k))
+        lower = value_at_rank(f)
+        upper = value_at_rank(c)
+        return (c-k) * lower + (k-f) * upper
 
 class StdevPopulation(object):
     def __init__(self):
@@ -323,6 +496,21 @@ user_functions = [
                     "Calculate the strict percentile of a set of a values.",
                     StrictPercentile,
                     2),
+    UserFunctionDef(FunctionType.AGG,
+                    "percentile","percentile(<expr>,<repeat-count>,<percentile-in-the-range-0-to-1>) = <percentile-value>",
+                    "Calculate the strict percentile of a set of values, where each row's value represents <repeat-count> identical observations. Repeat counts must be non-negative integers; zero-count rows do not affect the result. All rows of a group must use the same percentile.",
+                    WeightedPercentile,
+                    3),
+    UserFunctionDef(FunctionType.AGG,
+                    "weighted_percentile","weighted_percentile(<expr>,<repeat-count>,<percentile-in-the-range-0-to-1>) = <percentile-value>",
+                    "Alias of the 3-argument percentile() form. Calculate the strict percentile of a set of values, where each row's value represents <repeat-count> identical observations.",
+                    WeightedPercentile,
+                    3),
+    UserFunctionDef(FunctionType.AGG,
+                    "percentile_weighted","percentile_weighted(<expr>,<repeat-count>,<percentile-in-the-range-0-to-1>) = <percentile-value>",
+                    "Alias of the 3-argument percentile() form. Calculate the strict percentile of a set of values, where each row's value represents <repeat-count> identical observations.",
+                    WeightedPercentile,
+                    3),
     UserFunctionDef(FunctionType.AGG,
                     "stddev_pop","stddev_pop(<expr>) = <stddev-value>",
                     "Calculate the population standard deviation of a set of values",
@@ -2852,6 +3040,8 @@ class QTextAsData(object):
         error = None
         table_structures = []
 
+        _clear_last_udf_error()
+
         db_results_obj = None
 
         effective_input_params = self.default_input_params.merged_with(input_params)
@@ -2925,6 +3115,10 @@ class QTextAsData(object):
         except SqliteOperationalErrorException as e:
             xprint("Sqlite Operational error: %s" % e)
             msg = str(e.original_error)
+            udf_error = _get_last_udf_error()
+            _clear_last_udf_error()
+            if udf_error is not None and "user-defined aggregate" in msg:
+                msg = udf_error
             error = QError(e,"query error: %s" % msg,1)
             if "no such column" in msg and effective_input_params.skip_header:
                 warnings.append(QWarning(e,'Warning - There seems to be a "no such column" error, and -H (header line) exists. Please make sure that you are using the column names from the header line and not the default (cXX) column names. Another issue might be that the file contains a BOM. Files that are encoded with UTF8 and contain a BOM can be read by specifying `-e utf-9-sig` in the command line. Support for non-UTF8 encoding will be provided in the future.'))
@@ -3247,7 +3441,7 @@ See https://github.com/harelba/q for more details.
 """
 
 def run_standalone():
-    sqlite3.enable_callback_tracebacks(True)
+    sqlite3.enable_callback_tracebacks(DEBUG)
 
     p, qrc_filename = parse_qrc_file()
 

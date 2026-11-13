@@ -38,6 +38,7 @@ import pytest
 import uuid
 import sqlite3
 import re
+import math
 import collections
 
 sys.path.append(os.path.join(os.path.abspath(os.path.dirname(sys.argv[0])),'..','bin'))
@@ -4262,6 +4263,76 @@ class UserFunctionTests(AbstractQTestCase):
         self.assertEqual(minimum_values,base_values)
         self.assertEqual(median_values,list(map(lambda x: x + 49.5,base_values)))
         self.assertEqual(max_values,list(map(lambda x: x + 99,base_values)))
+
+    def test_weighted_percentile_func_matches_manual_expansion(self):
+        rows = [
+            (1,2),
+            (2,2),
+            (3,1),
+            (4,0),
+            (5,3),
+        ]
+        tmpfile = self.create_file_with_data(six.b("\n".join(["%s,%s" % (v,c) for v,c in rows])))
+
+        cmd = '%s -c 2 -d , "select percentile(c1,c2,0),percentile(c1,c2,0.25),percentile(c1,c2,0.5),percentile(c1,c2,1) from %s"' % (Q_EXECUTABLE,tmpfile.name)
+        retcode,o,e = run_command(cmd)
+
+        self.assertEqual(retcode,0)
+        self.assertEqual(len(o),1)
+        self.assertEqual(len(e),0)
+
+        expanded = sorted([v for v,c in rows for _ in range(c)])
+
+        expected = []
+        for p in (0,0.25,0.5,1):
+            k = p*(len(expanded)-1)
+            f = int(math.floor(k))
+            c = int(math.ceil(k))
+            if f == c:
+                expected.append(float(expanded[f]))
+            else:
+                expected.append((c-k)*expanded[f] + (k-f)*expanded[c])
+
+        actual = [float(x) for x in o[0].split(six.b(','))]
+        self.assertEqual(actual,expected)
+
+        self.cleanup(tmpfile)
+
+    def test_weighted_percentile_func_does_not_expand_huge_counts(self):
+        cmd = 'printf "1,100000000\\n2,100000000\\n3,100000000\\n" | %s -c 2 -d , "select percentile(c1,c2,0.5) from -"' % Q_EXECUTABLE
+        retcode,o,e = run_command(cmd)
+
+        self.assertEqual(retcode,0)
+        self.assertEqual(len(o),1)
+        self.assertEqual(len(e),0)
+        self.assertEqual(o[0],six.b('2.0'))
+
+    def test_weighted_percentile_func_single_observation_group(self):
+        cmd = 'printf "1,1,0.5\\n2,5,0.5\\n" | %s -c 3 -d , "select c1,percentile(c1,c2,c3) from - group by c1"' % Q_EXECUTABLE
+        retcode,o,e = run_command(cmd)
+
+        self.assertEqual(retcode,0)
+        self.assertEqual(len(o),2)
+        self.assertEqual(len(e),0)
+        self.assertEqual(sorted(o),sorted([six.b('1,1'),six.b('2,2')]))
+
+    def test_weighted_percentile_func_negative_count_is_an_error(self):
+        cmd = 'printf "1,2,0.5\\n2,-1,0.5\\n" | %s -c 3 -d , "select percentile(c1,c2,c3) from -"' % Q_EXECUTABLE
+        retcode,o,e = run_command(cmd)
+
+        self.assertNotEqual(retcode,0)
+        self.assertEqual(len(o),0)
+        self.assertEqual(len(e),1)
+        self.assertTrue(six.b('repeat count must be a non-negative integer') in e[0])
+
+    def test_weighted_percentile_func_mixed_percentiles_in_group_is_an_error(self):
+        cmd = 'printf "1,1,0.5\\n2,1,0.9\\n" | %s -c 3 -d , "select percentile(c1,c2,c3) from -"' % Q_EXECUTABLE
+        retcode,o,e = run_command(cmd)
+
+        self.assertNotEqual(retcode,0)
+        self.assertEqual(len(o),0)
+        self.assertEqual(len(e),1)
+        self.assertTrue(six.b('all rows in a group must use the same percentile parameter') in e[0])
 
     def test_regexp_null_data_handling(self):
         tmpfile = self.create_file_with_data(sample_data_no_header)
