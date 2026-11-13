@@ -1,0 +1,15 @@
+{
+  "table": "sales.csv",
+  "sheet_name": null,
+  "header_rows": [0],
+  "label_col": 0,
+  "row_total_col": 4,
+  "col_total_rows": [4],
+  "grand_total_row": 4,
+  "masks": ["?"],
+  "bounds": {
+    "default": [0, 100],
+    "rows": {"1": [0, 50]},
+    "cells": {"2, 3": [0, 50]}
+  }
+}

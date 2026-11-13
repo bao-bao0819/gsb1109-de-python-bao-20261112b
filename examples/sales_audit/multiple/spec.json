@@ -1,0 +1,12 @@
+{
+  "table": "sales.csv",
+  "header_rows": [0],
+  "label_col": 0,
+  "row_total_col": 3,
+  "col_total_rows": [3],
+  "grand_total_row": 3,
+  "masks": ["?"],
+  "bounds": {
+    "default": [0, 10]
+  }
+}
