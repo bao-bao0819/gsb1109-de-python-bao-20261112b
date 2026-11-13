@@ -206,13 +206,23 @@ class Worksheet(object):
     ## Properties, "getters", "setters"
     #################################################################
 
-    def set_name(self, value):
+    def _set_name(self, value):
         self.__name = value
+
+    def set_name(self, value):
+        self.__parent._rename_one_sheet(self, value)
 
     def get_name(self):
         return self.__name
 
     name = property(get_name, set_name)
+
+    def rename(self, value):
+        """
+        Rename this worksheet. Equivalent to assigning :attr:`name`; the
+        workbook validates the result and keeps its name index in sync.
+        """
+        self.set_name(value)
 
     #################################################################
 

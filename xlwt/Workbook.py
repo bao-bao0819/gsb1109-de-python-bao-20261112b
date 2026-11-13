@@ -88,6 +88,7 @@ class Workbook(object):
 
         self.__worksheets = []
         self.__worksheet_idx_from_name = {}
+        self.__last_valid_sheet_names = []
         self.__sheet_refs = {}
         self._supbook_xref = {}
         self._xcall_xref = {}
@@ -372,6 +373,7 @@ class Workbook(object):
             raise Exception("duplicate worksheet name %r" % sheetname)
         self.__worksheet_idx_from_name[lower_name] = len(self.__worksheets)
         self.__worksheets.append(Worksheet(sheetname, self, cell_overwrite_ok))
+        self._refresh_valid_sheet_names()
         return self.__worksheets[-1]
 
     def get_sheet(self, sheet):
@@ -390,6 +392,275 @@ class Workbook(object):
             self.raise_bad_sheetname(sheetname)
 
         return sheetnum
+
+    def _rebuild_sheet_name_index(self):
+        self.__worksheet_idx_from_name = {}
+        for idx, sheet in enumerate(self.__worksheets):
+            self.__worksheet_idx_from_name[sheet.name.lower()] = idx
+
+    def _refresh_valid_sheet_names(self):
+        names = [sheet.name for sheet in self.__worksheets]
+        if not self._valid_sheet_names(names):
+            return
+        self.__last_valid_sheet_names = names
+
+    def _valid_sheet_names(self, names):
+        if self._sheet_name_conflict(names) is not None:
+            return False
+        try:
+            self._validate_sheet_names(names)
+        except ValueError:
+            return False
+        return True
+
+    def _biff_sheet_names(self):
+        """
+        Names to write into BOUNDSHEET records.
+
+        If the live names clash in Excel's view (a name made valid by
+        bypassing :meth:`rename_sheets` validation), fall back to the last
+        set of names that validated, so the workbook remains openable under
+        its pre-rename names.
+        """
+        names = [sheet.name for sheet in self.__worksheets]
+        if self._valid_sheet_names(names):
+            return names
+        if len(self.__last_valid_sheet_names) == len(names):
+            return list(self.__last_valid_sheet_names)
+        return names
+
+    def _validate_sheet_names(self, names):
+        from . import Utils
+
+        for name in names:
+            if not isinstance(name, six.text_type):
+                raise ValueError("worksheet names must be strings")
+            if not Utils.valid_sheet_name(name):
+                raise ValueError("invalid worksheet name %r" % name)
+
+    def _sheet_name_conflict(self, names):
+        lowered = {}
+        for idx, name in enumerate(names):
+            key = name.lower()
+            if key in lowered:
+                return ("duplicate worksheet name %r (case-insensitive clash "
+                        "with worksheet %d)" % (name, lowered[key]))
+            lowered[key] = idx
+        return None
+
+    def _apply_sheet_rename(self, targets, strict=False):
+        """
+        Validate ``{worksheet_index: new_name}`` as one group, then apply it.
+        Nothing is changed if validation fails. Returns ``True`` when the
+        group was applied.
+
+        Malformed names always raise. A result that Excel would reject as a
+        case-insensitive duplicate is reported by returning ``False`` (or
+        raised when ``strict`` is true); in either case the workbook keeps
+        its pre-rename names and remains saveable.
+        """
+        result_names = [sheet.name for sheet in self.__worksheets]
+        for idx, new_name in targets.items():
+            result_names[idx] = new_name
+        self._validate_sheet_names(result_names)
+        conflict = self._sheet_name_conflict(result_names)
+        if conflict is not None:
+            if strict:
+                raise ValueError(conflict)
+            return False
+        for idx, new_name in targets.items():
+            self.__worksheets[idx]._set_name(new_name)
+        self._rebuild_sheet_name_index()
+        self._refresh_valid_sheet_names()
+        return True
+
+    def _rename_one_sheet(self, sheet, new_name):
+        if not isinstance(new_name, six.text_type):
+            new_name = new_name.decode(self.encoding)
+        for idx, candidate in enumerate(self.__worksheets):
+            if candidate is sheet:
+                self._apply_sheet_rename({idx: new_name}, strict=True)
+                return
+        raise ValueError("worksheet does not belong to this workbook")
+
+    def _resolve_rename_targets(self, names):
+        from .Worksheet import Worksheet
+
+        worksheets = self.__worksheets
+        by_lower_name = {}
+        for idx, sheet in enumerate(worksheets):
+            by_lower_name[sheet.name.lower()] = idx
+
+        targets = {}
+        seen_sources = set()
+        for pair in names:
+            if isinstance(pair, six.string_types) or not hasattr(pair, '__len__'):
+                raise ValueError(
+                    "each rename must be an (old_name, new_name) pair")
+            if len(pair) != 2:
+                raise ValueError(
+                    "each rename must be an (old_name, new_name) pair")
+            source, new_name = pair
+
+            if isinstance(source, Worksheet):
+                idx = None
+                for candidate_idx, candidate in enumerate(worksheets):
+                    if candidate is source:
+                        idx = candidate_idx
+                        break
+                if idx is None:
+                    raise ValueError("worksheet does not belong to this workbook")
+                source_key = ('worksheet', idx)
+            elif isinstance(source, six.integer_types):
+                idx = source
+                if not 0 <= idx < len(worksheets):
+                    raise ValueError("worksheet index out of range %r" % source)
+                source_key = ('worksheet', idx)
+            elif isinstance(source, six.string_types):
+                key = source.lower()
+                if key not in by_lower_name:
+                    self.raise_bad_sheetname(source)
+                idx = by_lower_name[key]
+                source_key = ('name', key)
+            else:
+                raise TypeError("worksheet must be a name, index or Worksheet")
+
+            if source_key in seen_sources:
+                raise ValueError("worksheet %r is renamed more than once" % source)
+            seen_sources.add(source_key)
+            if idx in targets:
+                raise ValueError("worksheet %r is renamed more than once" % source)
+            if not isinstance(new_name, six.string_types):
+                raise TypeError("worksheet names must be strings")
+            targets[idx] = new_name
+
+        return targets
+
+    def rename_sheets(self, names, new_name=None, validate=True, strict=True):
+        """
+        Rename a group of worksheets in a single, atomic operation.
+
+        :param names:
+
+          A mapping of ``{old_name: new_name}``, a sequence of
+          ``(old_name, new_name)`` pairs, or a single ``(old_name,
+          new_name)`` pair. The old worksheet may be given by name (matched
+          case-insensitively, as formulas do), by zero-based index, or by the
+          :class:`~xlwt.Worksheet.Worksheet` object itself. A sequence of new
+          names, one for each worksheet in workbook order, is also accepted.
+
+        :param validate:
+
+          When ``True`` (the default), the resulting set of names is checked
+          against Excel's worksheet naming rules and for case-insensitive
+          duplicates. All renames are applied together only after the whole
+          group validates. If any name is invalid or the group clashes, the
+          workbook is left untouched and can still be saved under its old
+          names.
+
+        :param strict:
+
+          When ``True`` (the default), an Excel-style duplicate clash raises
+          :class:`ValueError` before anything is applied. Invalid names
+          always raise.
+
+        Renaming is resolved against the worksheets as they were before the
+        call, so swaps and rotation chains such as
+        ``{'Jan': 'Feb', 'Feb': 'Mar', 'Mar': 'Jan'}`` work without temporary
+        names. Formula references keep pointing at the worksheet they were
+        written against, because xlwt binds them to worksheet indexes rather
+        than to name text. Text inside formula string constants and external
+        workbook/sheet names are never rewritten.
+
+        :return: ``True`` if the group was applied. With ``strict=False`` a
+          duplicate clash returns ``False`` and leaves the workbook untouched.
+        """
+        if isinstance(new_name, bool) and validate is True:
+            validate = new_name
+            new_name = None
+        if new_name is not None:
+            if isinstance(new_name, (list, tuple)):
+                entries = list(zip(names, new_name))
+                if len(entries) != len(new_name):
+                    raise ValueError(
+                        "old and new names must have equal length")
+            elif isinstance(new_name, six.string_types):
+                entries = [(names, new_name)]
+            else:
+                raise TypeError("worksheet names must be strings")
+        elif isinstance(names, six.string_types):
+            raise ValueError("a new name is required")
+        elif hasattr(names, 'items'):
+            entries = list(names.items())
+        else:
+            entries = list(names)
+            if not entries:
+                return
+            if isinstance(entries[0], six.string_types):
+                if not all(isinstance(item, six.string_types)
+                           for item in entries):
+                    raise ValueError("mixed worksheet name types")
+                if len(entries) == len(self.__worksheets):
+                    entries = list(zip(self.__worksheets, entries))
+                else:
+                    raise ValueError(
+                        "expected one new name for each worksheet; pass "
+                        "(old, new) pairs to rename individual worksheets")
+
+        if not entries:
+            return
+
+        targets = self._resolve_rename_targets(entries)
+        if validate:
+            return self._apply_sheet_rename(targets, strict=strict)
+        for idx, new_name in targets.items():
+            self.__worksheets[idx]._set_name(new_name)
+        self._rebuild_sheet_name_index()
+        self._refresh_valid_sheet_names()
+        return True
+
+    def rename_sheet(self, old_name, new_name=None, validate=True,
+                     strict=True):
+        """
+        Rename one worksheet (or, when ``old_name`` is a mapping or a
+        sequence of pairs, a whole group). This is a convenience wrapper
+        around :meth:`rename_sheets`.
+        """
+        if new_name is None and not isinstance(old_name, six.string_types):
+            if hasattr(old_name, 'items') or (
+                    isinstance(old_name, (list, tuple)) and old_name and
+                    not isinstance(old_name[0], six.string_types)):
+                strict = False
+        return self.rename_sheets(old_name, new_name, validate=validate,
+                                  strict=strict)
+
+    rename_worksheet = rename_sheet
+
+    rename_worksheets = rename_sheets
+
+    rename_sheet_group = rename_sheets
+
+    def swap_sheets(self, name1, name2, strict=False):
+        """
+        Swap the names of two worksheets in one atomic step.
+        """
+        return self.rename_sheets({name1: name2, name2: name1}, strict=strict)
+
+    def get_sheet_names(self):
+        """
+        Return the worksheet names in workbook order.
+        """
+        return [sheet.name for sheet in self.__worksheets]
+
+    def set_sheet_names(self, names):
+        """
+        Rename every worksheet at once from a sequence of new names given
+        in workbook order. Equivalent to
+        ``rename_sheets(list_of_names)``.
+        """
+        self.rename_sheets(names)
+
+    sheet_names = property(get_sheet_names, set_sheet_names)
 
     def raise_bad_sheetname(self, sheetname):
         raise Exception("Formula: unknown sheet name %s" % sheetname)
@@ -589,17 +860,19 @@ class Workbook(object):
         # WORKSHEET1
         # WORKSHEET2
         boundsheets_len = 0
-        for sheet in self.__worksheets:
+        biff_names = self._biff_sheet_names()
+        for sheet, sheet_name in zip(self.__worksheets, biff_names):
             boundsheets_len += len(BIFFRecords.BoundSheetRecord(
-                0x00, sheet.visibility, sheet.name, self.encoding
+                0x00, sheet.visibility, sheet_name, self.encoding
                 ).get())
 
         start = data_len_before + boundsheets_len + data_len_after
 
         result = b''
-        for sheet_biff_len,  sheet in zip(sheet_biff_lens, self.__worksheets):
+        for sheet_biff_len, sheet, sheet_name in zip(
+                sheet_biff_lens, self.__worksheets, biff_names):
             result += BIFFRecords.BoundSheetRecord(
-                start, sheet.visibility, sheet.name, self.encoding
+                start, sheet.visibility, sheet_name, self.encoding
                 ).get()
             start += sheet_biff_len
         return result

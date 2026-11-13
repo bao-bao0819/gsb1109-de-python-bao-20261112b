@@ -3,6 +3,22 @@ Changes
 
 .. currentmodule:: xlwt
 
+Unreleased
+----------
+
+- Add :meth:`Workbook.rename_sheets` for atomic, group worksheet renames.
+  Old names may be given by name, index or worksheet object, and swaps or
+  rotation chains are resolved against the pre-call names. Formula
+  references stay bound to the worksheet they were written against; formula
+  string constants and external workbook/sheet names are untouched. Results
+  that Excel would reject as duplicate names raise before anything changes,
+  and the workbook stays saveable under its previous names; pass
+  ``strict=False`` to get a ``False`` return instead.
+
+- Assigning :attr:`Worksheet.name` now keeps :meth:`Workbook.sheet_index`
+  in sync and rejects invalid or duplicate names instead of silently
+  corrupting the name index.
+
 1.3.0 (22 August 2017)
 ----------------------
 
