@@ -991,6 +991,10 @@ class TableColumnInferer(object):
         self.expected_column_count = input_params.expected_column_count
         self.input_delimiter = input_params.delimiter
         self.disable_column_type_detection = input_params.disable_column_type_detection
+        self.identifier_aware_type_detection = input_params.identifier_aware_type_detection
+        # Columns demoted to text during streaming, before the sample-based analysis
+        # has run. Each entry is the column number (0-based).
+        self.identifier_aware_text_columns = set()
 
     def _generate_content_signature(self):
         return OrderedDict({
@@ -1001,7 +1005,8 @@ class TableColumnInferer(object):
             "header_row": self.header_row,
             "expected_column_count": self.expected_column_count,
             "input_delimiter": self.input_delimiter,
-            "disable_column_type_detection": self.disable_column_type_detection
+            "disable_column_type_detection": self.disable_column_type_detection,
+            "identifier_aware_type_detection": self.identifier_aware_type_detection
         })
 
     def analyze(self, filename, col_vals):
@@ -1012,6 +1017,10 @@ class TableColumnInferer(object):
             self.header_row = col_vals
             self.header_row_filename = filename
         else:
+            if self.identifier_aware_type_detection and not self.disable_column_type_detection:
+                # Only data rows provide identifier evidence - the header row must never
+                # demote a column, even when its cells happen to be non-numeric text.
+                self._detect_identifier_evidence(col_vals)
             self.rows.append(col_vals)
 
         if len(self.rows) < 100:
@@ -1019,6 +1028,37 @@ class TableColumnInferer(object):
 
         self.do_analysis()
         return True
+
+    # A value is identifier evidence when it is either plain non-numeric text (e.g.
+    # "A1"), or an integer literal whose textual form is not the canonical rendering of
+    # the number it parses to (e.g. "001", "+1"). Float literals, including scientific
+    # notation such as "1e5", are left numeric so a column that is numeric all the way
+    # through remains numeric and summable. Leading/trailing whitespace is stripped
+    # consistently with the rest of the type detection.
+    def _is_numeric_literal_identifier(self, value):
+        stripped = value.strip()
+        try:
+            int_value = int(stripped)
+        except (ValueError, TypeError):
+            try:
+                float(stripped)
+            except (ValueError, TypeError):
+                return True
+            return False
+        return str(int_value) != stripped
+
+    def _detect_identifier_evidence(self, col_vals):
+        for column_number, value in enumerate(col_vals):
+            if column_number in self.identifier_aware_text_columns:
+                continue
+            if value is None:
+                continue
+            stripped = value.strip()
+            if stripped == '':
+                continue
+            if self._is_numeric_literal_identifier(value):
+                xprint("Identifier-aware detection: demoting column %s to text due to value '%s'" % (column_number, value))
+                self.identifier_aware_text_columns.add(column_number)
 
     def force_analysis(self):
         # This method is called whenever there is no more data, and an analysis needs
@@ -1215,12 +1255,34 @@ class TableColumnInferer(object):
                 column_value_list2)
             self.column_types2.append(column_type2)
 
+        if self.identifier_aware_type_detection:
+            self.apply_identifier_aware_demotions()
+
         comparison = map(
             lambda x: x[0] == x[1], zip(self.column_types, self.column_types2))
         if False in comparison and not self.skip_header:
             number_of_column_types = len(set(self.column_types))
             if number_of_column_types == 1 and list(set(self.column_types))[0] == str:
                 print('Warning - There seems to be header line in the file, but -H has not been specified. All fields will be detected as text fields, and the header line will appear as part of the data', file=sys.stderr)
+
+    # Demotes every column with identifier evidence from its sample-inferred numeric
+    # type to text. Safe to call again once more evidence has been collected.
+    def apply_identifier_aware_demotions(self):
+        if not self.identifier_aware_type_detection:
+            return
+        for column_number in self.identifier_aware_text_columns:
+            if column_number < len(self.column_types):
+                self.column_types[column_number] = str
+                self.column_types2[column_number] = str
+
+    # Returns the columns whose inferred numeric type must be changed to text because
+    # identifier evidence arrived after the table was created.
+    def get_late_demoted_numeric_columns(self):
+        demoted = []
+        for column_number in self.identifier_aware_text_columns:
+            if column_number < len(self.column_types) and self.column_types[column_number] != str:
+                demoted.append(column_number)
+        return demoted
 
     def get_column_dict(self):
         return OrderedDict(zip(self.column_names, self.column_types))
@@ -1727,6 +1789,9 @@ class MaterializedDelimitedFileState(MaterializedState):
         if not stop_after_analysis:
             table_creator.perform_read_fully(self.dialect_id)
 
+            # Identifier-aware demotions may have changed column types after analysis
+            self.mfs_structure.update_column_types(table_creator.column_inferer.get_column_types())
+
             self.save_cache_to_disk_if_needed(disk_db_filename, table_creator)
 
 
@@ -2099,6 +2164,12 @@ class MaterializedStateTableStructure(object):
     def get_table_name_for_querying(self):
         return self.table_name_for_querying
 
+    # Late identifier-aware demotions happen after the analysis-phase structure was
+    # built, so the recorded column types must be refreshed once the full read is done.
+    def update_column_types(self, python_column_types):
+        self.python_column_types = python_column_types
+        self.sqlite_column_types = [Sqlite3DB.PYTHON_TO_SQLITE_TYPE_NAMES[t].lower() for t in python_column_types]
+
     def __str__(self):
         return "MaterializedStateTableStructure<%s>" % self.__dict__
     __repr__ = __str__
@@ -2133,6 +2204,13 @@ class TableCreator(object):
         self.pre_creation_rows = []
         self.buffered_inserts = []
         self.effective_column_names = None
+
+        # Identifier-aware detection may demote a numeric column to text after the
+        # table has already been created. All rows are retained in that case, so the
+        # table can be recreated without re-reading the (potentially non-rereadable)
+        # input stream.
+        self.identifier_aware_type_detection = input_params.identifier_aware_type_detection
+        self.all_data_rows = []
 
         # Column type indices for columns that contain numeric types. Lazily initialized
         # so column inferer can do its work before this information is needed
@@ -2323,6 +2401,21 @@ class TableCreator(object):
         assert False, "Unidentified parsing mode %s" % self.mode
 
     def _insert_row_i(self, col_vals):
+        if self.identifier_aware_type_detection:
+            # The table already exists, so the sampling-phase inferer does not see this
+            # row. Detect identifier evidence here and recreate the table if a column that
+            # was classified as numeric must actually be treated as text.
+            self.column_inferer._detect_identifier_evidence(col_vals)
+            demoted_columns = self.column_inferer.get_late_demoted_numeric_columns()
+            if demoted_columns:
+                self._recreate_table_with_demoted_columns(demoted_columns)
+
+            # Retain the raw row so the table can be rebuilt from the beginning when a
+            # later row provides identifier evidence. The input may be a pipe or other
+            # stream which cannot be read a second time. Rows are kept pre-normalization
+            # so they are re-normalized against the final column types.
+            self.all_data_rows.append(col_vals[:])
+
         col_vals = self.normalize_col_vals(col_vals)
 
         if self.effective_column_names is None:
@@ -2335,6 +2428,38 @@ class TableCreator(object):
 
         if len(self.buffered_inserts) < 5000:
             return
+        self._flush_inserts()
+
+    def _recreate_table_with_demoted_columns(self, demoted_columns):
+        xprint("Recreating table %s after identifier-aware demotion of columns %s" % (self.target_sqlite_table_name, demoted_columns))
+
+        # Make sure all rows inserted so far are present in the about-to-be-dropped table
+        self._flush_inserts()
+
+        self.column_inferer.apply_identifier_aware_demotions()
+        # Numeric column indices depend on the inferred types and must be recomputed
+        self.numeric_column_indices = None
+
+        self.sqlite_db.execute_and_fetch(
+            self.sqlite_db.generate_drop_table(self.target_sqlite_table_name))
+
+        column_dict = self.column_inferer.get_column_dict()
+        if len(column_dict) == 0:
+            column_dict = {'dummy_column_for_empty_tables': str}
+            ordered_column_names = ['dummy_column_for_empty_tables']
+        else:
+            ordered_column_names = self.column_inferer.get_column_names()
+
+        create_table_stmt = self.sqlite_db.generate_create_table(
+            self.target_sqlite_table_name, ordered_column_names, column_dict)
+        self.sqlite_db.execute_and_fetch(create_table_stmt)
+
+        # Rebuild the table from the retained rows using the new schema, without
+        # re-reading the input source
+        retained_rows = self.all_data_rows
+        self.all_data_rows = []
+        for retained_row in retained_rows:
+            self._insert_row_i(retained_row)
         self._flush_inserts()
 
     def _flush_inserts(self):
@@ -2464,6 +2589,7 @@ class QInputParams(object):
             expected_column_count=None,keep_leading_whitespace_in_values=False,
             disable_double_double_quoting=False,disable_escaped_double_quoting=False,
             disable_column_type_detection=False,
+            identifier_aware_type_detection=False,
             input_quoting_mode='minimal',stdin_file=None,stdin_filename='-',
             max_column_length_limit=131072,
             read_caching=False,
@@ -2481,6 +2607,11 @@ class QInputParams(object):
         self.disable_escaped_double_quoting = disable_escaped_double_quoting
         self.input_quoting_mode = input_quoting_mode
         self.disable_column_type_detection = disable_column_type_detection
+        # When enabled, a column which initially looks numeric is demoted to text as
+        # soon as identifier evidence (a non-numeric literal, or a numeric-looking
+        # literal whose text form is not its numeric value, e.g. 001) is encountered.
+        # Columns that stay numeric all the way through remain numeric and summable.
+        self.identifier_aware_type_detection = identifier_aware_type_detection
         self.max_column_length_limit = max_column_length_limit
         self.read_caching = read_caching
         self.write_caching = write_caching
@@ -3318,6 +3449,8 @@ def initialize_command_line_parser(p, qrc_filename):
                                                                          True)
         default_disable_column_type_detection = get_option_with_default(p, 'boolean', 'disable_column_type_detection',
                                                                         False)
+        default_identifier_aware_type_detection = get_option_with_default(p, 'boolean', 'identifier_aware_type_detection',
+                                                                          False)
         default_input_quoting_mode = get_option_with_default(p, 'string', 'input_quoting_mode', 'minimal')
         default_max_column_length_limit = get_option_with_default(p, 'int', 'max_column_length_limit', 131072)
         default_with_universal_newlines = get_option_with_default(p, 'boolean', 'with_universal_newlines', False)
@@ -3388,6 +3521,10 @@ def initialize_command_line_parser(p, qrc_filename):
     input_data_option_group.add_argument("--as-text", dest="disable_column_type_detection",
                                        default=default_disable_column_type_detection, action="store_true",
                                        help="Don't detect column types - All columns will be treated as text columns")
+    input_data_option_group.add_argument("--identifier-aware", "--identifier-aware-type-detection",
+                                       dest="identifier_aware_type_detection",
+                                       default=default_identifier_aware_type_detection, action="store_true",
+                                       help="Treat columns containing identifier evidence (non-numeric literals, or numeric-looking literals whose original form is not the number itself, e.g. 001) as text, even when the first rows look numeric. Earlier rows keep their original literals for joins and grouping, while columns that are numeric all the way through remain numeric and summable. Works with non-rereadable input streams.")
     input_data_option_group.add_argument("-w", "--input-quoting-mode", 
                                        default=default_input_quoting_mode,
                                        help="Input quoting mode. Possible values are all, minimal and none. Note the slightly misleading parameter name, and see the matching -W parameter for output quoting.")
@@ -3619,6 +3756,7 @@ def parse_options(args, options):
                                         disable_escaped_double_quoting=options.disable_escaped_double_quoting,
                                         input_quoting_mode=options.input_quoting_mode,
                                         disable_column_type_detection=options.disable_column_type_detection,
+                                        identifier_aware_type_detection=options.identifier_aware_type_detection,
                                         max_column_length_limit=max_column_length_limit,
                                         read_caching=read_caching,
                                         write_caching=write_caching,

@@ -3068,6 +3068,7 @@ disable_escaped_double_quoting=False
 encoding=ascii
 formatting=xxx
 gzipped=True
+identifier_aware_type_detection=False
 input_quoting_mode=all
 keep_leading_whitespace_in_values=True
 list_user_functions=True
@@ -3095,7 +3096,7 @@ with_universal_newlines=True
         retcode, o, e = run_command(cmd, env_to_inject=env_to_inject)
 
         self.assertEqual(retcode, 0)
-        self.assertEqual(len(o), 34)
+        self.assertEqual(len(o), 35)
         self.assertEqual(len(e), 0)
 
         self.assertEqual(o[0],six.b('[options]'))
@@ -3117,6 +3118,7 @@ with_universal_newlines=True
         self.assertEqual(m[six.b('encoding')],six.b('ascii'))
         self.assertEqual(m[six.b('formatting')],six.b('xxx'))
         self.assertEqual(m[six.b('gzipped')],six.b('True'))
+        self.assertEqual(m[six.b('identifier_aware_type_detection')],six.b('False'))
         self.assertEqual(m[six.b('input_quoting_mode')],six.b('all'))
         self.assertEqual(m[six.b('keep_leading_whitespace_in_values')],six.b('True'))
         self.assertEqual(m[six.b('list_user_functions')],six.b('True'))
@@ -5053,6 +5055,213 @@ class SqlTests(AbstractQTestCase):
         self.assertEqual(o[2],six.b("regular text 3,123,123,33.4"))
         self.assertEqual(o[3],six.b("regular text 4,-123,-123,0122.2"))
 
+        self.cleanup(tmpfile)
+
+
+class IdentifierAwareTypeDetectionTests(AbstractQTestCase):
+
+    # More than the 100-row analysis sample, so the first rows lock the column in as
+    # int before the identifier evidence (001, A1) arrives late in the stream.
+    def generate_late_identifier_content(self):
+        rows = [six.b("1,%s" % i) for i in range(1, 121)]
+        rows += [six.b("001,999"), six.b("A1,5")]
+        return six.b("\n").join(rows) + six.b("\n")
+
+    def test_late_identifier_evidence_keeps_original_literals_when_grouping(self):
+        tmpfile = self.create_file_with_data(self.generate_late_identifier_content())
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select c1, count(*) from %s group by c1 order by c1"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b("001,1"), six.b("1,120"), six.b("A1,1")])
+
+        self.cleanup(tmpfile)
+
+    def test_numeric_column_still_summable_with_identifier_aware_detection(self):
+        tmpfile = self.create_file_with_data(self.generate_late_identifier_content())
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select c1, sum(c2) from %s group by c1 order by c1"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        # c1 is text (identifier), c2 stays numeric and is summed normally
+        self.assertEqual(o, [six.b("001,999"), six.b("1,7260"), six.b("A1,5")])
+
+        self.cleanup(tmpfile)
+
+    def test_purely_numeric_columns_remain_numeric(self):
+        tmpfile = self.create_file_with_data(six.b("1,10\n2,20\n3,30\n"))
+
+        analyze_cmd = Q_EXECUTABLE + ' -d , --identifier-aware -A "select * from %s"' % tmpfile.name
+        retcode, o, e = run_command(analyze_cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o[4], six.b('    `c1` - int'))
+        self.assertEqual(o[5], six.b('    `c2` - int'))
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select sum(c1), sum(c2) from %s"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b("6,60")])
+
+        self.cleanup(tmpfile)
+
+    def test_float_and_scientific_notation_values_stay_numeric(self):
+        tmpfile = self.create_file_with_data(six.b("1e5,1.0\n200000,2.0\n300000,3.0\n"))
+
+        analyze_cmd = Q_EXECUTABLE + ' -d , --identifier-aware -A "select * from %s"' % tmpfile.name
+        retcode, o, e = run_command(analyze_cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o[4], six.b('    `c1` - real'))
+        self.assertEqual(o[5], six.b('    `c2` - real'))
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select sum(c1), sum(c2) from %s"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(o, [six.b("600000.0,6.0")])
+
+        self.cleanup(tmpfile)
+
+    def test_header_row_text_does_not_demote_numeric_columns(self):
+        tmpfile = self.create_file_with_data(six.b("product_id,amount\n1,10\n2,20\n3,30\n"))
+
+        analyze_cmd = Q_EXECUTABLE + ' -d , -H --identifier-aware -A "select * from %s"' % tmpfile.name
+        retcode, o, e = run_command(analyze_cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o[4], six.b('    `product_id` - int'))
+        self.assertEqual(o[5], six.b('    `amount` - int'))
+
+        cmd = Q_EXECUTABLE + ' -d , -H --identifier-aware "select sum(amount) from %s"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(o, [six.b("60")])
+
+        self.cleanup(tmpfile)
+
+    def test_pipe_and_disk_produce_the_same_groups(self):
+        tmpfile = self.create_file_with_data(self.generate_late_identifier_content())
+
+        disk_cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select c1, count(*) from %s group by c1 order by c1"' % tmpfile.name
+        disk_retcode, disk_o, disk_e = run_command(disk_cmd)
+
+        pipe_cmd = 'cat %s | ' % tmpfile.name + Q_EXECUTABLE + ' -d , --identifier-aware "select c1, count(*) from - group by c1 order by c1"'
+        pipe_retcode, pipe_o, pipe_e = run_command(pipe_cmd)
+
+        self.assertEqual(disk_retcode, 0)
+        self.assertEqual(pipe_retcode, 0)
+        self.assertEqual(len(disk_e), 0)
+        self.assertEqual(len(pipe_e), 0)
+        # The same file must produce one identical grouping table regardless of source
+        self.assertEqual(pipe_o, disk_o)
+        self.assertEqual(disk_o, [six.b("001,1"), six.b("1,120"), six.b("A1,1")])
+
+        self.cleanup(tmpfile)
+
+    def test_join_uses_original_literals(self):
+        orders_file = self.create_file_with_data(self.generate_late_identifier_content())
+        master_file = self.create_file_with_data(six.b("001,leading-zero-item\n1,plain-item\nA1,alpha-item\n"))
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select o.c1, m.c2, o.c2 from %s o join %s m on (o.c1 = m.c1) order by o.c1, o.c2"' % (orders_file.name, master_file.name)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        # Every order row joins on its literal identifier
+        self.assertEqual(len(o), 122)
+        self.assertEqual(o[0], six.b("001,leading-zero-item,999"))
+        self.assertEqual(o[-1], six.b("A1,alpha-item,5"))
+        self.assertEqual(len([row for row in o if row.startswith(six.b("1,plain-item,"))]), 120)
+
+        self.cleanup(orders_file)
+        self.cleanup(master_file)
+
+    def test_identifier_evidence_within_analysis_sample_demotes_to_text(self):
+        tmpfile = self.create_file_with_data(six.b("1,5\n001,7\n2,9\n"))
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware -A "select * from %s"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o[4], six.b('    `c1` - text'))
+        self.assertEqual(o[5], six.b('    `c2` - int'))
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select c1, sum(c2) from %s group by c1 order by c1"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(o, [six.b("001,7"), six.b("1,5"), six.b("2,9")])
+
+        self.cleanup(tmpfile)
+
+    def test_empty_value_in_demoted_column_stays_empty_string(self):
+        # c1 is demoted to text by 001; the empty c1 literal must remain an empty
+        # string, while the empty value in the still-numeric c2 becomes null.
+        tmpfile = self.create_file_with_data(six.b("1,10\n001,\n,30\n"))
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select c2 from %s where c1 == %s"' % (tmpfile.name, "''")
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b("30")])
+
+        cmd = Q_EXECUTABLE + ' -d , --identifier-aware "select c1 from %s where c2 is null"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b("001")])
+
+        self.cleanup(tmpfile)
+
+    def test_default_detection_still_merges_literals_without_the_flag(self):
+        # Documents that the new behavior is strictly opt-in
+        tmpfile = self.create_file_with_data(self.generate_late_identifier_content())
+
+        cmd = Q_EXECUTABLE + ' -d , "select c1, count(*) from %s group by c1 order by c1"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(o, [six.b("1,121"), six.b("A1,1")])
+
+        self.cleanup(tmpfile)
+
+    def test_identifier_aware_option_through_qrc(self):
+        tmpfile = self.create_file_with_data(self.generate_late_identifier_content())
+        qrc_file = self.create_file_with_data(six.b('[options]\nidentifier_aware_type_detection=True\n'))
+        env_to_inject = {'QRC_FILENAME': qrc_file.name}
+
+        cmd = Q_EXECUTABLE + ' -d , "select c1, count(*) from %s group by c1 order by c1"' % tmpfile.name
+        retcode, o, e = run_command(cmd, env_to_inject=env_to_inject)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(o, [six.b("001,1"), six.b("1,120"), six.b("A1,1")])
+
+        self.cleanup(qrc_file)
+        self.cleanup(tmpfile)
+
+    def test_identifier_aware_detection_over_data_stream(self):
+        tmpfile = self.create_file_with_data(self.generate_late_identifier_content())
+
+        data_streams_dict = {
+            '-': DataStream('stdin', '-', codecs.open(tmpfile.name, 'rb', encoding='utf-8'))
+        }
+        q = QTextAsData(QInputParams(delimiter=',', identifier_aware_type_detection=True),
+                        data_streams_dict=data_streams_dict)
+        r = q.execute('select c1, count(*) from - group by c1 order by c1')
+
+        self.assertEqual(r.status, 'ok')
+        self.assertEqual(r.data, [('001', 1), ('1', 120), ('A1', 1)])
+        self.assertEqual(r.metadata.table_structures['-'].python_column_types, [str, int])
+        self.assertEqual(r.metadata.table_structures['-'].sqlite_column_types, ['text', 'int'])
+
+        q.done()
         self.cleanup(tmpfile)
 
 

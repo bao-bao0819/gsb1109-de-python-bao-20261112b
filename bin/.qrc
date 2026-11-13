@@ -21,5 +21,6 @@
 #gzipped: False
 #beautify: True
 #skip_header: False
+#identifier_aware_type_detection: False
 #formatting: 1=%4.3f,2=%4.3f
 #encoding: UTF-8
