@@ -41,6 +41,13 @@ report-long-jobs
 
     .. automodule:: mrjob.tools.emr.report_long_jobs
 
+.. _reuse-check-tool:
+
+reuse-check
+^^^^^^^^^^^
+
+    .. automodule:: mrjob.tools.reuse_check
+
 s3-tmpwatch
 ^^^^^^^^^^^
 

@@ -99,6 +99,13 @@ def _report_long_jobs(args):
     main(args)
 
 
+@_command('reuse-check', 'Show per-step reuse/recompute reasons for a'
+          ' reuse store')
+def _reuse_check(args):
+    from mrjob.tools.reuse_check import main
+    main(args)
+
+
 @_command('s3-tmpwatch', 'Delete S3 keys older than a specified time')
 def _s3_tmpwatch(args):
     from mrjob.tools.emr.s3_tmpwatch import main

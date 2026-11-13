@@ -19,6 +19,7 @@ Reference
     protocols.rst
     runners-spark.rst
     utils-retry.rst
+    reuse.rst
     runners-runner.rst
     step.rst
     utils-setup.rst

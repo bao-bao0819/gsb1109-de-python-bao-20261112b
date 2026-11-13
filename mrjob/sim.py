@@ -40,6 +40,8 @@ from mrjob.conf import combine_local_envs
 from mrjob.fs.local import _from_file_uri
 from mrjob.logs.counters import _format_counters
 from mrjob.parse import parse_mr_job_stderr
+from mrjob.reuse import REUSE
+from mrjob.reuse_mixin import StepReuseMixin
 from mrjob.runner import MRJobRunner
 from mrjob.runner import _fix_env
 from mrjob.step import _is_spark_step_type
@@ -51,7 +53,7 @@ log = logging.getLogger(__name__)
 # This class defers execution to a lot of other functions because of local
 # mode which uses :mod:`multiprocessing`, which relies on pickling.
 
-class SimMRJobRunner(MRJobRunner):
+class SimMRJobRunner(StepReuseMixin, MRJobRunner):
 
     # keyword arguments that we ignore because they require real Hadoop.
     # We look directly at self._<kwarg_name> because they aren't in
@@ -151,14 +153,44 @@ class SimMRJobRunner(MRJobRunner):
         # this does nothing in inline mode, since there's no _spark_master()
         self._copy_files_to_wd_mirror()
 
-        # run mapper, combiner, sort, reducer for each step
-        for step_num, step in enumerate(self._get_steps()):
-            log.info('Running step %d of %d...' % (
-                step_num + 1, self._num_steps()))
+        if not self._reuse_enabled():
+            # no reuse store: run every step exactly as before
+            for step_num, step in enumerate(self._get_steps()):
+                log.info('Running step %d of %d...' % (
+                    step_num + 1, self._num_steps()))
 
+                self._counters.append({})
+                self._run_step(step, step_num)
+            return
+
+        self._run_with_reuse()
+
+    def _run_with_reuse(self):
+        """Plan each step against the reuse store, skip (and restore)
+        reusable ones, and snapshot the output of recomputed ones."""
+        self._reuse_store.ensure_exists()
+
+        predecessor_reusable = True
+
+        for step_num, step in enumerate(self._get_steps()):
             self._counters.append({})
 
-            self._run_step(step, step_num)
+            decision = self._plan_step_reuse(
+                step_num, predecessor_reusable)
+
+            if decision.action == REUSE:
+                # don't recompute; just make the cached shards available
+                # in the output directory this step would have written
+                self._restore_reused_shards(step_num)
+            else:
+                log.info('Running step %d of %d...' % (
+                    step_num + 1, self._num_steps()))
+
+                self._run_step(step, step_num)
+                self._snapshot_step_for_reuse(
+                    step_num, predecessor_reusable)
+
+            predecessor_reusable = decision.reusable
 
     def _run_step(self, step, step_num):
         """Run an individual step. You can assume that setup wrapper scripts
