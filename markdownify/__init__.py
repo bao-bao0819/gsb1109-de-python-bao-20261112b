@@ -217,11 +217,16 @@ class MarkdownConverter(object):
         # Initialize the conversion function cache
         self.convert_fn_cache = {}
 
+        # (base_text, reading) pairs collected from <ruby> elements,
+        # in document order, for consumers that index readings separately
+        self.ruby_annotations = []
+
     def convert(self, html):
         soup = BeautifulSoup(html, **self.options['bs4_options'])
         return self.convert_soup(soup)
 
     def convert_soup(self, soup):
+        self.ruby_annotations = []
         return self.process_tag(soup, parent_tags=set())
 
     def process_element(self, node, parent_tags=None):
@@ -705,6 +710,60 @@ class MarkdownConverter(object):
 
     def convert_q(self, el, text, parent_tags):
         return '"' + text + '"'
+
+    def convert_ruby(self, el, text, parent_tags):
+        # The body text keeps only the base text; the readings are exposed
+        # separately via self.ruby_annotations for indexing purposes.
+        self._collect_ruby_annotations(el)
+        return text
+
+    def _collect_ruby_annotations(self, el):
+        rb_texts = [child.get_text()
+                    for child in el.children
+                    if isinstance(child, Tag) and child.name == 'rb']
+        rt_texts = [child.get_text()
+                    for child in el.children
+                    if isinstance(child, Tag) and child.name == 'rt']
+        if rb_texts:
+            # Explicit <rb>/<rt> markup: pair them without splitting
+            # readings across individual characters.
+            if len(rb_texts) == len(rt_texts):
+                pairs = list(zip(rb_texts, rt_texts))
+            elif len(rt_texts) == 1:
+                # one reading annotates the whole group of base characters
+                pairs = [(''.join(rb_texts), rt_texts[0])]
+            elif len(rb_texts) == 1:
+                # several readings share the same group of base characters
+                pairs = [(rb_texts[0], rt_text) for rt_text in rt_texts]
+            else:
+                # the pairing cannot be determined unambiguously
+                pairs = []
+        else:
+            # Legacy markup with omitted <rb> tags: only a base text segment
+            # directly followed by an <rt> element forms a determinable pair.
+            pairs = []
+            base_parts = []
+            for child in el.children:
+                if isinstance(child, Tag) and child.name in ('rt', 'rp'):
+                    if child.name == 'rt':
+                        base_text = ''.join(base_parts)
+                        if base_text.strip():
+                            pairs.append((base_text, child.get_text()))
+                        base_parts = []
+                elif isinstance(child, Tag):
+                    base_parts.append(child.get_text())
+                else:
+                    base_parts.append(str(child))
+        for base_text, rt_text in pairs:
+            base_text = base_text.strip()
+            rt_text = rt_text.strip()
+            if base_text and rt_text:
+                self.ruby_annotations.append((base_text, rt_text))
+
+    def convert_rt(self, el, text, parent_tags):
+        return ''
+
+    convert_rp = convert_rt
 
     def convert_script(self, el, text, parent_tags):
         return ''

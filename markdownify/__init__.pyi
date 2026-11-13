@@ -69,7 +69,9 @@ class MarkdownConverter:
         wrap_width: Union[int, None] = ...,
     ) -> None:
         ...
-  
+
+    ruby_annotations: list[tuple[str, str]]
+
     def convert(self, html: str) -> str:
         ...
 

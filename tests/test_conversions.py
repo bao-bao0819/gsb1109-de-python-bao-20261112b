@@ -1,4 +1,5 @@
-from markdownify import ATX, ATX_CLOSED, BACKSLASH, SPACES, UNDERSCORE
+from markdownify import ATX, ATX_CLOSED, BACKSLASH, SPACES, UNDERSCORE, \
+    MarkdownConverter
 from .utils import md
 
 
@@ -314,6 +315,58 @@ def test_pre():
 def test_q():
     assert md('foo <q>quote</q> bar') == 'foo "quote" bar'
     assert md('foo <q cite="https://example.com">quote</q> bar') == 'foo "quote" bar'
+
+
+def test_ruby():
+    # the body text keeps only the base text, without the reading
+    assert md('<ruby>山田<rt>やまだ</rt></ruby>') == '山田'
+    assert md('<ruby><rb>山田</rb><rt>やまだ</rt></ruby>') == '山田'
+    assert md('<ruby>山田<rp>(</rp><rt>やまだ</rt><rp>)</rp></ruby>') == '山田'
+    assert md('<ruby><rb>山</rb><rb>田</rb><rt>やま</rt><rt>だ</rt></ruby>') == '山田'
+    assert md('foo <ruby>山田<rt>やまだ</rt></ruby> bar') == 'foo 山田 bar'
+
+
+def test_ruby_annotations():
+    converter = MarkdownConverter()
+    converter.convert('<ruby>山田<rt>やまだ</rt></ruby>')
+    assert converter.ruby_annotations == [('山田', 'やまだ')]
+
+
+def test_ruby_annotations_explicit_pairs():
+    converter = MarkdownConverter()
+    converter.convert('<ruby><rb>山</rb><rb>田</rb><rt>やま</rt><rt>だ</rt></ruby>')
+    assert converter.ruby_annotations == [('山', 'やま'), ('田', 'だ')]
+
+
+def test_ruby_annotations_one_reading_for_group():
+    # one reading annotating a group of base characters is kept as a whole,
+    # not split evenly across the characters
+    converter = MarkdownConverter()
+    converter.convert('<ruby><rb>山</rb><rb>田</rb><rt>やまだ</rt></ruby>')
+    assert converter.ruby_annotations == [('山田', 'やまだ')]
+
+
+def test_ruby_annotations_shared_base():
+    # two readings sharing the same group of base characters
+    converter = MarkdownConverter()
+    converter.convert('<ruby><rb>山田</rb><rt>やまだ</rt><rt>ヤマダ</rt></ruby>')
+    assert converter.ruby_annotations == [('山田', 'やまだ'), ('山田', 'ヤマダ')]
+
+
+def test_ruby_annotations_legacy_omitted_rb():
+    # legacy markup without <rb>: only segments directly followed by <rt>
+    # enter the reading index; trailing unpaired text does not
+    converter = MarkdownConverter()
+    converter.convert('<ruby>山<rt>やま</rt>田<rt>だ</rt>氏</ruby>')
+    assert converter.ruby_annotations == [('山', 'やま'), ('田', 'だ')]
+
+
+def test_ruby_annotations_document_order():
+    # identical names stay separate, in original page position
+    converter = MarkdownConverter()
+    converter.convert('<p><ruby>山田<rt>やまだ</rt></ruby>氏と'
+                      '<ruby>山田<rt>さとう</rt></ruby>氏</p>')
+    assert converter.ruby_annotations == [('山田', 'やまだ'), ('山田', 'さとう')]
 
 
 def test_script():
