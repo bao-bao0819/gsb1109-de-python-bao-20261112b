@@ -1,0 +1,14 @@
+{
+  "audit_date": "2026-11-13",
+  "budget": 300,
+  "targets": {
+    "raw_events": {"size": 120, "expires": "2027-03-31"},
+    "archive_extract": {"size": 200, "expires": "2027-03-31"},
+    "daily_rollup": {"size": 40, "depends_on": [["raw_events"]]},
+    "q_revenue": {"size": 10, "expires": "2027-03-31",
+                  "depends_on": [["daily_rollup"], ["archive_extract"]]},
+    "q_churn": {"size": 8, "expires": "2027-03-31",
+                "depends_on": [["raw_events"]]}
+  },
+  "reports": ["q_revenue", "q_churn"]
+}
