@@ -859,6 +859,75 @@ At the end of your job, you'll get the counter's total value::
     group:
         counter_name: 1
 
+Exact, aggregatable metrics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Counters only hold integers. When you need exact decimal values (for
+example, money), use ``add_metric`` instead. Metrics are accumulated with
+:py:class:`~decimal.Decimal` arithmetic, so no rounding happens until you
+settle them.
+
+:py:meth:`~mrjob.job.MRJob.add_metric` is designed for mapper-side
+pre-aggregation. Its state lives in the task, not in the job output, and is
+sent to the runner as one exact summary when the task finishes. Each task's
+summary is merged with every other task's summary by exact addition::
+
+    class MRStoreSales(MRJob):
+
+        def mapper(self, _, line):
+            store, sales, items = line.split(',')
+            self.add_metric('net_sales', store, sales, items)
+            yield store, (sales, items)
+
+After the job finishes, read the exact totals from the runner and settle
+them once::
+
+    runner.settle_metrics('net_sales', decimal_places=2)
+
+If the ratio you need is part of the job output rather than a runner
+metric, use :py:class:`~mrjob.metrics.RatioMetric`; it supports ``+`` and
+``sum()``, and settles with :py:meth:`~mrjob.metrics.RatioMetric.settle`:
+
+.. code-block:: python
+
+    from mrjob.metrics import RatioMetric
+    from mrjob.metrics import metric_from_dict
+
+    def mapper(self, _, line):
+        store, sales, items = line.split(',')
+        metric = RatioMetric(store, 'net_sales_per_item')
+        metric.add(sales, items)
+        yield store, metric.as_dict()
+
+    def combiner(self, store, metric_dicts):
+        metric = RatioMetric(store, 'net_sales_per_item')
+        for metric_dict in metric_dicts:
+            metric.merge(metric_from_dict(metric_dict))
+        yield store, metric.as_dict()
+
+    def reducer(self, store, metric_dicts):
+        metric = RatioMetric(store, 'net_sales_per_item')
+        for metric_dict in metric_dicts:
+            metric.merge(metric_from_dict(metric_dict))
+
+        # settle (round) exactly once, after every shard has been merged
+        yield store, str(metric.settle(2))
+
+Returns are negative sales (and negative item counts). A zero net item
+count is still emitted as a row; its ratio is ``None`` unless you pass
+``zero_denominator``.
+
+Merging a metric is addition of its exact numerator and denominator, so the
+settled value is the same no matter how the input was sharded or whether a
+combiner ran. A shard whose local total is zero still contributes its exact
+amounts; it isn't dropped early.
+
+Task summaries are exact and additive. Merging them, or merging already
+merged subtotals, never rounds the intermediate values.
+
+See :py:mod:`mrjob.metrics` for the complete API, including
+:py:class:`~mrjob.metrics.DecimalMetric` for plain totals.
+
 .. aliases
 
 .. |JSONProtocol| replace:: :py:class:`~mrjob.protocol.JSONProtocol`

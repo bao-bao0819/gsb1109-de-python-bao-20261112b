@@ -22,6 +22,7 @@ from importlib import import_module
 from itertools import chain
 
 from mrjob.parse import is_uri
+from mrjob.metrics import metric_summary
 from mrjob.util import shlex_split
 from pyspark.accumulators import AccumulatorParam
 
@@ -60,6 +61,13 @@ _PASSTHRU_OPTIONS = [
         dest='counter_output_dir',
         help=(
             'An empty directory to write counter output to. '
+            'Can be a path or URI.')
+    )),
+    (['--metric-output-dir'], dict(
+        default=None,
+        dest='metric_output_dir',
+        help=(
+            'An empty directory to write exact metric summaries to. '
             'Can be a path or URI.')
     )),
     (['--num-reducers'], dict(
@@ -139,6 +147,17 @@ class CounterAccumulator(AccumulatorParam):
         return value1
 
 
+class MetricAccumulator(AccumulatorParam):
+    """Accumulator for exact metric summaries."""
+
+    def zero(self, value):
+        return value
+
+    def addInPlace(self, value1, value2):
+        from mrjob.metrics import merge_metric_summaries
+        return merge_metric_summaries(value1, value2)
+
+
 def main(cmd_line_args=None):
     if cmd_line_args is None:
         cmd_line_args = sys.argv[1:]
@@ -205,6 +224,12 @@ def main(cmd_line_args=None):
         for _ in steps_to_run
     ]
 
+    # exact metrics are merged, not summed as integers
+    metric_accumulators = [
+        sc.accumulator({'metrics': {}}, MetricAccumulator())
+        for _ in steps_to_run
+    ]
+
     def make_increment_counter(step_num):
         counter_accumulator = counter_accumulators[step_num - start]
 
@@ -213,6 +238,14 @@ def main(cmd_line_args=None):
 
         return increment_counter
 
+    def make_flush_metrics(step_num):
+        metric_accumulator = metric_accumulators[step_num - start]
+
+        def flush_metrics(metrics):
+            metric_accumulator.add(metric_summary(*metrics))
+
+        return flush_metrics
+
     def make_mrc_job(mrc, step_num):
         j = job_class(job_args + [
             '--%s' % mrc, '--step-num=%d' % step_num
@@ -220,6 +253,17 @@ def main(cmd_line_args=None):
 
         # patch increment_counter() to update the accumulator for this step
         j.increment_counter = make_increment_counter(step_num)
+
+        # metrics are merged into an accumulator rather than written to
+        # stderr (Spark tasks have no meaningful stderr summary protocol)
+        flush_metrics = make_flush_metrics(step_num)
+
+        def job_flush_metrics():
+            flush_metrics(j._metrics)
+            j._metrics = {}
+
+        j._flush_metrics = job_flush_metrics
+        j._metrics = {}
 
         # if skip_internal_protocol is true, patch internal_protocol() to
         # return an object whose *read* and *write* attributes are ``None``
@@ -301,6 +345,21 @@ def main(cmd_line_args=None):
                     os.mkdir(args.counter_output_dir)
                 with open(path, 'w') as wb:
                     wb.write(str(json.dumps(counters)))
+
+        if args.metric_output_dir is not None:
+            metrics = [ma.value for ma in metric_accumulators]
+
+            if is_uri(args.metric_output_dir):
+                sc.parallelize(
+                    [json.dumps(metrics)],
+                    numSlices=1
+                ).saveAsTextFile(args.metric_output_dir)
+            else:
+                path = os.path.join(args.metric_output_dir, 'part-00000')
+                if not os.path.exists(args.metric_output_dir):
+                    os.mkdir(args.metric_output_dir)
+                with open(path, 'w') as wb:
+                    wb.write(json.dumps(metrics))
 
 
 def _text_file_with_path(sc, path):
@@ -424,14 +483,17 @@ def _run_mapper(make_mrc_job, step_num, rdd, rdd_includes_input_path):
         # reduce_pairs() runs key-value pairs through mapper
         #
         # (k, v), ... -> (k, v), ...
-        for k, v in job.map_pairs(pairs, step_num):
-            # encode key-value pairs back into lines
-            #
-            # (k, v) -> line
-            if write:
-                yield write(k, v)
-            else:
-                yield k, v
+        try:
+            for k, v in job.map_pairs(pairs, step_num):
+                # encode key-value pairs back into lines
+                #
+                # (k, v) -> line
+                if write:
+                    yield write(k, v)
+                else:
+                    yield k, v
+        finally:
+            job._flush_metrics()
 
     return rdd.mapPartitions(map_lines)
 
@@ -466,9 +528,13 @@ def _run_combiner(combiner_job, rdd, sort_values=False, num_reducers=None):
     # values through the MRJob's combiner multiple times.
     def combiner_helper(pairs1, pairs2):
         if len(pairs1) == len(pairs2) == 1:
-            return list(
-                combiner_job.combine_pairs(pairs1 + pairs2, step_num),
-            )
+            try:
+                return list(
+                    combiner_job.combine_pairs(
+                        pairs1 + pairs2, step_num),
+                )
+            finally:
+                combiner_job._flush_metrics()
         else:
             pairs1.extend(pairs2)
             return pairs1
@@ -572,14 +638,17 @@ def _run_reducer(make_mrc_job, step_num, rdd, num_reducers=None):
         # reduce_pairs() runs key-value pairs through reducer
         #
         # (k, v), ... -> (k, v), ...
-        for k, v in job.reduce_pairs(pairs, step_num):
-            # encode key-value pairs back into lines
-            #
-            # (k, v) -> line
-            if write:
-                yield write(k, v)
-            else:
-                yield k, v
+        try:
+            for k, v in job.reduce_pairs(pairs, step_num):
+                # encode key-value pairs back into lines
+                #
+                # (k, v) -> line
+                if write:
+                    yield write(k, v)
+                else:
+                    yield k, v
+        finally:
+            job._flush_metrics()
 
     # if *num_reducers* is set, don't re-partition. otherwise, doesn't matter
     return rdd.mapPartitions(

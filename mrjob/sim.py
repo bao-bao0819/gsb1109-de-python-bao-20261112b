@@ -40,6 +40,8 @@ from mrjob.conf import combine_local_envs
 from mrjob.fs.local import _from_file_uri
 from mrjob.logs.counters import _format_counters
 from mrjob.parse import parse_mr_job_stderr
+from mrjob.metrics import merge_metric_summaries
+from mrjob.metrics import parse_metric_summary_line
 from mrjob.runner import MRJobRunner
 from mrjob.runner import _fix_env
 from mrjob.step import _is_spark_step_type
@@ -78,6 +80,7 @@ class SimMRJobRunner(MRJobRunner):
         super(SimMRJobRunner, self).__init__(**kwargs)
 
         self._counters = []
+        self._metrics = []
 
         # warn about ignored keyword arguments
         for key in self._IGNORED_HADOOP_KWARGS:
@@ -157,6 +160,7 @@ class SimMRJobRunner(MRJobRunner):
                 step_num + 1, self._num_steps()))
 
             self._counters.append({})
+            self._metrics.append({})
 
             self._run_step(step, step_num)
 
@@ -235,6 +239,20 @@ class SimMRJobRunner(MRJobRunner):
         for stderr_path in stderr_paths:
             with open(stderr_path, 'rb') as stderr:
                 parse_mr_job_stderr(stderr, counters=self._counters[step_num])
+
+            self._parse_task_metrics(stderr_path, step_num)
+
+    def _parse_task_metrics(self, stderr_path, step_num):
+        """Parse metric summary lines from one task's stderr file."""
+        with open(stderr_path, 'rb') as stderr:
+            for line in stderr:
+                summary = parse_metric_summary_line(line.rstrip(b'\r\n'))
+                if summary is not None:
+                    self._metrics[step_num] = merge_metric_summaries(
+                        self._metrics[step_num], summary)
+
+    def metric_summaries(self):
+        return deepcopy(self._metrics)
 
     def counters(self):
         return deepcopy(self._counters)

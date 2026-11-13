@@ -42,6 +42,8 @@ from mrjob.fs.local import LocalFilesystem
 from mrjob.options import _combiners
 from mrjob.options import _deprecated_aliases
 from mrjob.options import CLEANUP_CHOICES
+from mrjob.metrics import merge_metric_summaries
+from mrjob.metrics import settle_metric_summary
 from mrjob.parse import is_uri
 from mrjob.parse import to_uri
 from mrjob.py2 import PY2
@@ -197,6 +199,9 @@ class MRJobRunner(object):
                                 jobs). Currently ignored by local runners.
         """
         self._ran_job = False
+
+        # exact metric summaries from each step, if any
+        self._metrics = []
 
         # opts are made from:
         #
@@ -665,6 +670,63 @@ class MRJobRunner(object):
         The list contains an entry for every step of the current job.
         """
         raise NotImplementedError
+
+    def metric_summaries(self):
+        """Get exact metric summaries associated with this run.
+
+        Returns a list with an entry for every step, each looking like::
+
+            {'group': {'name': {...}}}
+
+        Values are unrounded and exact. Use :py:meth:`metric_summary` to
+        merge all steps, and :py:meth:`settle_metrics` to round once.
+        """
+        return deepcopy(self._metrics)
+
+    def metric_summary(self):
+        """Merge exact metric summaries from all steps into one dictionary."""
+        return merge_metric_summaries(*self._metrics)
+
+    def metrics(self):
+        """Alias for :py:meth:`metric_summary`."""
+        return self.metric_summary()
+
+    def settled_metrics(self, group=None, name=None, decimal_places=2,
+                        rounding='ROUND_HALF_UP', zero_denominator=None):
+        """Alias for :py:meth:`settle_metrics`."""
+        return self.settle_metrics(
+            group=group, name=name, decimal_places=decimal_places,
+            rounding=rounding, zero_denominator=zero_denominator)
+
+    def settle_metrics(self, group=None, name=None, decimal_places=2,
+                       rounding='ROUND_HALF_UP', zero_denominator=None):
+        """Settle metrics for this run, rounding only at the end.
+
+        With no arguments, returns ``{group: {name: value}}`` for all
+        metrics. If *group* is given, returns the metrics in that group.
+        If *name* is also given, returns that metric's settled value
+        (``None`` for a zero denominator by default).
+        """
+        settled = settle_metric_summary(
+            self.metric_summary(),
+            decimal_places=decimal_places, rounding=rounding,
+            zero_denominator=zero_denominator)
+
+        if group is None:
+            return settled
+
+        if group not in settled:
+            raise ValueError('no metrics in group %r' % (group,))
+
+        if name is None:
+            return settled[group]
+
+        group_metrics = settled[group]
+        if name not in group_metrics:
+            raise ValueError(
+                'no metric %r in group %r' % (name, group))
+
+        return group_metrics[name]
 
     ### hooks for the with statement ###
 

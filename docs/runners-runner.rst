@@ -19,6 +19,9 @@ Run Information
 ---------------
 
 .. automethod:: MRJobRunner.counters
+.. automethod:: MRJobRunner.metric_summaries
+.. automethod:: MRJobRunner.metric_summary
+.. automethod:: MRJobRunner.settle_metrics
 .. automethod:: MRJobRunner.get_hadoop_version
 .. automethod:: MRJobRunner.get_job_key
 

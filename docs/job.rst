@@ -53,6 +53,22 @@ Counters and status messages
 .. automethod:: MRJob.increment_counter
 .. automethod:: MRJob.set_status
 
+Exact, aggregatable metrics
+---------------------------
+
+Metrics are like counters, except that they accept decimal values and can
+be pre-aggregated by tasks. Values are kept as exact
+:py:class:`~decimal.Decimal` values, so no rounding happens until you
+explicitly settle them.
+
+.. automethod:: MRJob.add_metric
+.. automethod:: MRJob.add_ratio_metric
+.. automethod:: MRJob.add_decimal_metric
+.. automethod:: MRJob.ratio_metric
+.. automethod:: MRJob.decimal_metric
+.. automethod:: MRJob.metric_summary
+.. automethod:: MRJob.settle_metrics
+
 Setting protocols
 -----------------
 

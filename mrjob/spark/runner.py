@@ -135,6 +135,9 @@ class SparkMRJobRunner(MRJobBinRunner):
         # steps because Spark doesn't have counters).
         self._counters = []
 
+        # exact metric summaries, one per job step
+        self._metrics = []
+
         # TODO: we may eventually want log interpretation, but it shouldn't
         # include counters, as they are not found in logs.
 
@@ -210,8 +213,15 @@ class SparkMRJobRunner(MRJobBinRunner):
         return self.fs.join(
             self._spark_tmp_dir, 'counter-output-step-%d' % step_num)
 
+    def _metric_output_dir(self, step_num):
+        return self.fs.join(
+            self._spark_tmp_dir, 'metric-output-step-%d' % step_num)
+
     def counters(self):
         return deepcopy(self._counters)
+
+    def metric_summaries(self):
+        return deepcopy(self._metrics)
 
     @property
     def fs(self):
@@ -347,10 +357,23 @@ class SparkMRJobRunner(MRJobBinRunner):
                         counter_dict,
                         desc=('Counters for step %d' % desc_num)))
 
-        # for non-streaming steps, there are no counters.
-        # pad self._counters to match number of steps
+        metrics = None
+        if step['type'] == 'streaming':
+            metric_file = self.fs.join(
+                self._metric_output_dir(step_num), 'part-*')
+            metric_json = b''.join(self.fs.cat(metric_file))
+            if metric_json.strip():
+                metrics = json.loads(to_unicode(metric_json))
+
+        if isinstance(metrics, list):
+            self._metrics.extend(metrics)
+
+        # for non-streaming steps, there are no counters or metrics.
+        # pad both to match number of steps
         while len(self._counters) < (last_step_num or step_num) + 1:
             self._counters.append({})
+        while len(self._metrics) < (last_step_num or step_num) + 1:
+            self._metrics.append({'metrics': {}})
 
         if returncode:
             error = _pick_error(dict(step=step_interpretation))
@@ -428,6 +451,10 @@ class SparkMRJobRunner(MRJobBinRunner):
         # --counter-output-dir, to simulate counters
         args.extend(['--counter-output-dir',
                      self._counter_output_dir(step_num)])
+
+        # --metric-output-dir, to simulate exact metrics
+        args.extend(['--metric-output-dir',
+                     self._metric_output_dir(step_num)])
 
         # --first-step-num, --last-step-num (step range)
         args.extend(['--first-step-num', str(step_num),

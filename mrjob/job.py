@@ -35,6 +35,10 @@ from argparse import ArgumentTypeError
 from mrjob.cat import decompress
 from mrjob.conf import combine_dicts
 from mrjob.conf import combine_lists
+from mrjob.metrics import DecimalMetric
+from mrjob.metrics import RatioMetric
+from mrjob.metrics import metric_from_dict
+from mrjob.metrics import metric_summary_line
 from mrjob.options import _add_basic_args
 from mrjob.options import _add_job_args
 from mrjob.options import _add_runner_args
@@ -141,6 +145,13 @@ class MRJob(object):
         self._stdout = None
         self._stderr = None
 
+        # exact metrics are kept in memory and flushed at the end of each
+        # task (see add_metric(), below)
+        self._metrics = {}
+
+        # runner for the most recent run_job() call, if any
+        self._last_runner = None
+
     # by default, self.stdin, self.stdout, and self.stderr are sys.std*.buffer
     # if it exists, and otherwise sys.std* otherwise (they should always deal
     # with bytes, not Unicode).
@@ -159,6 +170,11 @@ class MRJob(object):
     @property
     def stderr(self):
         return self._stderr or getattr(sys.stderr, 'buffer', sys.stderr)
+
+    @property
+    def metrics(self):
+        """Task-local metric state, keyed by ``(type, group, name)``."""
+        return self._metrics
 
     def _usage(self):
         return "%(prog)s [options] [input files]"
@@ -582,6 +598,267 @@ class MRJob(object):
         self.stderr.write(line)
         self.stderr.flush()
 
+    ### Aggregatable metrics ###
+
+    def add_metric(self, group, name, amount=None, denominator=None,
+                   numerator=None, value=None):
+        """Add an exact value to a metric that can be pre-aggregated.
+
+        Unlike :py:meth:`increment_counter`, this method accepts decimal
+        values. Tasks accumulate metrics locally and send one summary per
+        task to the runner when the task finishes, so mappers can
+        pre-aggregate exactly and combiners/reducers can merge those
+        partial sums without re-reading input.
+
+        If *denominator* is ``None``, the metric is a simple
+        :py:class:`~mrjob.metrics.DecimalMetric`. If *denominator* is
+        given, the metric is a :py:class:`~mrjob.metrics.RatioMetric` and
+        both values are accumulated exactly.
+
+        No rounding happens here. Use :py:meth:`settle_metrics` on the
+        runner (or :py:func:`mrjob.metrics.settle_ratio` directly) to round
+        once, at the end.
+
+        :type group: str
+        :param group: metric group
+        :type name: str
+        :param name: metric name
+        :param amount: int, float, string, or Decimal to add
+        :param denominator: if not ``None``, also add this to the metric's
+                            denominator (e.g. the number of items)
+        :param numerator: alias for *amount*
+        :param value: alias for *amount*
+
+        You may also pass another metric object as *amount*, in which case
+        its exact numerator/denominator (or value) is merged into this
+        metric.
+        """
+        if amount is None:
+            amount = numerator
+        if amount is None:
+            amount = value
+        if amount is None:
+            raise TypeError('missing metric amount')
+
+        if isinstance(amount, dict):
+            amount = metric_from_dict(amount)
+
+        if isinstance(amount, (RatioMetric, DecimalMetric)):
+            if isinstance(amount, RatioMetric):
+                metric = self._get_ratio_metric(group, name)
+                metric.merge(amount)
+            else:
+                metric = self._get_dec_metric(group, name)
+                metric.add(amount.value)
+            return
+
+        if denominator is None:
+            metric = self._get_dec_metric(group, name)
+            metric.add(amount)
+        else:
+            metric = self._get_ratio_metric(group, name)
+            metric.add(amount, denominator)
+
+    def add_ratio_metric(self, group, name, numerator, denominator=1):
+        """Add exact numerator and denominator values to a ratio metric.
+
+        This is equivalent to ``add_metric(group, name, numerator,
+        denominator)`` but makes the intent explicit.
+        """
+        self.add_metric(
+            group, name, amount=numerator, denominator=denominator)
+
+    def add_decimal_metric(self, group, name, amount):
+        """Add an exact decimal value to a simple metric."""
+        self.add_metric(group, name, amount=amount)
+
+    def increment_metric(self, group, name, amount=None, denominator=None,
+                         numerator=None, value=None):
+        """Alias for :py:meth:`add_metric`."""
+        if amount is None and numerator is None and value is None:
+            amount = 1
+
+        self.add_metric(
+            group, name, amount=amount, denominator=denominator,
+            numerator=numerator, value=value)
+
+    def track_metric(self, group, name, amount=None, denominator=None,
+                     numerator=None, value=None):
+        """Alias for :py:meth:`add_metric`."""
+        self.add_metric(
+            group, name, amount=amount, denominator=denominator,
+            numerator=numerator, value=value)
+
+    def record_metric(self, group, name, amount=None, denominator=None,
+                      numerator=None, value=None):
+        """Alias for :py:meth:`add_metric`."""
+        self.add_metric(
+            group, name, amount=amount, denominator=denominator,
+            numerator=numerator, value=value)
+
+    def ratio_metric(self, group, name):
+        """Return the task-local :class:`~mrjob.metrics.RatioMetric`.
+
+        This lets callers pre-aggregate values in a local variable and add
+        them in one go, e.g. ``metric.add(total_sales, total_items)``.
+        """
+        return self._get_ratio_metric(group, name)
+
+    def decimal_metric(self, group, name):
+        """Return the task-local :class:`~mrjob.metrics.DecimalMetric`."""
+        return self._get_dec_metric(group, name)
+
+    def metric(self, group, name):
+        """Alias for :py:meth:`ratio_metric`."""
+        return self.ratio_metric(group, name)
+
+    def merge_metric(self, group, name, numerator=None, denominator=1,
+                     metric=None):
+        """Merge an exact partial metric into a ratio metric.
+
+        This is handy in combiners and reducers that receive pre-aggregated
+        ``(numerator, denominator)`` pairs from mappers.
+        """
+        if metric is not None:
+            self.add_metric(group, name, amount=metric)
+        else:
+            self.add_metric(
+                group, name, amount=numerator, denominator=denominator)
+
+    def _get_dec_metric(self, group, name):
+        key = ('decimal', group, name)
+        metric = self._metrics.get(key)
+
+        if metric is None:
+            metric = DecimalMetric(group, name)
+            self._metrics[key] = metric
+
+        return metric
+
+    def _get_ratio_metric(self, group, name):
+        key = ('ratio', group, name)
+        metric = self._metrics.get(key)
+
+        if metric is None:
+            metric = RatioMetric(group, name)
+            self._metrics[key] = metric
+
+        return metric
+
+    def _flush_metrics(self):
+        """Send this task's metric summary to the runner.
+
+        Called at the end of a task by :py:meth:`run_mapper`,
+        :py:meth:`run_combiner`, and :py:meth:`run_reducer`. Does nothing if
+        no metrics were added.
+        """
+        if not self._metrics:
+            return
+
+        line = metric_summary_line(self._metrics.values())
+        if not isinstance(line, bytes):
+            line = line.encode('utf_8')
+
+        self.stderr.write(line + b'\n')
+        self.stderr.flush()
+
+    def settle_metrics(self, group, name=None, decimal_places=2,
+                       rounding='ROUND_HALF_UP', zero_denominator=None):
+        """Settle one metric (or all metrics in a group) from the runner.
+
+        This is meant to be called after the job finishes, with *self*
+        being the same MRJob object the runner was created from. It rounds
+        exactly once, at settlement.
+
+        :param str group: metric group to settle
+        :param name: metric name, or ``None`` to settle every metric in
+                     *group*
+        :param int decimal_places: decimal places to keep
+        :param str rounding: :py:mod:`decimal` rounding mode name
+        :param zero_denominator: value to use for ratios whose exact
+                                 denominator is zero (``None`` by default,
+                                 which keeps the row but gives no value)
+
+        Returns a :py:class:`~decimal.Decimal` if *name* is given, otherwise
+        ``{name: value}``.
+        """
+        summary = self._merged_metric_summary()
+        group_metrics = summary.get(group, {})
+
+        if not group_metrics:
+            raise ValueError('no metrics in group %r' % (group,))
+
+        if name is not None:
+            metric_dict = group_metrics.get(name)
+            if metric_dict is None:
+                raise ValueError(
+                    'no metric %r in group %r' % (name, group))
+            metric = metric_from_dict(metric_dict)
+            if isinstance(metric, RatioMetric):
+                return metric.settle(
+                    decimal_places=decimal_places, rounding=rounding,
+                    zero_denominator=zero_denominator)
+            else:
+                return metric.settle(
+                    decimal_places=decimal_places, rounding=rounding)
+        else:
+            result = {}
+            for metric_name, metric_dict in group_metrics.items():
+                metric = metric_from_dict(metric_dict)
+                if isinstance(metric, RatioMetric):
+                    result[metric_name] = metric.settle(
+                        decimal_places=decimal_places, rounding=rounding,
+                        zero_denominator=zero_denominator)
+                else:
+                    result[metric_name] = metric.settle(
+                        decimal_places=decimal_places, rounding=rounding)
+            return result
+
+    def metric_summary(self):
+        """Return the merged metric summary for this job's last run.
+
+        The summary looks like ``{group: {name: {...}}}`` and contains
+        exact, unrounded values.
+        """
+        return self._merged_metric_summary()
+
+    def metric_summaries(self):
+        """Return per-step exact metric summaries for this job's last run."""
+        runner = getattr(self, '_last_runner', None)
+        if runner is None:
+            return []
+
+        return runner.metric_summaries()
+
+    def settled_metrics(self, group=None, name=None, decimal_places=2,
+                         rounding='ROUND_HALF_UP', zero_denominator=None):
+        """Alias for :py:meth:`settle_metrics`."""
+        if group is None:
+            return self._settle_all_metrics(
+                decimal_places=decimal_places, rounding=rounding,
+                zero_denominator=zero_denominator)
+
+        return self.settle_metrics(
+            group=group, name=name, decimal_places=decimal_places,
+            rounding=rounding, zero_denominator=zero_denominator)
+
+    def _settle_all_metrics(self, decimal_places=2,
+                            rounding='ROUND_HALF_UP',
+                            zero_denominator=None):
+        from mrjob.metrics import settle_metric_summary
+
+        return settle_metric_summary(
+            self._merged_metric_summary(),
+            decimal_places=decimal_places, rounding=rounding,
+            zero_denominator=zero_denominator)
+
+    def _merged_metric_summary(self):
+        runner = getattr(self, '_last_runner', None)
+        if runner is None:
+            return {}
+
+        return runner.metric_summary()
+
     def set_status(self, msg):
         """Set the job status in hadoop streaming by printing to stderr.
 
@@ -639,6 +916,8 @@ class MRJob(object):
                 # log more useful information anyway
                 log.error(str(e))
                 sys.exit(1)
+
+            self._last_runner = runner
 
             if self._should_cat_output():
                 for chunk in runner.cat_output():
@@ -710,7 +989,9 @@ class MRJob(object):
                       for k, v in sorted(kwargs.items())
                       if v not in (None, [], {}))))
 
-        return self._runner_class()(**self._runner_kwargs())
+        runner = self._runner_class()(**self._runner_kwargs())
+        self._last_runner = runner
+        return runner
 
     def _runner_class(self):
         """Runner class as indicated by ``--runner``. Defaults to ``'inline'``.
@@ -757,8 +1038,11 @@ class MRJob(object):
         # pick input and output protocol
         read_lines, write_line = self._wrap_protocols(step_num, 'mapper')
 
-        for k, v in self.map_pairs(read_lines(), step_num=step_num):
-            write_line(k, v)
+        try:
+            for k, v in self.map_pairs(read_lines(), step_num=step_num):
+                write_line(k, v)
+        finally:
+            self._flush_metrics()
 
     def run_combiner(self, step_num=0):
         """Run the combiner for the given step.
@@ -777,8 +1061,11 @@ class MRJob(object):
         # pick input and output protocol
         read_lines, write_line = self._wrap_protocols(step_num, 'combiner')
 
-        for k, v in self.combine_pairs(read_lines(), step_num=step_num):
-            write_line(k, v)
+        try:
+            for k, v in self.combine_pairs(read_lines(), step_num=step_num):
+                write_line(k, v)
+        finally:
+            self._flush_metrics()
 
     def run_reducer(self, step_num=0):
         """Run the reducer for the given step.
@@ -792,8 +1079,11 @@ class MRJob(object):
         # pick input and output protocol
         read_lines, write_line = self._wrap_protocols(step_num, 'reducer')
 
-        for k, v in self.reduce_pairs(read_lines(), step_num=step_num):
-            write_line(k, v)
+        try:
+            for k, v in self.reduce_pairs(read_lines(), step_num=step_num):
+                write_line(k, v)
+        finally:
+            self._flush_metrics()
 
     def map_pairs(self, pairs, step_num=0):
         """Runs :py:meth:`mapper_init`,
@@ -1652,6 +1942,9 @@ class MRJob(object):
         self._stdin = stdin or BytesIO()
         self._stdout = stdout or BytesIO()
         self._stderr = stderr or BytesIO()
+
+        # clear any metrics left over from a previous task
+        self._metrics = {}
 
         return self
 
