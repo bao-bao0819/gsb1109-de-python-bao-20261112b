@@ -15,6 +15,7 @@
 from typing import IO, AnyStr
 
 from . import gpx as mod_gpx
+from . import incremental
 
 __version__ = '1.6.2'
 

@@ -42,6 +42,7 @@ import gpxpy as mod_gpxpy
 import gpxpy.gpx as mod_gpx
 import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
+import gpxpy.incremental as mod_incremental
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
 
@@ -3723,6 +3724,178 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+
+class IncrementalReconciliationTests(mod_unittest.TestCase):
+
+    BASE = mod_datetime.datetime(2026, 11, 1, 8, 0, 0)
+
+    def _points(self, entries: Any) -> List[mod_gpx.GPXTrackPoint]:
+        return [
+            mod_gpx.GPXTrackPoint(
+                latitude=lat, longitude=13.0,
+                time=self.BASE + mod_datetime.timedelta(seconds=seconds))
+            for seconds, lat in entries
+        ]
+
+    def _window(self, start_seconds: int, end_seconds: int) -> Any:
+        return (self.BASE + mod_datetime.timedelta(seconds=start_seconds),
+                self.BASE + mod_datetime.timedelta(seconds=end_seconds))
+
+    def _times(self, points: Any) -> List[int]:
+        return [int((p.time - self.BASE).total_seconds()) for p in points]
+
+    def test_handoff_merges_and_corrects_tail(self) -> None:
+        previous = self._points([(i, float(i)) for i in range(10)])
+        current = self._points([(i, 500.0 if i == 7 else float(i))
+                                for i in range(5, 15)])
+
+        result = mod_incremental.reconcile(
+            previous, current, self._window(0, 9), self._window(5, 14))
+
+        self.assertEqual(self._window(5, 9), result.overlap_window)
+        self.assertEqual(list(range(15)), self._times(result.points))
+        corrected = [p for p in result.points
+                     if p.time == self.BASE + mod_datetime.timedelta(seconds=7)]
+        self.assertEqual([500.0], [p.latitude for p in corrected])
+        self.assertEqual([7.0], [p.latitude for p in result.retracted])
+        self.assertEqual(6, len(result.inserted))  # corrected t7 + t10..t14
+        self.assertEqual(4, len(result.confirmed))  # t5, t6, t8, t9
+        self.assertEqual(5, len(result.kept))  # t0..t4
+        self.assertEqual(1, len(result.corrections))
+        self.assertEqual([], result.undecided)
+
+    def test_reimport_is_idempotent(self) -> None:
+        previous = self._points([(i, float(i)) for i in range(10)])
+        current = self._points([(i, 500.0 if i == 7 else float(i))
+                                for i in range(5, 15)])
+
+        first = mod_incremental.reconcile(
+            previous, current, self._window(0, 9), self._window(5, 14))
+        second = mod_incremental.reconcile(
+            first.points, current, self._window(0, 14), self._window(5, 14))
+
+        self.assertEqual(first.row_count, second.row_count)
+        self.assertEqual([], second.inserted)
+        self.assertEqual([], second.retracted)
+        self.assertEqual([], second.undecided)
+
+    def test_retraction_inside_overlap(self) -> None:
+        previous = self._points([(i, float(i)) for i in range(10)])
+        current = self._points([(i, float(i)) for i in range(10) if i != 4])
+
+        result = mod_incremental.reconcile(
+            previous, current, self._window(0, 9), self._window(0, 9))
+
+        self.assertEqual([0, 1, 2, 3, 5, 6, 7, 8, 9],
+                         self._times(result.points))
+        self.assertEqual([4], self._times(result.retracted))
+        self.assertEqual([], result.undecided)
+
+    def test_points_vanishing_outside_window_are_kept(self) -> None:
+        previous = self._points([(i, float(i)) for i in range(10)])
+        current = self._points([(i, float(i)) for i in range(3, 7)])
+
+        result = mod_incremental.reconcile(
+            previous, current, self._window(0, 5), self._window(3, 6))
+
+        # t7..t9 vanished from the current export but are outside the
+        # overlap window: they must be kept.
+        self.assertEqual(list(range(10)), self._times(result.points))
+        self.assertEqual([], result.retracted)
+        self.assertEqual([], result.inserted)
+
+    def test_same_second_points(self) -> None:
+        previous = self._points([(0, 0.0), (5, 1.0), (5, 2.0), (9, 9.0)])
+        current = self._points([(0, 0.0), (5, 1.0), (5, 7.0), (9, 9.0)])
+
+        result = mod_incremental.reconcile(
+            previous, current, self._window(0, 9), self._window(0, 9))
+
+        self.assertEqual([0, 5, 5, 9], self._times(result.points))
+        self.assertEqual([0.0, 1.0, 7.0, 9.0],
+                         [p.latitude for p in result.points])
+        self.assertEqual([2.0], [p.latitude for p in result.retracted])
+        self.assertEqual([], result.undecided)
+
+    def test_ambiguous_same_second_duplicates_are_undecided(self) -> None:
+        previous = self._points([(0, 0.0), (5, 1.0), (5, 1.0), (9, 9.0)])
+        current = self._points([(0, 0.0), (5, 1.0), (9, 9.0)])
+
+        result = mod_incremental.reconcile(
+            previous, current, self._window(0, 9), self._window(0, 9))
+
+        # Two equally good alignments: no retraction without evidence.
+        self.assertEqual([0, 5, 5, 9], self._times(result.points))
+        self.assertEqual([], result.retracted)
+        self.assertEqual(1, len(result.undecided))
+        self.assertEqual(2, len(result.undecided[0].previous_points))
+        self.assertEqual(1, len(result.undecided[0].current_points))
+
+        second = mod_incremental.reconcile(
+            result.points, current, self._window(0, 9), self._window(0, 9))
+        self.assertEqual(result.row_count, second.row_count)
+        self.assertEqual([], second.inserted)
+        self.assertEqual([], second.retracted)
+
+    def test_ambiguous_swapped_order_is_undecided(self) -> None:
+        previous = self._points([(0, 0.0), (5, 1.0), (5, 2.0), (9, 9.0)])
+        current = self._points([(0, 0.0), (5, 2.0), (5, 1.0), (9, 9.0)])
+
+        result = mod_incremental.reconcile(
+            previous, current, self._window(0, 9), self._window(0, 9))
+
+        self.assertEqual([0, 5, 5, 9], self._times(result.points))
+        self.assertEqual([0.0, 1.0, 2.0, 9.0],
+                         [p.latitude for p in result.points])
+        self.assertEqual([], result.retracted)
+        self.assertEqual([], result.inserted)
+        self.assertEqual(1, len(result.undecided))
+
+    def test_no_overlap_concatenation_and_idempotency(self) -> None:
+        previous = self._points([(i, float(i)) for i in range(5)])
+        current = self._points([(i, float(i)) for i in range(5, 10)])
+
+        result = mod_incremental.reconcile(
+            previous, current, self._window(0, 4), self._window(5, 9))
+        self.assertEqual(list(range(10)), self._times(result.points))
+        self.assertEqual(5, len(result.inserted))
+
+        again = mod_incremental.reconcile(
+            result.points, current, self._window(0, 4), self._window(5, 9))
+        self.assertEqual(result.row_count, again.row_count)
+        self.assertEqual([], again.inserted)
+
+        with_overlap = mod_incremental.reconcile(
+            result.points, current, self._window(0, 9), self._window(5, 9))
+        self.assertEqual(result.row_count, with_overlap.row_count)
+        self.assertEqual([], with_overlap.inserted)
+        self.assertEqual([], with_overlap.retracted)
+
+    def test_reconcile_gpx_roundtrip(self) -> None:
+        def _gpx(entries: Any) -> mod_gpx.GPX:
+            gpx = mod_gpx.GPX()
+            track = mod_gpx.GPXTrack()
+            segment = mod_gpx.GPXTrackSegment()
+            segment.points = self._points(entries)
+            track.segments.append(segment)
+            gpx.tracks.append(track)
+            return gpx
+
+        previous = _gpx([(i, float(i)) for i in range(10)])
+        current = _gpx([(i, 500.0 if i == 7 else float(i))
+                        for i in range(5, 15)])
+
+        result = mod_incremental.reconcile_gpx(
+            previous, current, self._window(0, 9), self._window(5, 14))
+
+        merged = result.to_gpx()
+        self.assertEqual(15, merged.get_track_points_no())
+        reparsed = mod_gpxpy.parse(merged.to_xml())
+        self.assertEqual(15, reparsed.get_track_points_no())
+        self.assertEqual([500.0], [p.latitude for p in reparsed.walk(
+            only_points=True) if p.latitude == 500.0])
+
 
 if __name__ == '__main__':
     mod_unittest.main()
