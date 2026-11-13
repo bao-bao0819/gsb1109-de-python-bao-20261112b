@@ -132,6 +132,12 @@ escape_misc
   that sometimes have Markdown significance in text.
   Defaults to ``False``.
 
+figure_catalog
+  If set to ``True``, additionally extract a queryable catalog of figure
+  plates (``<figure>`` elements and their captions) while converting.
+  The catalog is available as ``converter.figure_catalog`` after calling
+  ``convert()``. Defaults to ``False``.
+
 keep_inline_images_in
   Images are converted to their alt-text when the images are located inside
   headlines or table cells. If some inline images should be converted to
@@ -176,6 +182,54 @@ bs4_options
 
 Options may be specified as kwargs to the ``markdownify`` function, or as a
 nested ``Options`` class in ``MarkdownConverter`` subclasses.
+
+
+Figure plate catalog
+====================
+
+Museum and archive pages often pair composite figures (parts A, B, ...) with
+captions. With ``figure_catalog=True``, conversion additionally produces a
+queryable catalog mapping each plate to its caption(s):
+
+.. code:: python
+
+    from markdownify import markdownify_with_catalog
+
+    html = '''
+    <figure id="fig1">
+      <img data-part="A" src="a.jpg">
+      <img data-part="B" src="b.jpg">
+      <figcaption>A and B: two views of the same vase</figcaption>
+    </figure>
+    <p class="caption">Fig. 2B: side view</p>
+    <figure id="fig2">
+      <img data-part="A" src="a2.jpg"><img data-part="B" src="b2.jpg">
+    </figure>
+    '''
+    text, catalog = markdownify_with_catalog(html)
+    catalog.captions_for('fig1B')  # > ['two views of the same vase']
+    catalog.captions_for('fig2B')  # > ['side view']
+
+How captions are matched to plates:
+
+- Parts are declared with ``data-part``/``data-parts`` attributes or with
+  nested ``<figure>`` elements; part labels are scoped per figure, so the
+  "B" of one plate is never confused with the "B" of an adjacent plate.
+- A ``<figcaption>`` on the parent figure applies to the whole composite,
+  so every part is kept as a candidate. A caption with an explicit label
+  (``data-part="B"``, or a text prefix like ``B: ...``, ``(A) ...``,
+  ``A and B: ...``) applies to exactly those parts; one caption may
+  reference several exhibits.
+- Labeled captions outside a ``<figure>`` (e.g. ``data-figure="fig2"`` or a
+  ``Fig. 2B:`` prefix) are attached to the plate they name. A bare label
+  such as ``B: ...`` between two figures is ambiguous, so both neighbouring
+  plates are kept as candidates (``entry.ambiguous`` is ``True``).
+- Plates without a caption stay uncaptioned; a caption is never borrowed
+  from a neighbouring figure to fill a gap.
+
+Use ``catalog.lookup('fig1B')`` for the matching entries,
+``catalog.plates()`` for all known plates, ``catalog.to_dict()`` for a
+serializable form, and ``catalog.to_markdown()`` for a Markdown table.
 
 
 Converting BeautifulSoup objects

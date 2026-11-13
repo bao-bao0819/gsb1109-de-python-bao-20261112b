@@ -43,6 +43,32 @@ re_escape_misc_list_items = re.compile(r'((?:\s|^)[0-9]{1,9})([.)](?:\s|$))')
 # Find consecutive backtick sequences in a string
 re_backtick_runs = re.compile(r'`+')
 
+# Split part lists such as "A B", "A,B" or "A、B" (used for data-part attributes)
+re_part_split = re.compile(r'[\s,，、;；]+')
+
+# Normalize plate/figure references for lookup (e.g. "Fig. 1-B" -> "fig1b")
+re_plate_ref_non_alnum = re.compile(r'[^0-9a-z]+')
+
+# Strip leading reference words ("fig", "figure", "plate") from figure keys
+re_figure_ref_prefix = re.compile(r'^(?:figure|fig|plate)')
+
+# Detect an explicit plate label at the start of a caption text, e.g.
+# "B: ...", "(A) ...", "A and B: ..." or "Fig. 2B: ...". The label may
+# reference several parts ("A and B") because one caption may describe
+# multiple exhibits. Part letters are uppercase A-Z.
+re_caption_label = re.compile(
+    r'^\s*'
+    r'(?:(?i:fig(?:ure)?s?|plate|图版)\.?\s*)?'  # optional "Fig."/"Plate" prefix
+    r'(\d{1,4})?'                                # optional figure number
+    r'\s*'
+    r'(?:'
+    r'\(\s*([A-Z](?:\s*(?:,|&|、|和|(?i:and))\s*[A-Z])*)\s*\)\s*[:：.]?'  # "(A)", "(A, B)"
+    r'|'
+    r'([A-Z](?:\s*(?:,|&|、|和|(?i:and))\s*[A-Z])*)\s*[:：.]'             # "A:", "A and B."
+    r')'
+    r'(?=\s|$)'
+)
+
 # Heading styles
 ATX = 'atx'
 ATX_CLOSED = 'atx_closed'
@@ -172,6 +198,373 @@ def _next_block_content_sibling(el):
     return None
 
 
+def _split_parts(value):
+    """Split a part list such as "A B", "A,B" or "A、B" into normalized labels."""
+    if not value:
+        return []
+    parts = []
+    for token in re_part_split.split(str(value)):
+        token = token.strip().upper()
+        if token and token not in parts:
+            parts.append(token)
+    return parts
+
+
+def _parse_caption_label(text):
+    """
+    Parse an explicit plate label at the start of a caption text.
+    Returns (figure_number, part_letters, end_index) or None.
+    """
+    match = re_caption_label.match(text)
+    if not match:
+        return None
+    number = match.group(1)
+    letters = re.findall(r'[A-Z]', match.group(2) or match.group(3) or '')
+    if not letters:
+        return None
+    return number, letters, match.end()
+
+
+def _format_plate_ref(figure_key, part):
+    """Build a fully qualified plate reference such as "fig1B"."""
+    return '%s%s' % (figure_key, part) if part else str(figure_key)
+
+
+def _normalize_plate_ref(plate_ref):
+    """Normalize a plate reference for tolerant lookup ("Fig. 1-B" -> "fig1b")."""
+    return re_plate_ref_non_alnum.sub('', str(plate_ref).lower())
+
+
+def _normalize_figure_ref(figure_ref):
+    """Normalize a figure reference, ignoring "fig"/"plate" style prefixes."""
+    norm = _normalize_plate_ref(figure_ref)
+    return re_figure_ref_prefix.sub('', norm)
+
+
+class FigureCatalogEntry(object):
+    """
+    One caption together with the plates it may describe.
+
+    ``candidates`` is a tuple of ``(figure_key, part)`` pairs (``part`` is
+    None for a whole-figure plate). It holds more than one pair when one
+    caption references several exhibits, or when the evidence allows more
+    than one interpretation; in that case all candidates are kept rather
+    than resolved.
+    """
+
+    def __init__(self, caption, candidates, explicit=False, ambiguous=False):
+        self.caption = caption
+        self.candidates = tuple(candidates)
+        self.explicit = explicit
+        self.ambiguous = ambiguous
+
+    @property
+    def plates(self):
+        """Fully qualified plate references for all candidates."""
+        return [_format_plate_ref(figure, part) for figure, part in self.candidates]
+
+    def to_dict(self):
+        return {
+            'caption': self.caption,
+            'plates': list(self.plates),
+            'explicit': self.explicit,
+            'ambiguous': self.ambiguous,
+        }
+
+    def __repr__(self):
+        return 'FigureCatalogEntry(%r, plates=%r)' % (self.caption, self.plates)
+
+
+class FigureCatalog(object):
+    """
+    A queryable catalog of figure plates （图版目录） extracted from a document.
+
+    ``figures`` maps each figure key to its part labels; part labels are
+    scoped per figure, so the "B" of one figure is never confused with the
+    "B" of an adjacent figure. ``entries`` holds the captions found in the
+    document; plates without a caption simply have no entry (captions are
+    never borrowed from a neighbouring figure to fill a gap).
+    """
+
+    def __init__(self, figures, entries):
+        self.figures = dict(figures)
+        self.entries = list(entries)
+        self._index = {}
+        for entry in self.entries:
+            for plate in entry.plates:
+                self._index.setdefault(_normalize_plate_ref(plate), []).append(entry)
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __len__(self):
+        return len(self.entries)
+
+    def plates(self):
+        """Return all known plate references, including uncaptioned ones."""
+        result = []
+        for key, parts in self.figures.items():
+            if parts:
+                result.extend(_format_plate_ref(key, part) for part in parts)
+            else:
+                result.append(key)
+        return result
+
+    def lookup(self, plate_ref):
+        """Return all catalog entries whose candidates include the given plate."""
+        return list(self._index.get(_normalize_plate_ref(plate_ref), []))
+
+    def captions_for(self, plate_ref):
+        """Return all caption texts associated with the given plate."""
+        return [entry.caption for entry in self.lookup(plate_ref)]
+
+    def to_dict(self):
+        return {
+            'figures': {key: list(parts) for key, parts in self.figures.items()},
+            'entries': [entry.to_dict() for entry in self.entries],
+        }
+
+    def to_markdown(self):
+        """Render the catalog as a Markdown table."""
+        lines = ['| Plate | Caption | Match |', '| --- | --- | --- |']
+        for entry in self.entries:
+            if entry.explicit:
+                match = 'explicit'
+            elif entry.ambiguous:
+                match = 'ambiguous'
+            else:
+                match = 'inferred'
+            caption = entry.caption.replace('|', '\\|')
+            lines.append('| %s | %s | %s |' % (', '.join(entry.plates), caption, match))
+        return '\n'.join(lines)
+
+
+def _is_caption_element(el):
+    """Return True for elements that hold a figure caption."""
+    if not isinstance(el, Tag):
+        return False
+    if el.name == 'figcaption':
+        return True
+    classes = el.get('class') or []
+    return 'caption' in classes or 'figure-caption' in classes
+
+
+def _caption_text(el):
+    return ' '.join(el.stripped_strings)
+
+
+def _detect_figure_parts(fig_el):
+    """Collect the part labels (A, B, ...) declared inside a figure element."""
+    parts = []
+
+    def add(part):
+        if part and part not in parts:
+            parts.append(part)
+
+    for el in fig_el.find_all(attrs={'data-part': True}):
+        for part in _split_parts(el.get('data-part')):
+            add(part)
+    for el in fig_el.find_all(attrs={'data-parts': True}):
+        for part in _split_parts(el.get('data-parts')):
+            add(part)
+    # nested sub-figures may be labeled by their own figcaption ("A. ...")
+    for sub in fig_el.find_all('figure'):
+        cap = sub.find('figcaption')
+        if cap is not None:
+            label = _parse_caption_label(_caption_text(cap))
+            if label:
+                for part in label[1]:
+                    add(part)
+    return parts
+
+
+def _find_inner_captions(fig_el):
+    """Find the outermost caption elements contained in a figure element."""
+    result = []
+    for el in fig_el.find_all(True):
+        if not _is_caption_element(el):
+            continue
+        ancestor = el.parent
+        nested = False
+        while ancestor is not None and ancestor is not fig_el:
+            if _is_caption_element(ancestor):
+                nested = True
+                break
+            ancestor = ancestor.parent
+        if not nested:
+            result.append(el)
+    return result
+
+
+def _explicit_parts_from_attrs(el, stop_at):
+    """Find a data-part/data-parts attribute on el or its ancestors (up to stop_at)."""
+    node = el
+    while node is not None and node is not stop_at:
+        if isinstance(node, Tag):
+            for attr in ('data-part', 'data-parts'):
+                parts = _split_parts(node.get(attr))
+                if parts:
+                    return parts
+        node = node.parent
+    return None
+
+
+def _whole_figure_candidates(figures, key):
+    """Candidates for a caption applying to a whole figure: its parts, if any."""
+    for fig_key, _, parts in figures:
+        if fig_key == key:
+            if parts:
+                return [(key, part) for part in parts]
+            return [(key, None)]
+    return [(key, None)]
+
+
+def _resolve_figure_key(figures, ref):
+    """Match a figure reference (e.g. "2", "fig2", "Plate 2") to a figure key."""
+    ref = str(ref)
+    for key, _, _ in figures:
+        if key == ref:
+            return key
+    ref_norm = _normalize_figure_ref(ref)
+    for key, _, _ in figures:
+        if _normalize_figure_ref(key) == ref_norm:
+            return key
+    return ref
+
+
+def _adjacent_figures(el, figures):
+    """Return the (key, element, parts) of the figures closest before/after el."""
+    prev_fig = None
+    for fig in el.find_all_previous('figure'):
+        if not fig.find_parent('figure'):
+            prev_fig = fig
+            break
+    next_fig = None
+    for fig in el.find_all_next('figure'):
+        if not fig.find_parent('figure'):
+            next_fig = fig
+            break
+    return [entry for entry in figures
+            if entry[1] is prev_fig or entry[1] is next_fig]
+
+
+def _build_figure_caption_entry(cap_el, fig_el, key, parts, text):
+    """Build a catalog entry for a caption element inside a figure."""
+    explicit_parts = _explicit_parts_from_attrs(cap_el, fig_el)
+    label = _parse_caption_label(text)
+    if explicit_parts:
+        caption = text[label[2]:].strip() if label else text
+        candidates = [(key, part) for part in explicit_parts]
+        return FigureCatalogEntry(caption, candidates, explicit=True)
+    if label:
+        # An explicit label in the caption text ("B: ...", "A and B: ...")
+        caption = text[label[2]:].strip()
+        candidates = [(key, part) for part in label[1]]
+        return FigureCatalogEntry(caption, candidates, explicit=True)
+    # Unlabeled caption on the parent figure: it may describe the whole
+    # composite, so every part is kept as a candidate.
+    if parts:
+        candidates = [(key, part) for part in parts]
+        return FigureCatalogEntry(text, candidates, ambiguous=True)
+    return FigureCatalogEntry(text, [(key, None)])
+
+
+def _build_standalone_caption_entry(el, figures, text):
+    """Build a catalog entry for a labeled caption outside any figure."""
+    label = _parse_caption_label(text)
+    number = label[0] if label else None
+    letters = list(label[1]) if label else []
+    caption = text[label[2]:].strip() if label else text
+
+    attr_parts = _split_parts(el.get('data-part') or el.get('data-parts'))
+    if attr_parts:
+        letters = attr_parts
+    attr_figure = el.get('data-figure')
+
+    if attr_figure or number:
+        # The caption explicitly names its figure ("Fig. 2B: ...", data-figure).
+        key = _resolve_figure_key(figures, attr_figure or number)
+        if letters:
+            candidates = [(key, part) for part in letters]
+        else:
+            candidates = _whole_figure_candidates(figures, key)
+        return FigureCatalogEntry(caption, candidates, explicit=True)
+
+    if letters:
+        # A bare part label ("B: ...") between two figures: the "B" of the
+        # previous figure and the "B" of the next one are different plates,
+        # and the evidence allows both readings, so keep both candidates.
+        candidates = []
+        for key, _, _ in _adjacent_figures(el, figures):
+            for part in letters:
+                if (key, part) not in candidates:
+                    candidates.append((key, part))
+        return FigureCatalogEntry(caption, candidates,
+                                  ambiguous=len(candidates) > 1)
+
+    # No label at all: the caption may belong to either neighbouring figure.
+    candidates = []
+    for key, _, parts in _adjacent_figures(el, figures):
+        for candidate in _whole_figure_candidates(figures, key):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return FigureCatalogEntry(text, candidates, ambiguous=True)
+
+
+def _find_standalone_captions(soup):
+    """Find labeled caption elements that live outside any figure element."""
+    result = []
+    for el in soup.find_all(True):
+        if el.find_parent('figure'):
+            continue
+        if not (_is_caption_element(el)
+                or el.has_attr('data-figure')
+                or el.has_attr('data-part')
+                or el.has_attr('data-parts')):
+            continue
+        if not _caption_text(el):
+            continue
+        # keep only the outermost element if caption markers are nested
+        nested = any(
+            ancestor.name != '[document]'
+            and (_is_caption_element(ancestor)
+                 or ancestor.has_attr('data-figure')
+                 or ancestor.has_attr('data-part')
+                 or ancestor.has_attr('data-parts'))
+            for ancestor in el.parents
+        )
+        if not nested:
+            result.append(el)
+    return result
+
+
+def _extract_figure_catalog(soup):
+    """Extract a FigureCatalog from a BeautifulSoup tree."""
+    figure_els = [fig for fig in soup.find_all('figure')
+                  if not fig.find_parent('figure')]
+    figures = []  # list of (key, element, parts)
+    for index, fig_el in enumerate(figure_els, 1):
+        key = fig_el.get('id') or str(index)
+        figures.append((key, fig_el, _detect_figure_parts(fig_el)))
+
+    entries = []
+    for key, fig_el, parts in figures:
+        for cap_el in _find_inner_captions(fig_el):
+            text = _caption_text(cap_el)
+            if text:
+                entries.append(
+                    _build_figure_caption_entry(cap_el, fig_el, key, parts, text))
+
+    if figures:
+        for el in _find_standalone_captions(soup):
+            entries.append(
+                _build_standalone_caption_entry(el, figures, _caption_text(el)))
+
+    return FigureCatalog(
+        figures={key: list(parts) for key, _, parts in figures},
+        entries=entries)
+
+
 class MarkdownConverter(object):
     class DefaultOptions:
         autolinks = True
@@ -184,6 +577,7 @@ class MarkdownConverter(object):
         escape_asterisks = True
         escape_underscores = True
         escape_misc = False
+        figure_catalog = False
         heading_style = UNDERLINED
         keep_inline_images_in = []
         newline_style = SPACES
@@ -217,11 +611,17 @@ class MarkdownConverter(object):
         # Initialize the conversion function cache
         self.convert_fn_cache = {}
 
+        # Figure plate catalog, populated by convert()/convert_soup() when
+        # the 'figure_catalog' option is enabled (None otherwise).
+        self.figure_catalog = None
+
     def convert(self, html):
         soup = BeautifulSoup(html, **self.options['bs4_options'])
         return self.convert_soup(soup)
 
     def convert_soup(self, soup):
+        if self.options['figure_catalog']:
+            self.figure_catalog = _extract_figure_catalog(soup)
         return self.process_tag(soup, parent_tags=set())
 
     def process_element(self, node, parent_tags=None):
@@ -791,3 +1191,13 @@ class MarkdownConverter(object):
 
 def markdownify(html, **options):
     return MarkdownConverter(**options).convert(html)
+
+
+def markdownify_with_catalog(html, **options):
+    """
+    Convert HTML to Markdown and additionally extract the figure plate
+    catalog （图版目录）. Returns a (markdown_text, FigureCatalog) tuple.
+    """
+    options['figure_catalog'] = True
+    converter = MarkdownConverter(**options)
+    return converter.convert(html), converter.figure_catalog
