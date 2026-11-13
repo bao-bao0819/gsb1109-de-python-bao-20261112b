@@ -378,6 +378,21 @@ class Sqlite3DB(object):
     # TODO Add metadata table with qsql file version
 
     QCATALOG_TABLE_NAME = '_qcatalog'
+    SOURCE_CATALOG_TABLE_NAME = '_q_sources'
+    SOURCE_CATALOG_COLUMNS = [
+        'source_id',
+        'source_reference',
+        'source',
+        'canonical_source',
+        'table_name',
+        'source_type',
+        'reference_kind',
+        'same_object_id',
+        'is_same_object',
+        'reference_count',
+        'content_signature_key',
+        'creation_time',
+    ]
     NUMERIC_COLUMN_TYPES =  {int, long, float}
     PYTHON_TO_SQLITE_TYPE_NAMES = { str: 'TEXT', int: 'INT', long : 'INT' , float: 'REAL', None: 'TEXT' }
 
@@ -406,6 +421,156 @@ class Sqlite3DB(object):
 
     def retrieve_all_table_names(self):
         return [x[0] for x in self.execute_and_fetch("select tbl_name from sqlite_master where type='table'").results]
+
+    def retrieve_all_view_names(self):
+        return [x[0] for x in self.execute_and_fetch("select tbl_name from sqlite_master where type='view'").results]
+
+    def table_names_available_for_export(self):
+        qcatalog_tables = set()
+        if self.qcatalog_table_exists():
+            qcatalog_tables = set(
+                x[0] for x in self.execute_and_fetch(
+                    "SELECT temp_table_name FROM %s" % self.QCATALOG_TABLE_NAME).results)
+        return set(self.retrieve_all_table_names()) | qcatalog_tables
+
+    def _is_glob_source_reference(self, source_reference):
+        return any(character in source_reference for character in ('*', '?', '['))
+
+    def assign_deterministic_table_names(self, planned_identities):
+        existing_table_names = self.table_names_available_for_export()
+        assignments = OrderedDict()
+        existing_source_assignments = OrderedDict(
+            (entry['source_id'], entry['table_name']) for entry in self.get_source_catalog_entries())
+        assigned_names = set(existing_source_assignments.values())
+        for planned_table_name, source_id, canonical_source in sorted(
+                planned_identities,
+                key=lambda x: (x[0], 1 if self._is_glob_source_reference(x[2]) else 0, x[2], x[1])):
+            if source_id in assignments:
+                continue
+            if source_id in existing_source_assignments:
+                assignments[source_id] = existing_source_assignments[source_id]
+                continue
+            for index in range(1, 1000):
+                suffix = '' if index == 1 else '_%s' % index
+                table_name_attempt = '%s%s' % (planned_table_name, suffix)
+                if table_name_attempt not in existing_table_names and table_name_attempt not in assigned_names:
+                    assignments[source_id] = table_name_attempt
+                    assigned_names.add(table_name_attempt)
+                    existing_table_names.add(table_name_attempt)
+                    break
+            else:
+                raise Exception('Cannot find free table name in db %s for planned table name %s' % (
+                    self.db_id, planned_table_name))
+        return assignments
+
+    def _source_catalog_candidate_names(self):
+        yield self.SOURCE_CATALOG_TABLE_NAME
+        for index in range(2, 1000):
+            yield '%s_%s' % (self.SOURCE_CATALOG_TABLE_NAME, index)
+
+    def _object_type(self, object_name):
+        r = self.execute_and_fetch(
+            "select type from sqlite_master where name = ? order by type", (object_name,))
+        if len(r.results) == 0:
+            return None
+        return r.results[0][0]
+
+    def _is_managed_source_catalog_view(self, view_name):
+        sql = self.execute_and_fetch(
+            "select sql from sqlite_master where type='view' and name = ?", (view_name,)).results
+        if len(sql) == 0 or sql[0][0] is None:
+            return False
+        normalized_sql = sql[0][0].lower()
+        return 'json_each' in normalized_sql and all(
+            column.lower() in normalized_sql for column in ('source_id', 'source_reference', 'table_name'))
+
+    def _find_source_catalog_view_name(self):
+        for candidate in self._source_catalog_candidate_names():
+            if self._object_type(candidate) == 'view' and self._is_managed_source_catalog_view(candidate):
+                return candidate
+        return None
+
+    def source_catalog_table_exists(self):
+        return self._find_source_catalog_view_name() is not None
+
+    def source_catalog_available_name(self):
+        for candidate in self._source_catalog_candidate_names():
+            if self._object_type(candidate) is None:
+                return candidate
+            if self._is_managed_source_catalog_view(candidate):
+                return candidate
+        raise Exception('Cannot find a free name for the source catalog')
+
+    def _quote_sql_literal(self, value):
+        if value is None:
+            return 'NULL'
+        return "'%s'" % str(value).replace("'", "''")
+
+    def write_source_catalog(self, rows):
+        view_name = self._find_source_catalog_view_name()
+        if view_name is None:
+            view_name = self.source_catalog_available_name()
+        else:
+            self.conn.execute('DROP VIEW "%s"' % view_name)
+
+        row_json = json.dumps([dict((column, row.get(column)) for column in self.SOURCE_CATALOG_COLUMNS) for row in rows])
+        view_sql = 'CREATE VIEW "%s" AS SELECT %s FROM json_each(%s)' % (
+            view_name,
+            ", ".join([
+                "json_extract(value, '$.%s') AS %s" % (column, column)
+                for column in self.SOURCE_CATALOG_COLUMNS]),
+            self._quote_sql_literal(row_json))
+        xprint("Creating source catalog view: %s" % view_sql)
+        self.conn.execute(view_sql)
+        self.conn.commit()
+
+    def get_source_catalog_entries(self):
+        view_name = self._find_source_catalog_view_name()
+        if view_name is None:
+            return []
+        r = self.execute_and_fetch("SELECT %s FROM \"%s\"" % (
+            ",".join(self.SOURCE_CATALOG_COLUMNS), view_name))
+        return [dict(zip(self.SOURCE_CATALOG_COLUMNS, row)) for row in r.results]
+
+    def merge_source_catalog_rows(self, new_rows):
+        merged = OrderedDict()
+        for row in self.get_source_catalog_entries():
+            merged[(row['source_id'], row['source_reference'])] = row
+        for row in new_rows:
+            merged[(row['source_id'], row['source_reference'])] = row
+        ordered_rows = [merged[key] for key in sorted(merged.keys())]
+        self.write_source_catalog(ordered_rows)
+        return ordered_rows
+
+    def get_source_catalog_entries_by_reference(self, source_reference):
+        view_name = self._find_source_catalog_view_name()
+        if view_name is None:
+            return []
+        r = self.execute_and_fetch(
+            "SELECT %s FROM \"%s\" WHERE source_reference = ? ORDER BY source_id, reference_kind" % (
+                ",".join(self.SOURCE_CATALOG_COLUMNS), view_name),
+            (source_reference,))
+        return [dict(zip(self.SOURCE_CATALOG_COLUMNS, row)) for row in r.results]
+
+    def get_source_catalog_entries_by_canonical_source(self, canonical_source):
+        view_name = self._find_source_catalog_view_name()
+        if view_name is None:
+            return []
+        r = self.execute_and_fetch(
+            "SELECT %s FROM \"%s\" WHERE canonical_source = ? ORDER BY source_id, source_reference" % (
+                ",".join(self.SOURCE_CATALOG_COLUMNS), view_name),
+            (canonical_source,))
+        return [dict(zip(self.SOURCE_CATALOG_COLUMNS, row)) for row in r.results]
+
+    def get_same_object_source_entries(self, source_id):
+        view_name = self._find_source_catalog_view_name()
+        if view_name is None:
+            return []
+        r = self.execute_and_fetch(
+            "SELECT %s FROM \"%s\" WHERE same_object_id = ? ORDER BY source_reference" % (
+                ",".join(self.SOURCE_CATALOG_COLUMNS), view_name),
+            (source_id,))
+        return [dict(zip(self.SOURCE_CATALOG_COLUMNS, row)) for row in r.results]
 
     def get_sqlite_table_info(self,table_name):
         return self.execute_and_fetch('PRAGMA table_info(%s)' % table_name).results
@@ -436,7 +601,7 @@ class Sqlite3DB(object):
     def create_qcatalog_table(self):
         if not self.qcatalog_table_exists():
             xprint("qcatalog table does not exist. Creating it")
-            r = self.conn.execute("""CREATE TABLE %s ( 
+            r = self.conn.execute("""CREATE TABLE %s (
                                qcatalog_entry_id text not null primary key,
                                content_signature_key text,
                                temp_table_name text,
@@ -709,6 +874,20 @@ class NoTablesInSqliteException(Exception):
     def __init__(self, sqlite_filename):
         self.sqlite_filename = sqlite_filename
 
+class AmbiguousSourceReferenceException(Exception):
+
+    def __init__(self, source_reference, sqlite_filename, table_names):
+        self.source_reference = source_reference
+        self.sqlite_filename = sqlite_filename
+        self.table_names = table_names
+
+class ExportSourceTableAlreadyExistsException(Exception):
+
+    def __init__(self, table_name, source_db_id, source_table_name):
+        self.table_name = table_name
+        self.source_db_id = source_db_id
+        self.source_table_name = source_table_name
+
 class ColumnMaxLengthLimitExceededException(Exception):
 
     def __init__(self, msg):
@@ -871,6 +1050,8 @@ class Sql(object):
         # Dict from qtable names to their effective (actual database) table
         # names
         self.qtable_name_effective_table_names = {}
+        # Dict from normalized qtable names to the original reference spellings used in the query
+        self.qtable_name_original_references = {}
 
         self.query_column_names = None
 
@@ -906,6 +1087,12 @@ class Sql(object):
 
                     if normalized_qtable_name not in self.qtable_name_positions.keys():
                         self.qtable_name_positions[normalized_qtable_name] = []
+
+                    if normalized_qtable_name not in self.qtable_name_original_references:
+                        self.qtable_name_original_references[normalized_qtable_name] = []
+
+                    if qtable_name not in self.qtable_name_original_references[normalized_qtable_name]:
+                        self.qtable_name_original_references[normalized_qtable_name].append(qtable_name)
 
                     self.qtable_name_positions[normalized_qtable_name].append(idx + 1)
                     self.sql_parts[idx + 1] = normalized_qtable_name
@@ -1372,6 +1559,48 @@ def normalize_filename_to_table_name(filename):
         filename = filename[:-8]
     return filename.replace("-","_dash_").replace(".","_dot_").replace('?','_qm_').replace("/","_slash_").replace("\\","_backslash_").replace(":","_colon_").replace(" ","_space_").replace("+","_plus_")
 
+def split_source_reference(source_reference):
+    if ':::' in source_reference:
+        filename, table_name = source_reference.split(':::', 1)
+        return filename, table_name
+    return source_reference, None
+
+def canonicalize_source_reference(source_reference, data_streams=None):
+    if data_streams is not None and data_streams.is_data_stream(source_reference):
+        return source_reference
+    filename, table_name = split_source_reference(source_reference)
+    if not os.path.isabs(filename):
+        filename = os.path.abspath(filename)
+    filename = os.path.realpath(filename)
+    if table_name is None:
+        return filename
+    return '%s:::%s' % (filename, table_name)
+
+def source_reference_kind(source_reference, data_streams=None):
+    if data_streams is not None and data_streams.is_data_stream(source_reference):
+        return TableSourceType.DATA_STREAM
+    filename, table_name = split_source_reference(source_reference)
+    if is_qsql_file(filename):
+        return TableSourceType.QSQL_FILE
+    if is_sqlite_file(filename):
+        return TableSourceType.SQLITE_FILE
+    return TableSourceType.DELIMITED_FILE
+
+def generate_source_id(canonical_source, source_type):
+    return hashlib.sha1(six.b('%s\x00%s' % (source_type, canonical_source))).hexdigest()
+
+def is_existing_user_sqlite_database(filename):
+    if not is_sqlite_file(filename):
+        return False
+
+    db = Sqlite3DB('check_existing_db', 'file:%s?immutable=1' % filename, filename, create_qcatalog=False)
+    try:
+        if db.source_catalog_table_exists() or db.qcatalog_table_exists():
+            return False
+        return len(db.retrieve_all_table_names()) > 0
+    finally:
+        db.done()
+
 def validate_content_signature(original_filename, source_signature,other_filename, content_signature,scope=None,dump=False):
     if dump:
         xprint("Comparing: source value: %s target value: %s" % (source_signature,content_signature))
@@ -1815,6 +2044,7 @@ class MaterializedSqliteState(MaterializedState):
         super(MaterializedSqliteState, self).__init__(table_source_type,qtable_name,engine_id)
         self.sqlite_filename = sqlite_filename
         self.table_name = table_name
+        self.original_table_name = table_name
 
         self.table_name_autodetected = None
 
@@ -1823,11 +2053,82 @@ class MaterializedSqliteState(MaterializedState):
 
         self.table_name_autodetected = False
         if self.table_name is None:
+            if self._saved_source_catalog_exists():
+                resolved_table_name = self._resolve_table_name_from_saved_catalog()
+                if resolved_table_name is not None:
+                    self.table_name = resolved_table_name
+                    return
             self.table_name = self.autodetect_table_name()
             self.table_name_autodetected = True
             return
 
+        if self._saved_source_catalog_exists():
+            self._resolve_explicit_table_reference()
+
         self.validate_table_name()
+
+    def _explicitly_addressable_names(self, db):
+        names = list(db.retrieve_all_table_names())
+        catalog_view_name = db._find_source_catalog_view_name()
+        if catalog_view_name is not None:
+            names.append(catalog_view_name)
+        return names
+
+    def _resolve_explicit_table_reference(self):
+        db = self._open_catalog_db()
+        try:
+            reference = self.original_table_name
+            if reference.lower() in map(lambda x: x.lower(), self._explicitly_addressable_names(db)):
+                return
+
+            entries = db.get_source_catalog_entries_by_reference(reference)
+            if len(entries) == 0:
+                canonical_reference = canonicalize_source_reference(reference)
+                entries = db.get_source_catalog_entries_by_canonical_source(canonical_reference)
+            if len(entries) == 0:
+                raise NonExistentTableNameInSqlite(
+                    self.sqlite_filename, reference, db.retrieve_all_table_names())
+
+            resolved_table_names = set(entry['table_name'] for entry in entries)
+            if len(resolved_table_names) > 1:
+                raise AmbiguousSourceReferenceException(reference, self.sqlite_filename, sorted(resolved_table_names))
+            self.table_name = entries[0]['table_name']
+        finally:
+            db.done()
+
+    def _open_catalog_db(self):
+        return Sqlite3DB('temp_catalog_db', 'file:%s?immutable=1' % self.sqlite_filename, self.sqlite_filename,
+                         create_qcatalog=False)
+
+    def _saved_source_catalog_exists(self):
+        db = self._open_catalog_db()
+        try:
+            return db.source_catalog_table_exists()
+        finally:
+            db.done()
+
+    def _resolve_table_name_from_saved_catalog(self):
+        db = self._open_catalog_db()
+        try:
+            reference = self.original_table_name
+            if reference is None:
+                reference = self.qtable_name
+            entries = db.get_source_catalog_entries_by_reference(reference)
+            if len(entries) == 0 and ':::' not in reference:
+                entries = db.get_source_catalog_entries_by_reference(
+                    os.path.abspath(reference))
+            if len(entries) == 0:
+                canonical_reference = canonicalize_source_reference(reference)
+                entries = db.get_source_catalog_entries_by_canonical_source(canonical_reference)
+            if len(entries) == 0:
+                return None
+
+            table_names = set(entry['table_name'] for entry in entries)
+            if len(table_names) > 1:
+                raise AmbiguousSourceReferenceException(reference, self.sqlite_filename, sorted(table_names))
+            return entries[0]['table_name']
+        finally:
+            db.done()
 
     def get_planned_table_name(self):
         if self.table_name_autodetected:
@@ -1853,9 +2154,9 @@ class MaterializedSqliteState(MaterializedState):
         db = Sqlite3DB('temp_db', 'file:%s?immutable=1' % self.sqlite_filename, self.sqlite_filename,
                        create_qcatalog=False)
         try:
-            table_names = list(db.retrieve_all_table_names())
-            if self.table_name.lower() not in map(lambda x:x.lower(),table_names):
-                raise NonExistentTableNameInSqlite(self.sqlite_filename, self.table_name, table_names)
+            if self.table_name.lower() not in map(lambda x:x.lower(), self._explicitly_addressable_names(db)):
+                raise NonExistentTableNameInSqlite(self.sqlite_filename, self.table_name,
+                                                  db.retrieve_all_table_names())
         finally:
             db.done()
 
@@ -1902,13 +2203,14 @@ class MaterializedSqliteState(MaterializedState):
 
     def _extract_information(self):
         table_list = self.db_to_use.retrieve_all_table_names()
-        if len(table_list) == 1:
-            table_name = table_list[0][0]
+        view_list = self.db_to_use.retrieve_all_view_names()
+        if len(table_list) == 1 and len(view_list) == 0:
+            table_name = table_list[0]
             xprint("Only one table in sqlite database, choosing it: %s" % table_name)
         else:
             # self.table_name has either beein autodetected, or validated as an existing table up the stack
             table_name = self.table_name
-            xprint("Multiple tables in sqlite file. Using provided table name %s" % self.table_name)
+            xprint("Multiple objects in sqlite file. Using provided table name %s" % self.table_name)
 
         table_info = self.db_to_use.get_sqlite_table_info(table_name)
         xprint('Table info is %s' % table_info)
@@ -2769,6 +3071,34 @@ class QTextAsData(object):
 
         return new_table_structures
 
+    def _export_source_identity(self, qtable_name, table_structure, sql_object):
+        source_type = table_structure.source_type
+        canonical_source = canonicalize_source_reference(qtable_name, self.data_streams)
+        source_id = generate_source_id(canonical_source, source_type)
+        reference_rows = []
+        original_references = sql_object.qtable_name_original_references.get(qtable_name, [qtable_name])
+        source_reference = table_structure.source
+        for reference in original_references:
+            if self.data_streams.is_data_stream(reference):
+                canonical_reference = reference
+            else:
+                canonical_reference = canonicalize_source_reference(reference)
+            reference_rows.append({
+                'source_id': source_id,
+                'source_reference': reference,
+                'source': source_reference,
+                'canonical_source': canonical_reference,
+                'source_type': source_type,
+                'reference_kind': source_reference_kind(reference, self.data_streams),
+                'same_object_id': source_id,
+                'is_same_object': '1',
+                'reference_count': str(len(original_references)),
+                'content_signature_key': None,
+                'creation_time': None,
+                'table_name': None,
+            })
+        return source_id, canonical_source, source_type, reference_rows
+
     def materialize_query_level_db(self,save_db_to_disk_filename,sql_object):
         # TODO More robust creation - Create the file in a separate folder and move it to the target location only after success
 
@@ -2778,8 +3108,40 @@ class QTextAsData(object):
         # For each table in the query
         effective_table_names = sql_object.get_qtable_name_effective_table_names()
 
-        for i, qtable_name in enumerate(effective_table_names):
-            # table name, in the format db_id.table_name
+        identities = OrderedDict()
+        for qtable_name in effective_table_names:
+            ts = self.loaded_table_structures_dict[qtable_name]
+            source_id, canonical_source, source_type, reference_rows = self._export_source_identity(
+                qtable_name, ts, sql_object)
+            identities[qtable_name] = {
+                'source_id': source_id,
+                'canonical_source': canonical_source,
+                'source_type': source_type,
+                'reference_rows': reference_rows,
+                'planned_table_name': ts.planned_table_name,
+            }
+
+        planned_identities = [
+            (identity['planned_table_name'], identity['source_id'], identity['canonical_source'])
+            for identity in identities.values()
+        ]
+        identity_to_same_object_id = OrderedDict()
+        for identity in identities.values():
+            same_object_id = identity['source_id']
+            for other_identity in identities.values():
+                if identity['canonical_source'] == other_identity['canonical_source']:
+                    same_object_id = min(same_object_id, other_identity['source_id'])
+            identity_to_same_object_id[identity['source_id']] = same_object_id
+            for row in identity['reference_rows']:
+                row['same_object_id'] = same_object_id
+                row['is_same_object'] = '1' if identity['source_id'] == same_object_id else '0'
+                row['reference_count'] = str(len(identity['reference_rows']))
+
+        source_id_to_table_name = materialized_db.assign_deterministic_table_names(planned_identities)
+
+        new_catalog_rows = []
+        for qtable_name in effective_table_names:
+            identity = identities[qtable_name]
             effective_table_name_for_qtable_name = effective_table_names[qtable_name]
 
             source_db_id, actual_table_name_in_db = effective_table_name_for_qtable_name.split(".", 1)
@@ -2792,28 +3154,38 @@ class QTextAsData(object):
             proposed_new_table_name = ts.planned_table_name
             xprint("Proposed table name is %s" % proposed_new_table_name)
 
-            new_table_name = materialized_db.find_new_table_name(proposed_new_table_name)
+            new_table_name = source_id_to_table_name[identity['source_id']]
+            xprint("Assigned deterministic table name %s to source %s (%s)" % (
+                new_table_name, ts.source, identity['canonical_source']))
 
             xprint("Materializing",source_db_id,actual_table_name_in_db,"as",new_table_name)
-            # Copy the table into the materialized database
-            xx = materialized_db.execute_and_fetch('CREATE TABLE %s AS SELECT * FROM %s' % (new_table_name,effective_table_name_for_qtable_name))
+            # Copy the table into the materialized database, reusing an identical source table on incremental exports
+            if new_table_name in materialized_db.table_names_available_for_export():
+                existing_row_count = materialized_db.execute_and_fetch(
+                    'SELECT COUNT(*) FROM "%s"' % new_table_name).results[0][0]
+                source_row_count = materialized_db.execute_and_fetch(
+                    'SELECT COUNT(*) FROM %s' % effective_table_name_for_qtable_name).results[0][0]
+                if existing_row_count == source_row_count:
+                    xprint("Reusing existing table %s for source %s" % (new_table_name, ts.source))
+                else:
+                    raise ExportSourceTableAlreadyExistsException(new_table_name, source_db_id, actual_table_name_in_db)
+            else:
+                materialized_db.execute_and_fetch(
+                    'CREATE TABLE "%s" AS SELECT * FROM %s' % (new_table_name,effective_table_name_for_qtable_name))
 
             table_name_mapping[effective_table_name_for_qtable_name] = new_table_name
 
-            # TODO RLRL Preparation for writing materialized database as a qsql file
-            # if source_database.sqlite_db.qcatalog_table_exists():
-            #     qcatalog_entry = source_database.sqlite_db.get_from_qcatalog_using_table_name(actual_table_name_in_db)
-            #     # TODO RLRL Encapsulate dictionary transform inside qcatalog access methods
-            #     materialized_db.add_to_qcatalog_table(new_table_name,OrderedDict(json.loads(qcatalog_entry['content_signature'])),
-            #                                           qcatalog_entry['creation_time'],
-            #                                           qcatalog_entry['source_type'],
-            #                                           qcatalog_entry['source_type'])
-            #     xprint("PQX Added to qcatalog",source_db_id,actual_table_name_in_db,'as',new_table_name)
-            # else:
-            #     xprint("PQX Skipped adding to qcatalog",source_db_id,actual_table_name_in_db)
+            creation_time = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
+            for row in identity['reference_rows']:
+                row = dict(row)
+                row['table_name'] = new_table_name
+                row['creation_time'] = creation_time
+                new_catalog_rows.append(row)
 
             if source_db_id != self.query_level_db:
                 self.detach_from_db(source_database.sqlite_db,materialized_db)
+
+        materialized_db.merge_source_catalog_rows(new_catalog_rows)
 
         return table_name_mapping
 
@@ -2973,6 +3345,14 @@ class QTextAsData(object):
         except NoTablesInSqliteException as e:
             msg = "sqlite file %s has no tables" % e.sqlite_filename
             error = QError(e,msg,88)
+        except AmbiguousSourceReferenceException as e:
+            msg = "Source reference %s in sqlite file %s matches multiple tables: %s" % (
+                e.source_reference, e.sqlite_filename, ",".join(e.table_names))
+            error = QError(e,msg,100)
+        except ExportSourceTableAlreadyExistsException as e:
+            msg = "Table %s already exists in the database with different data than source table %s.%s" % (
+                e.table_name, e.source_db_id, e.source_table_name)
+            error = QError(e,msg,101)
         except TooManyAttachedDatabasesException as e:
             msg = str(e)
             error = QError(e,msg,89)
@@ -3593,7 +3973,8 @@ def parse_options(args, options):
             sys.exit(119)
 
         print("Going to save data into a disk database: %s" % options.save_db_to_disk_filename, file=sys.stderr)
-        if os.path.exists(options.save_db_to_disk_filename):
+        if os.path.exists(options.save_db_to_disk_filename) and not is_existing_user_sqlite_database(
+                options.save_db_to_disk_filename):
             print("Disk database file %s already exists." % options.save_db_to_disk_filename, file=sys.stderr)
             sys.exit(77)
     # sys.exit(78) Deprecated, but shouldn't be reused

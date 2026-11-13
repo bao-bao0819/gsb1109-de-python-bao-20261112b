@@ -290,6 +290,179 @@ def get_sqlite_table_list(c,exclude_qcatalog=True):
 
     return r
 
+class SourceCatalogTests(AbstractQTestCase):
+
+    def test_catalog_distinguishes_same_basename_with_colliding_normalization(self):
+        new_tmp_folder = self.create_folder_with_files({
+            'a-b.csv': six.b("v\n1\n2\n"),
+            'a_b.csv': six.b("v\n3\n"),
+            'other/a-b.csv': six.b("v\n4\n")
+        }, prefix='xx', suffix='catalog')
+
+        output_db = self.generate_tmpfile_name(suffix='.sqlite')
+        effective_filename1 = '%s/a-b.csv' % new_tmp_folder
+        effective_filename2 = '%s/a_b.csv' % new_tmp_folder
+        effective_filename3 = '%s/other/a-b.csv' % new_tmp_folder
+
+        cmd = '%s -H -c 1 "select * from %s left join %s left join %s" -S %s' % (
+            Q_EXECUTABLE, effective_filename1, effective_filename2, effective_filename3, output_db)
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+
+        c = sqlite3.connect(output_db)
+        catalog_rows = c.execute(
+            'select source_reference,table_name,canonical_source from _q_sources order by source_reference').fetchall()
+        c.close()
+
+        table_names = set(row[1] for row in catalog_rows)
+        self.assertEqual(len(catalog_rows), 3)
+        self.assertEqual(len(table_names), 3)
+
+        expected_row_counts = {
+            '%s/a-b.csv' % new_tmp_folder: 2,
+            '%s/a_b.csv' % new_tmp_folder: 1,
+            '%s/other/a-b.csv' % new_tmp_folder: 1,
+        }
+        for reference, table_name, canonical_source in catalog_rows:
+            cmd = '%s -H -c 1 "select * from %s:::%s"' % (Q_EXECUTABLE, output_db, reference)
+            retcode, o, e = run_command(cmd)
+            self.assertEqual(retcode, 0)
+            self.assertEqual(len(e), 0)
+            self.assertEqual(len(o), expected_row_counts[reference])
+
+    def test_catalog_marks_two_spellings_of_same_source_as_same_object(self):
+        new_tmp_folder = self.create_folder_with_files({
+            'a-b.csv': six.b("v\n7\n")
+        }, prefix='xx', suffix='catalog-alias')
+
+        output_db = self.generate_tmpfile_name(suffix='.sqlite')
+        effective_filename = '%s/a-b.csv' % new_tmp_folder
+        alternate_reference = '%s/./a-b.csv' % new_tmp_folder
+
+        cmd = '%s -H -c 1 "select * from %s a left join %s b" -S %s' % (
+            Q_EXECUTABLE, effective_filename, alternate_reference, output_db)
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+
+        c = sqlite3.connect(output_db)
+        rows = c.execute(
+            'select source_reference,table_name,same_object_id,is_same_object,reference_count from _q_sources').fetchall()
+        c.close()
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(set(row[1] for row in rows)), 1)
+        self.assertEqual(len(set(row[2] for row in rows)), 1)
+        self.assertEqual(len(set(row[3] for row in rows)), 1)
+        self.assertEqual(set(row[4] for row in rows), {'2'})
+
+    def test_reversing_input_order_does_not_reassign_sources(self):
+        new_tmp_folder = self.create_folder_with_files({
+            'a.csv': six.b("v\n1\n"),
+            'nested/a.csv': six.b("v\n2\n")
+        }, prefix='xx', suffix='catalog-order')
+
+        first_db = self.generate_tmpfile_name(suffix='.sqlite')
+        second_db = self.generate_tmpfile_name(suffix='.sqlite')
+        filename1 = '%s/a.csv' % new_tmp_folder
+        filename2 = '%s/nested/a.csv' % new_tmp_folder
+
+        cmd = '%s -H -c 1 "select * from %s left join %s" -S %s' % (
+            Q_EXECUTABLE, filename1, filename2, first_db)
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+
+        cmd = '%s -H -c 1 "select * from %s left join %s" -S %s' % (
+            Q_EXECUTABLE, filename2, filename1, second_db)
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+
+        def catalog_mapping(db_filename):
+            c = sqlite3.connect(db_filename)
+            rows = c.execute('select source_reference,table_name from _q_sources').fetchall()
+            c.close()
+            return dict(rows)
+
+        self.assertEqual(catalog_mapping(first_db), catalog_mapping(second_db))
+
+    def test_repeated_exports_into_same_database_reuse_sources(self):
+        new_tmp_folder = self.create_folder_with_files({
+            'a.csv': six.b("v\n1\n"),
+            'nested/a.csv': six.b("v\n2\n")
+        }, prefix='xx', suffix='catalog-repeat')
+
+        output_db = self.generate_tmpfile_name(suffix='.sqlite')
+        filename1 = '%s/a.csv' % new_tmp_folder
+        filename2 = '%s/nested/a.csv' % new_tmp_folder
+
+        first_cmd = '%s -H -c 1 "select * from %s left join %s" -S %s' % (
+            Q_EXECUTABLE, filename1, filename2, output_db)
+        retcode, o, e = run_command(first_cmd)
+        self.assertEqual(retcode, 0)
+
+        c = sqlite3.connect(output_db)
+        first_mapping = c.execute('select source_reference,table_name from _q_sources order by source_reference').fetchall()
+        c.close()
+
+        q = QTextAsData(QInputParams(skip_header=True, delimiter=','))
+        try:
+            r = q.execute('select * from %s left join %s' % (filename2, filename1),
+                          save_db_to_disk_filename=output_db)
+            self.assertEqual(r.status, 'ok')
+        finally:
+            q.done()
+
+        c = sqlite3.connect(output_db)
+        second_mapping = c.execute('select source_reference,table_name from _q_sources order by source_reference').fetchall()
+        c.close()
+
+        self.assertEqual(first_mapping, second_mapping)
+
+    def test_existing_user_tables_are_preserved(self):
+        new_tmp_folder = self.create_folder_with_files({
+            'a.csv': six.b("v\n9\n")
+        }, prefix='xx', suffix='catalog-user-tables')
+
+        output_db = self.generate_tmpfile_name(suffix='.sqlite')
+        c = sqlite3.connect(output_db)
+        c.execute('create table _q_sources (note text)')
+        c.execute("insert into _q_sources values ('user data')")
+        c.execute('create table keep_me (v int)')
+        c.execute('insert into keep_me values (42)')
+        c.commit()
+        c.close()
+
+        q = QTextAsData(QInputParams(skip_header=True, delimiter=','))
+        try:
+            r = q.execute('select * from %s' % ('%s/a.csv' % new_tmp_folder),
+                          save_db_to_disk_filename=output_db)
+            self.assertEqual(r.status, 'ok')
+        finally:
+            q.done()
+
+        c = sqlite3.connect(output_db)
+        self.assertEqual(c.execute('select * from _q_sources').fetchall(), [('user data',)])
+        self.assertEqual(c.execute('select * from keep_me').fetchall(), [(42,)])
+        self.assertEqual(
+            c.execute("select count(*) from sqlite_master where type='view' and name='_q_sources_2'").fetchone()[0], 1)
+        c.close()
+
+    def test_catalog_is_queryable_directly(self):
+        new_tmp_folder = self.create_folder_with_files({
+            'a.csv': six.b("v\n9\n")
+        }, prefix='xx', suffix='catalog-query')
+
+        output_db = self.generate_tmpfile_name(suffix='.sqlite')
+        cmd = '%s -H -c 1 "select * from %s" -S %s' % (
+            Q_EXECUTABLE, '%s/a.csv' % new_tmp_folder, output_db)
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+
+        cmd = '%s -H -c 1 "select count(*) from %s:::_q_sources"' % (Q_EXECUTABLE, output_db)
+        retcode, o, e = run_command(cmd)
+        self.assertEqual(retcode, 0)
+        self.assertEqual(o, [six.b('1')])
+
+
 class SaveToSqliteTests(AbstractQTestCase):
 
     # Returns a folder with files and a header in each, one column named 'a'
