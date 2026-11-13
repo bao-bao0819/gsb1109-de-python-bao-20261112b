@@ -416,6 +416,175 @@ msgstr ""
         self.assertFalse(polib._is_file(True))
 
 
+class TestMenuMnemonics(unittest.TestCase):
+    """
+    Tests for translated menu mnemonic (underlined letter) handling.
+    """
+
+    def test_menu_mnemonic_simple(self):
+        self.assertEqual(polib.menu_mnemonic('_Datei'), 'D')
+
+    def test_menu_mnemonic_literal_underscore(self):
+        # doubled underscore is a literal character, not a marker
+        self.assertIsNone(polib.menu_mnemonic('Speichern__unter'))
+        self.assertEqual(polib.menu_mnemonic('_Speichern__unter'), 'S')
+        # a trailing single underscore marks nothing
+        self.assertIsNone(polib.menu_mnemonic('Datei_'))
+
+    def test_menu_label_strips_markers(self):
+        self.assertEqual(polib.menu_label('_Speichern__unter'),
+                         u('Speichern_unter'))
+        self.assertEqual(polib.menu_label('Datei'), u('Datei'))
+
+    def test_with_mnemonic_preserves_literal_underscore(self):
+        item = polib.MenuItem('save', '_Speichern__unter')
+        self.assertEqual(item.with_mnemonic('u'), 'Speichern___unter')
+        self.assertEqual(item.with_mnemonic(None), 'Speichern_unter')
+        self.assertRaises(ValueError, item.with_mnemonic, 'z')
+
+    def test_candidates_are_case_insensitive_and_ordered(self):
+        item = polib.MenuItem('open', u('Ö_ffnen'))
+        self.assertEqual([c.lower() for c in item.candidates()],
+                         [u('ö'), 'f', 'n', 'e'])
+
+    def test_conflicts_only_inside_shared_scope(self):
+        # two menus that are never open at the same time do not share a scope
+        file_menu = polib.Menu('Datei', [
+            polib.MenuItem('new', '_Neu'),
+            polib.MenuItem('open', '_Öffnen'),
+        ], condition=lambda ctx: ctx == 'file')
+        edit_menu = polib.Menu('Bearbeiten', [
+            polib.MenuItem('note', '_Notiz'),
+        ], condition=lambda ctx: ctx == 'edit')
+        self.assertEqual(
+            polib.check_menu_mnemonics([file_menu, edit_menu],
+                                       context='file'), [])
+
+        # menus shown together form one scope, so duplicated letters collide
+        bar = polib.Menu('Leiste', [
+            polib.MenuItem('new', '_Neu'),
+            polib.MenuItem('note', '_Notiz'),
+        ])
+        conflicts = polib.check_menu_mnemonics([bar])
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].letter, 'n')
+        self.assertEqual(conflicts[0].commands, ['new', 'note'])
+
+    def test_mutually_exclusive_menus_never_collide(self):
+        full = polib.Menu('Voll', [
+            polib.MenuItem('a', '_Alpha'),
+            polib.MenuItem('b', '_Beta'),
+        ], condition=lambda ctx: ctx == 'full')
+        mini = polib.Menu('Kompakt', [
+            polib.MenuItem('a2', '_Auch'),
+        ], condition=lambda ctx: ctx == 'mini')
+        self.assertEqual(
+            polib.check_menu_mnemonics([full, mini], context='full'), [])
+        self.assertEqual(
+            polib.check_menu_mnemonics([full, mini], context='mini'), [])
+
+    def test_visibility_sets_merge_simultaneous_menus(self):
+        first = polib.Menu('Eins', [polib.MenuItem('a', '_Alpha')])
+        second = polib.Menu('Zwei', [polib.MenuItem('b', '_Beta')],
+                            condition=lambda ctx: True)
+        planner = polib.MenuMnemonicPlanner([first, second])
+        self.assertEqual(len(planner.sets), 1)
+        self.assertEqual(
+            planner.sets[0].menus, [first, second])
+
+    def test_assign_changes_minimum_translations(self):
+        # 'fixed' only contains the letter s, so it must keep it and the two
+        # other commands (currently also on s) have to move instead
+        menu = polib.Menu('Datei', [
+            polib.MenuItem('fixed', '_S'),
+            polib.MenuItem('save-as', '_Sichern __als'),
+            polib.MenuItem('send', '_Senden'),
+        ])
+        assignment = polib.assign_menu_mnemonics([menu])
+        self.assertTrue(assignment.feasible)
+        self.assertEqual(
+            assignment.changed_commands(), ['save-as', 'send'])
+        self.assertNotIn('fixed', assignment.translations)
+        self.assertEqual(
+            assignment.translations['save-as'], 'S_ichern __als')
+        self.assertEqual(
+            assignment.translations['send'], 'S_enden')
+        # literal double underscores survive the rewrite
+        rewritten = assignment.translations['save-as']
+        self.assertIn('__', rewritten)
+        self.assertEqual(polib.menu_label(rewritten), 'Sichern _als')
+        letters = [
+            polib.menu_mnemonic(
+                assignment.translations.get(item.command,
+                                            item.translation)).lower()
+            for item in menu.items]
+        self.assertEqual(len(set(letters)), 3)
+
+    def test_locked_mnemonics_are_immovable(self):
+        menu = polib.Menu('Datei', [
+            polib.MenuItem('save', '_Speichern', locked=True),
+            polib.MenuItem('send', '_Senden'),
+        ])
+        assignment = polib.assign_menu_mnemonics([menu])
+        self.assertTrue(assignment.feasible)
+        self.assertNotIn('save', assignment.translations)
+        self.assertEqual(
+            assignment.translations['send'], 'S_enden')
+
+    def test_shared_command_uses_one_translation(self):
+        # 'export' is shared by two mutually exclusive menus and clashes in
+        # both; moving it once must resolve both clashes with a single result
+        bar = polib.Menu('Datei', [
+            polib.MenuItem('export', '_Export'),
+            polib.MenuItem('insert', '_Einfügen'),
+        ], condition=lambda ctx: ctx == 'bar')
+        toolbar = polib.Menu('Werkzeugleiste', [
+            polib.MenuItem('export', '_Export'),
+            polib.MenuItem('exit', '_Ende'),
+        ], condition=lambda ctx: ctx == 'toolbar')
+        assignment = polib.assign_menu_mnemonics([bar, toolbar],
+                                                 context='bar')
+        self.assertTrue(assignment.feasible)
+        # cheapest fix moves the shared command once, one shared translation
+        self.assertEqual(assignment.changed_commands(), ['export'])
+        self.assertEqual(assignment.translations['export'], 'E_xport')
+        self.assertEqual(
+            polib.menu_mnemonic(assignment.translations['export']), 'x')
+
+    def test_same_command_in_simultaneous_menus_is_not_a_collision(self):
+        # the same command can be a menu item and a toolbar button at once;
+        # its duplicated letter must not be reported as a clash
+        menu = polib.Menu('Datei', [
+            polib.MenuItem('save', '_Speichern'),
+        ])
+        toolbar = polib.Menu('Leiste', [
+            polib.MenuItem('save', '_Speichern'),
+        ])
+        self.assertEqual(
+            polib.check_menu_mnemonics([menu, toolbar]), [])
+        assignment = polib.assign_menu_mnemonics([menu, toolbar])
+        self.assertTrue(assignment.feasible)
+        self.assertEqual(assignment.translations, {})
+
+    def test_deadlock_reports_one_conflict_group(self):
+        # two locked commands, same letter, no way out: report this group
+        # only rather than every menu
+        stuck = polib.Menu('Klemmt', [
+            polib.MenuItem('one', '_Aaa', locked=True),
+            polib.MenuItem('two', '_Abb', locked=True),
+        ])
+        fine = polib.Menu('Frei', [
+            polib.MenuItem('three', '_Ccc'),
+            polib.MenuItem('four', '_Ddd'),
+        ])
+        assignment = polib.assign_menu_mnemonics([stuck, fine])
+        self.assertFalse(assignment.feasible)
+        self.assertEqual(assignment.translations, {})
+        self.assertEqual(len(assignment.conflicts), 1)
+        self.assertEqual(assignment.conflicts[0].commands, ['one', 'two'])
+        self.assertEqual(assignment.conflicts[0].menus, ['Klemmt'])
+
+
 class TestBaseFile(unittest.TestCase):
     """
     Tests for the _BaseFile class.

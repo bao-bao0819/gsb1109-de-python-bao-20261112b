@@ -25,7 +25,11 @@ import io
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'default_encoding', 'escape', 'unescape', 'detect_encoding',
+           'MenuItem', 'Menu', 'MnemonicSet', 'MnemonicAssignment',
+           'MenuMnemonicConflict', 'MenuMnemonicPlanner',
+           'menu_mnemonic', 'menu_label',
+           'check_menu_mnemonics', 'assign_menu_mnemonics', ]
 
 
 # the default encoding to use when encoding cannot be detected
@@ -286,6 +290,448 @@ def natural_sort(lst):
         return [convert(c) for c in re.split('([0-9]+)', key)]
 
     return sorted(lst, key=alphanum_key)
+
+# }}}
+# menu mnemonic helpers {{{
+
+
+def menu_mnemonic(label):
+    """
+    Return the underlined mnemonic character of a translated menu label.
+
+    A single underscore marks the mnemonic, i.e. the character immediately
+    following it.  Two consecutive underscores are a literal underscore and
+    never start a mnemonic.  Labels without any mnemonic return ``None``.
+
+    >>> menu_mnemonic('_File')
+    'F'
+    >>> menu_mnemonic('Save __As') is None
+    True
+    >>> menu_mnemonic('_Save__As')
+    'S'
+    """
+    index = 0
+    length = len(label)
+    while index < length:
+        if label[index] != '_':
+            index += 1
+            continue
+        if index + 1 < length and label[index + 1] == '_':
+            index += 2
+            continue
+        if index + 1 >= length:
+            return None
+        return label[index + 1]
+    return None
+
+
+def menu_label(label):
+    """
+    Return the visible text of a menu label: mnemonic markers are stripped
+    and doubled underscores are collapsed into a literal underscore.
+    """
+    result = []
+    index = 0
+    length = len(label)
+    while index < length:
+        char = label[index]
+        if char == '_':
+            if index + 1 < length and label[index + 1] == '_':
+                result.append('_')
+                index += 2
+                continue
+            index += 1
+            continue
+        result.append(char)
+        index += 1
+    return u('').join(result)
+
+
+class MenuItem(object):
+    """
+    A single translated menu entry.
+
+    ``command``
+        A stable identifier of the underlying command.  The same command may
+        appear in several menus; a translation shared by two menus is modelled
+        by giving their items the same ``command``.
+
+    ``translation``
+        The translated label.  At most one single underscore marks the
+        mnemonic, doubled underscores (``__``) are literal underscores.
+
+    ``locked``
+        When ``True``, the mnemonic inherited from the source string cannot
+        be moved to another letter.
+    """
+
+    def __init__(self, command, translation, locked=False):
+        self.command = command
+        self.translation = translation
+        self.locked = locked
+        self.mnemonic = menu_mnemonic(translation)
+        self.visible = menu_label(translation)
+
+    def __repr__(self):
+        return 'MenuItem(%r, %r, locked=%r)' % (
+            self.command, self.translation, self.locked)
+
+    def __eq__(self, other):
+        if not isinstance(other, MenuItem):
+            return NotImplemented
+        return (self.command == other.command and
+                self.translation == other.translation and
+                self.locked == other.locked)
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def candidates(self):
+        """
+        Return the letters that can carry the mnemonic, in the order in
+        which they appear in the visible label (case preserved).
+        """
+        seen = set()
+        result = []
+        for char in self.visible:
+            key = char.lower()
+            if key.isalpha() and key not in seen:
+                seen.add(key)
+                result.append(char)
+        return result
+
+    def with_mnemonic(self, letter):
+        """
+        Return a copy of the translation whose mnemonic underlines
+        ``letter``.  Doubled underscores are left untouched.  ``None``
+        removes the mnemonic marker.
+        """
+        if letter is None:
+            return self.visible
+        target = letter.lower()
+        result = []
+        marked = False
+        index = 0
+        length = len(self.translation)
+        while index < length:
+            char = self.translation[index]
+            if char == '_':
+                if (index + 1 < length and
+                        self.translation[index + 1] == '_'):
+                    result.append('__')
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if not marked and char.lower() == target:
+                result.append('_' + char)
+                marked = True
+            else:
+                result.append(char)
+            index += 1
+        if not marked:
+            raise ValueError(
+                'Letter %r is not available in label %r'
+                % (letter, self.visible))
+        return u('').join(result)
+
+
+class Menu(object):
+    """
+    A named group of :class:`MenuItem` instances with an optional display
+    condition.
+
+    Menus that can be visible at the same time form a single visibility
+    scope in which mnemonic letters must stay unique; menus whose conditions
+    are mutually exclusive are checked independently.
+
+    ``condition``
+        Optional predicate ``f(context) -> bool`` telling whether the menu is
+        displayed.  Menus without a condition are always displayed.
+    """
+
+    def __init__(self, name, items=None, condition=None):
+        self.name = name
+        self.items = list(items) if items is not None else []
+        self.condition = condition
+
+    def __repr__(self):
+        return 'Menu(%r, %d items)' % (self.name, len(self.items))
+
+    def is_visible(self, context=None):
+        if self.condition is None:
+            return True
+        return bool(self.condition(context))
+
+    def visible_together(self, other, context=None):
+        """
+        Return ``True`` when both menus can be displayed simultaneously for
+        the given context.
+        """
+        return (self.is_visible(context) and
+                other.is_visible(context))
+
+
+class MenuMnemonicConflict(object):
+    """
+    A real mnemonic collision: several commands underlined with the same
+    letter inside the same visibility scope.
+    """
+
+    def __init__(self, letter, occurrences):
+        self.letter = letter
+        self.occurrences = list(occurrences)
+
+    @property
+    def commands(self):
+        return sorted(set(item.command for menu, item in self.occurrences))
+
+    @property
+    def menus(self):
+        return sorted(set(menu.name for menu, item in self.occurrences))
+
+    def __repr__(self):
+        return 'MenuMnemonicConflict(%r, %r)' % (
+            self.letter, self.occurrences)
+
+
+class MnemonicSet(object):
+    """
+    A visibility scope in which mnemonic letters must stay unique.  It is
+    built from one menu or from every menu that can be shown at the same
+    time.
+    """
+
+    def __init__(self, name, menus):
+        self.name = name
+        self.menus = list(menus)
+
+    def __repr__(self):
+        return 'MnemonicSet(%r, %d menus)' % (
+            self.name, len(self.menus))
+
+    def entries(self):
+        result = []
+        for menu in self.menus:
+            for item in menu.items:
+                if item.mnemonic is not None:
+                    result.append((menu, item))
+        return result
+
+    def conflicts(self):
+        groups = {}
+        for menu, item in self.entries():
+            key = item.mnemonic.lower()
+            groups.setdefault(key, []).append((menu, item))
+        result = []
+        for letter, occurrences in sorted(groups.items()):
+            # the same command shown in several menus (e.g. a menu item and
+            # its toolbar button) keeps one letter and never clashes with
+            # itself: only distinct commands can collide
+            commands = set(item.command for menu, item in occurrences)
+            if len(commands) > 1:
+                result.append(MenuMnemonicConflict(letter, occurrences))
+        return result
+
+
+class MnemonicAssignment(object):
+    """
+    The result of a mnemonic allocation.
+
+    ``translations``
+        Mapping ``command -> new translation`` containing only the commands
+        whose translation had to change.
+
+    ``conflicts``
+        Deadlocked :class:`MenuMnemonicConflict` groups that could not be
+        separated; one group per stuck visibility scope, never the whole menu
+        tree.
+    """
+
+    def __init__(self, translations=None, conflicts=None):
+        self.translations = dict(translations) if translations else {}
+        self.conflicts = list(conflicts) if conflicts else []
+
+    @property
+    def feasible(self):
+        return not self.conflicts
+
+    def changed_commands(self):
+        return sorted(self.translations)
+
+    def __repr__(self):
+        return 'MnemonicAssignment(%d changed, %d conflicts)' % (
+            len(self.translations), len(self.conflicts))
+
+
+def _build_visibility_sets(menus, context):
+    parent = dict((menu, menu) for menu in menus)
+
+    def find(menu):
+        while parent[menu] != menu:
+            parent[menu] = parent[parent[menu]]
+            menu = parent[menu]
+        return menu
+
+    def union(left, right):
+        parent[find(left)] = find(right)
+
+    for index, menu in enumerate(menus):
+        for other in menus[index + 1:]:
+            if menu.visible_together(other, context):
+                union(menu, other)
+    groups = {}
+    for menu in menus:
+        groups.setdefault(find(menu), []).append(menu)
+    sets = []
+    for group in groups.values():
+        name = u(' + ').join(sorted(menu.name for menu in group))
+        sets.append(MnemonicSet(name, group))
+    sets.sort(key=lambda mset: mset.name)
+    return sets
+
+
+class MenuMnemonicPlanner(object):
+    """
+    Plan mnemonic allocations across translated menus.
+
+    Menus that cannot be visible at the same time (their conditions are
+    mutually exclusive) are kept in separate visibility scopes and therefore
+    never reported as colliding.  Commands shared by several menus receive a
+    single letter, locked mnemonics are preserved, and the allocation changes
+    as few existing translations as possible.
+    """
+
+    def __init__(self, menus, context=None):
+        self.menus = list(menus)
+        self.context = context
+        self.sets = _build_visibility_sets(self.menus, context)
+
+    def conflicts(self):
+        """Return the collisions that really occur in a shared scope."""
+        result = []
+        for mset in self.sets:
+            result.extend(mset.conflicts())
+        return result
+
+    def assign(self):
+        """Return a minimal-change :class:`MnemonicAssignment`."""
+        return _solve_mnemonics(self.sets)
+
+
+def _solve_mnemonics(sets):
+    variables = {}
+    for set_id, mset in enumerate(sets):
+        for menu in mset.menus:
+            for item in menu.items:
+                if item.mnemonic is None:
+                    continue
+                var = variables.get(item.command)
+                if var is None:
+                    variables[item.command] = {
+                        'command': item.command,
+                        'translation': item.translation,
+                        'locked': item.locked,
+                        'current': item.mnemonic.lower(),
+                        'candidates': [c.lower() for c in item.candidates()],
+                        'sets': [set_id],
+                        'item': item,
+                    }
+                    continue
+                if var['translation'] != item.translation:
+                    raise ValueError(
+                        'Command %r is shared with conflicting translations'
+                        % item.command)
+                var['locked'] = var['locked'] or item.locked
+                if set_id not in var['sets']:
+                    var['sets'].append(set_id)
+
+    ordered = sorted(
+        variables.values(),
+        key=lambda var: (not var['locked'], len(var['candidates']),
+                         -len(var['sets']), var['command']))
+    used = [set() for _ in sets]
+    best = {'cost': None, 'letters': None}
+    stuck = set()
+
+    def ordered_domain(var):
+        domain = list(var['candidates'])
+        if var['current'] not in domain:
+            domain.insert(0, var['current'])
+        else:
+            domain.remove(var['current'])
+            domain.insert(0, var['current'])
+        if var['locked']:
+            return [var['current']]
+        return domain
+
+    def backtrack(depth, cost, letters):
+        if best['cost'] is not None and cost >= best['cost']:
+            return
+        if depth == len(ordered):
+            best['cost'] = cost
+            best['letters'] = dict(letters)
+            return
+        var = ordered[depth]
+        feasible = False
+        for letter in ordered_domain(var):
+            if any(letter in used[set_id] for set_id in var['sets']):
+                continue
+            feasible = True
+            for set_id in var['sets']:
+                used[set_id].add(letter)
+            letters[var['command']] = letter
+            extra = 0 if letter == var['current'] else 1
+            backtrack(depth + 1, cost + extra, letters)
+            for set_id in var['sets']:
+                used[set_id].discard(letter)
+            del letters[var['command']]
+        if not feasible:
+            stuck.update(var['sets'])
+
+    backtrack(0, 0, {})
+
+    if best['letters'] is None:
+        conflicts = []
+        for set_id in sorted(stuck):
+            conflicts.extend(sets[set_id].conflicts())
+        if not conflicts:
+            # coupled deadlock without a direct clash in the original
+            # translations: still report only the pinned commands of the
+            # stuck visibility scopes, never unrelated menus
+            for set_id in sorted(stuck):
+                for menu, item in sets[set_id].entries():
+                    conflicts.append(MenuMnemonicConflict(
+                        item.mnemonic.lower(), [(menu, item)]))
+        return MnemonicAssignment(conflicts=conflicts)
+
+    translations = {}
+    for var in ordered:
+        letter = best['letters'][var['command']]
+        if letter != var['current']:
+            translations[var['command']] = \
+                var['item'].with_mnemonic(letter)
+    return MnemonicAssignment(translations=translations)
+
+
+def check_menu_mnemonics(menus, context=None):
+    """
+    Return the real :class:`MenuMnemonicConflict` list for the given menus,
+    ignoring menus whose display conditions are mutually exclusive.
+    """
+    return MenuMnemonicPlanner(menus, context).conflicts()
+
+
+def assign_menu_mnemonics(menus, context=None):
+    """
+    Allocate mnemonic letters with as few translation changes as possible.
+    Locked mnemonics are preserved and commands shared by menus get a single
+    consistent translation.  Returns a :class:`MnemonicAssignment`.
+    """
+    return MenuMnemonicPlanner(menus, context).assign()
 
 # }}}
 # class _BaseFile {{{
