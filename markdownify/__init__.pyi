@@ -1,5 +1,5 @@
 from _typeshed import Incomplete
-from typing import Callable, Union
+from typing import Callable, Iterable, Mapping, Tuple, Union
 
 ATX: str
 ATX_CLOSED: str
@@ -75,3 +75,14 @@ class MarkdownConverter:
 
     def convert_soup(self, soup: Incomplete) -> str:
         ...
+
+
+class BookPageConverter(MarkdownConverter):
+    def __init__(self, book: Incomplete, page: Incomplete, **options: Incomplete) -> None:
+        ...
+
+
+def markdownify_pages(
+    pages: Iterable[Union[Tuple[str, str], Mapping[str, str]]],
+    **options: Incomplete,
+) -> str: ...

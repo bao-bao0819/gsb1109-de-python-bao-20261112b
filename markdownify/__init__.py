@@ -1,5 +1,7 @@
 from bs4 import BeautifulSoup, Comment, Doctype, NavigableString, Tag
+from collections import Counter
 from textwrap import fill
+from urllib.parse import unquote, urldefrag, urljoin, urlparse
 import re
 
 
@@ -791,3 +793,190 @@ class MarkdownConverter(object):
 
 def markdownify(html, **options):
     return MarkdownConverter(**options).convert(html)
+
+
+# Pattern for characters that cannot appear in a generated page slug
+re_slug_disallowed_chars = re.compile(r'[^0-9A-Za-z_-]+')
+
+
+def _escape_anchor_id(text):
+    """Escape a value so it can be embedded in an HTML id attribute."""
+    return text.replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;')
+
+
+class _BookPage(object):
+    """A single source page of a book passed to markdownify_pages()."""
+
+    def __init__(self, url, html):
+        self.url = url
+        self.defragged_url = urldefrag(url)[0]
+        self.html = html
+        self.slug = None
+        self.id_counts = Counter()
+
+
+def _derive_page_slug(page, taken_slugs):
+    """Derive a unique, anchor-safe slug for a page from its URL."""
+    path = urlparse(page.defragged_url).path
+    name = path.rstrip('/').rsplit('/', 1)[-1]
+    if '.' in name:
+        name = name.rsplit('.', 1)[0]  # drop the file extension
+    slug = re_slug_disallowed_chars.sub('-', name).strip('-') or 'page'
+    candidate = slug
+    suffix = 2
+    while candidate in taken_slugs:
+        candidate = '%s-%d' % (slug, suffix)
+        suffix += 1
+    return candidate
+
+
+class _BookContext(object):
+    """Shared state about all pages of a book being merged."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.pages_by_url = dict((page.defragged_url, page) for page in pages)
+
+    def resolve_href(self, page, href):
+        """
+        Resolve a link found on a book page.
+
+        Returns a (new_href, editorial_note) tuple. new_href is the href to
+        use in the merged document, or None to keep the original href (in
+        which case editorial_note explains why the link was left untouched).
+        """
+        href = href.strip()
+        if href.startswith('#'):
+            # Fragment-only links refer to the page they appear on.
+            target_page = page
+            fragment = unquote(href[1:])
+            fallback_href = href
+        else:
+            # Resolve relative addresses against the page's own URL.
+            absolute_url = urljoin(page.url, href)
+            base_url, fragment = urldefrag(absolute_url)
+            fragment = unquote(fragment)
+            target_page = self.pages_by_url.get(base_url)
+            if target_page is None:
+                # Not part of this book: keep the resolved external address,
+                # even if its fragment matches a heading of this book.
+                return absolute_url, None
+            fallback_href = absolute_url
+        if not fragment:
+            # Link to a whole page: point at the page's start anchor.
+            return '#%s' % target_page.slug, None
+        count = target_page.id_counts.get(fragment, 0)
+        if count > 1:
+            # The source page itself declares this id more than once, so the
+            # intended target is ambiguous. Keep the original link and leave
+            # a note with its source, so editors can fix it in the book.
+            note = ('markdownify: unresolved link "%s": id "%s" appears %d '
+                    'times in page %s; the original link was kept so it can '
+                    'be fixed in the source book'
+                    % (href, fragment, count, target_page.url))
+            return None, note
+        if count == 1:
+            return '#%s--%s' % (target_page.slug, fragment), None
+        # No such anchor on the target page; leave the link as resolved.
+        return fallback_href, None
+
+
+class BookPageConverter(MarkdownConverter):
+    """
+    MarkdownConverter used by markdownify_pages() to convert a single page
+    of a book. It namespaces anchors per page and rewrites links so that
+    the merged document can be read on its own.
+    """
+
+    def __init__(self, book, page, **options):
+        self.book = book
+        self.page = page
+        super().__init__(**options)
+
+    def process_tag(self, node, parent_tags=None):
+        text = super().process_tag(node, parent_tags)
+        if isinstance(node, Tag) and node.name != '[document]':
+            el_id = node.get('id')
+            if el_id and isinstance(el_id, str) \
+                    and self.page.id_counts.get(el_id, 0) == 1:
+                # Emit an explicit, page-namespaced anchor so that links to
+                # this element keep working in the merged document, even if
+                # another page has a heading or element with the same id.
+                anchor = '<a id="%s--%s"></a>' % (self.page.slug,
+                                                  _escape_anchor_id(el_id))
+                return anchor + text
+        return text
+
+    def convert_a(self, el, text, parent_tags):
+        note = None
+        href = el.get('href')
+        if href:
+            new_href, note = self.book.resolve_href(self.page, href)
+            if new_href is not None:
+                el['href'] = new_href
+        text = super().convert_a(el, text, parent_tags)
+        if note and '_noformat' not in parent_tags:
+            text = '%s <!-- %s -->' % (text, note)
+        return text
+
+    def convert_img(self, el, text, parent_tags):
+        src = el.attrs.get('src', None)
+        if src:
+            # Resolve relative image addresses against the page's own URL.
+            el['src'] = urljoin(self.page.url, src)
+        return super().convert_img(el, text, parent_tags)
+
+
+def markdownify_pages(pages, **options):
+    """
+    Convert a sequence of HTML pages into a single Markdown document that
+    can be read on its own.
+
+    Each page is given as a (url, html) pair or as a mapping with 'url'
+    and 'html' keys. The url is the page's source address; relative links
+    and image sources of that page are resolved against it. Links between
+    the given pages are rewritten to page-namespaced fragment anchors, so
+    same-named headings on different pages no longer collide. Links to
+    pages outside the book are kept as absolute external addresses, even
+    if their fragment matches a heading of the book. If a source page
+    declares the same id more than once, links to it are kept as written
+    and annotated with an HTML comment naming the source page, so editors
+    know which links to fix in the original book.
+    """
+    book_pages = []
+    for page in pages:
+        if hasattr(page, 'keys'):
+            url, html = page['url'], page['html']
+        else:
+            url, html = page
+        book_pages.append(_BookPage(url, html))
+
+    taken_slugs = set()
+    for book_page in book_pages:
+        book_page.slug = _derive_page_slug(book_page, taken_slugs)
+        taken_slugs.add(book_page.slug)
+
+    book = _BookContext(book_pages)
+
+    bs4_options = options.get('bs4_options',
+                              MarkdownConverter.DefaultOptions.bs4_options)
+    if not isinstance(bs4_options, dict):
+        bs4_options = {'features': bs4_options}
+
+    soups = []
+    for book_page in book_pages:
+        soup = BeautifulSoup(book_page.html, **bs4_options)
+        for tag in soup.find_all(attrs={'id': True}):
+            tag_id = tag['id']
+            if isinstance(tag_id, str):
+                book_page.id_counts[tag_id] += 1
+        soups.append(soup)
+
+    sections = []
+    for book_page, soup in zip(book_pages, soups):
+        converter = BookPageConverter(book, book_page, **options)
+        page_markdown = converter.convert_soup(soup)
+        sections.append('<a id="%s"></a>\n<!-- source: %s -->\n\n%s'
+                        % (book_page.slug, book_page.url, page_markdown))
+
+    return '\n\n---\n\n'.join(sections)
