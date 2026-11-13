@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.stationing as mod_stationing
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3723,6 +3724,275 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    # ------------------------------------------------------------------
+    # Engineering stationing with broken chains
+    # ------------------------------------------------------------------
+
+    def _stationing_track(self, points_no: int, start_lat: float = 45.0) -> List[mod_gpx.GPXTrackPoint]:
+        # Uniform meridian steps -> every measured edge has the same length.
+        return [mod_gpx.GPXTrackPoint(start_lat + index * 0.0009, 15.0)
+                for index in range(points_no)]
+
+    def test_stationing_parse_and_format(self) -> None:
+        self.assertEqual(12800.0, mod_stationing.parse_stationing('K12+800'))
+        self.assertEqual(12300.5, mod_stationing.parse_stationing('k12+300.5'))
+        self.assertEqual(12300.0, mod_stationing.parse_stationing('12+300'))
+        self.assertEqual(500.0, mod_stationing.parse_stationing(500))
+        self.assertEqual('K12+800', mod_stationing.format_stationing(12800.0))
+        self.assertEqual('K12+000', mod_stationing.format_stationing(12000.0))
+        self.assertEqual('K0+000', mod_stationing.format_stationing(0.0))
+        self.assertEqual('K12+345.679', mod_stationing.format_stationing(12345.6789))
+        # Rounding that crosses a whole kilometer carries into the K part.
+        self.assertEqual('K13+000', mod_stationing.format_stationing(12999.9999))
+        self.assertEqual('K12+300.5', mod_stationing.format_stationing(12300.5))
+        self.assertEqual('K12+300', mod_stationing.format_stationing(12300.0, decimals=0))
+        for invalid in ('K12', 'not-a-station', 'K+100'):
+            with self.assertRaises(ValueError):
+                mod_stationing.parse_stationing(invalid)
+        with self.assertRaises(ValueError):
+            mod_stationing.format_stationing(-1.0)
+
+    def test_stationing_interpolated_by_measured_path(self) -> None:
+        points = self._stationing_track(9)
+        markers = [mod_stationing.StationMarker.parse(0, 'K12+000'),
+                   mod_stationing.StationMarker.parse(8, 'K12+800')]
+        model = mod_stationing.StationingModel(points, markers)
+
+        station_at_0 = model.stationing_at(0).station_m
+        station_at_4 = model.stationing_at(4).station_m
+        station_at_8 = model.stationing_at(8).station_m
+        assert station_at_0 is not None and station_at_4 is not None and station_at_8 is not None
+        self.assertAlmostEqual(12000.0, station_at_0)
+        self.assertAlmostEqual(12400.0, station_at_4)
+        self.assertAlmostEqual(12800.0, station_at_8)
+        # Marker points keep the recorded value exactly, with no float drift.
+        self.assertEqual('K12+000', model.stationing_at(0).station)
+        self.assertEqual('K12+800', model.stationing_at(8).station)
+        # Measured distance, not point index, drives interpolation.
+        edge = points[0].distance_2d(points[1])
+        assert edge is not None
+        self.assertAlmostEqual(4 * edge, model.stationing_at(4).distance_m)
+
+    def test_stationing_haversine_option(self) -> None:
+        points = self._stationing_track(4)
+        markers = [mod_stationing.StationMarker.parse(0, 'K0+000'),
+                   mod_stationing.StationMarker.parse(3, 'K0+300')]
+        plain = mod_stationing.StationingModel(points, markers, haversine=False)
+        haver = mod_stationing.StationingModel(points, markers, haversine=True)
+        plain_distance = plain.stationing_at(1).distance_m
+        haver_distance = haver.stationing_at(1).distance_m
+        # The two formulas are close over a short edge but not identical.
+        self.assertNotEqual(plain_distance, haver_distance)
+        self.assertAlmostEqual(plain_distance, haver_distance, delta=1.0)
+
+    def test_broken_chain_detection_and_sides(self) -> None:
+        points = self._stationing_track(12)
+        markers = [mod_stationing.StationMarker.parse(0, 'K12+000'),
+                   mod_stationing.StationMarker.parse(8, 'K12+800'),
+                   mod_stationing.StationMarker.parse(9, 'K12+300'),
+                   mod_stationing.StationMarker.parse(11, 'K13+000')]
+        model = mod_stationing.StationingModel(points, markers)
+
+        breaks = model.break_points()
+        self.assertEqual(1, len(breaks))
+        break_point = breaks[0]
+        self.assertEqual(12800.0, break_point.incoming_station_m)
+        self.assertEqual(12300.0, break_point.outgoing_station_m)
+        self.assertEqual('K12+800', break_point.incoming_station)
+        self.assertEqual('K12+300', break_point.outgoing_station)
+        self.assertEqual(0, break_point.chain_before)
+        self.assertEqual(1, break_point.chain_after)
+        self.assertGreater(break_point.connector_length_m, 0.0)
+
+        incoming = model.stationing_at(8)
+        outgoing = model.stationing_at(9)
+        self.assertEqual('K12+800', incoming.station)
+        self.assertEqual(mod_stationing.SIDE_INCOMING, incoming.side)
+        self.assertEqual(0, incoming.chain_id)
+        self.assertTrue(incoming.in_broken_span)
+        self.assertEqual('K12+300', outgoing.station)
+        self.assertEqual(mod_stationing.SIDE_OUTGOING, outgoing.side)
+        self.assertEqual(1, outgoing.chain_id)
+        self.assertTrue(outgoing.in_broken_span)
+
+    def test_reverse_lookup_returns_all_compatible_sections(self) -> None:
+        points = self._stationing_track(12)
+        markers = [mod_stationing.StationMarker.parse(0, 'K12+000'),
+                   mod_stationing.StationMarker.parse(8, 'K12+800'),
+                   mod_stationing.StationMarker.parse(9, 'K12+300'),
+                   mod_stationing.StationMarker.parse(11, 'K13+000')]
+        model = mod_stationing.StationingModel(points, markers)
+
+        # K12+500 exists on the old line, on the connector span and on the
+        # new line, hence three compatible sections.
+        hits = model.find('K12+500')
+        self.assertEqual(3, len(hits))
+        self.assertEqual([5, 9, 10], [hit.index for hit in hits])
+        self.assertTrue(all(0 <= hit.position <= 1 for hit in hits))
+
+        # Break boundary stationing carries the incoming side.
+        hits_800 = {hit.index: hit for hit in model.find('K12+800')}
+        self.assertIn(8, hits_800)
+        self.assertEqual(mod_stationing.SIDE_INCOMING, hits_800[8].side)
+        self.assertEqual(0, hits_800[8].chain_id)
+
+        hits_300 = {hit.index: hit for hit in model.find('K12+300')}
+        self.assertIn(9, hits_300)
+        self.assertEqual(mod_stationing.SIDE_OUTGOING, hits_300[9].side)
+        self.assertEqual(1, hits_300[9].chain_id)
+
+        self.assertEqual([], model.find('K99+999'))
+
+    def test_explicit_break_with_equal_stationing(self) -> None:
+        points = self._stationing_track(5)
+        markers = [mod_stationing.StationMarker.parse(0, 'K12+000'),
+                   mod_stationing.StationMarker.parse(2, 'K12+300', is_break=True),
+                   mod_stationing.StationMarker.parse(4, 'K12+300')]
+        model = mod_stationing.StationingModel(points, markers)
+
+        breaks = model.break_points()
+        self.assertEqual(1, len(breaks))
+        self.assertEqual(12300.0, breaks[0].incoming_station_m)
+        self.assertEqual(12300.0, breaks[0].outgoing_station_m)
+
+        hits = {(hit.index, hit.side) for hit in model.find('K12+300')}
+        self.assertIn((2, mod_stationing.SIDE_INCOMING), hits)
+        self.assertIn((4, mod_stationing.SIDE_OUTGOING), hits)
+
+    def test_multiple_broken_chains_keep_distinct_chain_hits(self) -> None:
+        points = self._stationing_track(15)
+        markers = [mod_stationing.StationMarker.parse(0, 'K0+000'),
+                   mod_stationing.StationMarker.parse(3, 'K1+000'),
+                   mod_stationing.StationMarker.parse(5, 'K0+500'),
+                   mod_stationing.StationMarker.parse(8, 'K1+500'),
+                   mod_stationing.StationMarker.parse(10, 'K0+800'),
+                   mod_stationing.StationMarker.parse(14, 'K2+000')]
+        model = mod_stationing.StationingModel(points, markers)
+
+        self.assertEqual(2, len(model.break_points()))
+        hits = model.find('K0+900')
+        # Every engineering chain compatible with K0+900 answers, including
+        # two different chains sharing the boundary point 10.
+        self.assertEqual({0, 1, 2}, {hit.chain_id for hit in hits})
+        keys = [(hit.index, hit.chain_id) for hit in hits]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(keys, sorted(keys))
+
+    def test_sections_without_markers_keep_local_mileage(self) -> None:
+        points = self._stationing_track(12)
+        # Markers only in the middle; both ends are local-only sections.
+        markers = [mod_stationing.StationMarker.parse(3, 'K10+000'),
+                   mod_stationing.StationMarker.parse(7, 'K10+400')]
+        model = mod_stationing.StationingModel(points, markers)
+
+        head = model.stationing_at(0)
+        tail = model.stationing_at(11)
+        self.assertTrue(head.local and head.station is None)
+        self.assertTrue(tail.local and tail.station is None)
+        self.assertAlmostEqual(0.0, head.local_mileage_m)
+        self.assertGreater(tail.local_mileage_m, 0.0)
+        # Local-only spans never answer reverse lookups.
+        self.assertEqual([], model.find('K10+900'))
+        calibrated = model.stationing_at(5)
+        self.assertFalse(calibrated.local)
+        assert calibrated.station_m is not None
+        self.assertAlmostEqual(10200.0, calibrated.station_m)
+
+    def test_local_mileage_restarts_per_track_segment(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        segment_1 = mod_gpx.GPXTrackSegment(self._stationing_track(4))
+        segment_2 = mod_gpx.GPXTrackSegment(self._stationing_track(3, start_lat=46.0))
+        track.segments = [segment_1, segment_2]
+
+        model = mod_stationing.StationingModel.from_gpx(gpx)
+        results = model.all_stationing()
+        self.assertTrue(all(result.local for result in results))
+        self.assertAlmostEqual(0.0, results[0].local_mileage_m)
+        # First point of the disconnected second segment restarts at zero.
+        self.assertAlmostEqual(0.0, results[4].local_mileage_m)
+        self.assertNotEqual(results[0].chain_id, results[4].chain_id)
+        self.assertEqual([], model.find('K1+000'))
+
+    def test_markers_cannot_span_or_sit_on_gap(self) -> None:
+        points = self._stationing_track(6) + self._stationing_track(2, start_lat=48.0)
+        with self.assertRaises(ValueError):
+            mod_stationing.StationingModel(
+                points, [mod_stationing.StationMarker.parse(6, 'K1+000')], gaps=[6])
+
+    def test_stationing_validation_errors(self) -> None:
+        points = self._stationing_track(5)
+        with self.assertRaises(ValueError):
+            mod_stationing.StationingModel(
+                points, [mod_stationing.StationMarker.parse(9, 'K1+000')])
+        with self.assertRaises(ValueError):
+            mod_stationing.StationingModel(
+                points, [mod_stationing.StationMarker.parse(1, 'K1+000'),
+                         mod_stationing.StationMarker.parse(1, 'K1+100')])
+        with self.assertRaises(ValueError):
+            mod_stationing.StationingModel(
+                [], [mod_stationing.StationMarker.parse(0, 'K1+000')])
+        with self.assertRaises(IndexError):
+            mod_stationing.StationingModel(
+                points, [mod_stationing.StationMarker.parse(0, 'K1+000')]).stationing_at(99)
+
+    def test_stationing_gpx_round_trip(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        segment = mod_gpx.GPXTrackSegment(self._stationing_track(12))
+        track.segments.append(segment)
+        for index, name in ((0, 'K12+000'), (8, 'K12+800'), (9, 'K12+300'), (11, 'K13+000')):
+            point = segment.points[index]
+            gpx.waypoints.append(mod_gpx.GPXWaypoint(point.latitude, point.longitude, name=name))
+
+        model = mod_stationing.StationingModel.from_gpx(gpx)
+        self.assertEqual([0, 8, 9, 11], [marker.index for marker in model.markers])
+        model.apply_to_gpx(gpx)
+
+        reparsed = mod_gpxpy.parse(gpx.to_xml())
+        read_back = mod_stationing.StationingModel.read_point_stationing(reparsed)
+        self.assertEqual(12, len(read_back))
+        self.assertEqual('K12+800', read_back[8].station)
+        self.assertEqual(mod_stationing.SIDE_INCOMING, read_back[8].side)
+        self.assertEqual('K12+300', read_back[9].station)
+        self.assertEqual(mod_stationing.SIDE_OUTGOING, read_back[9].side)
+        self.assertEqual(1, read_back[9].chain_id)
+
+        # Re-applying must not duplicate extension elements.
+        model.apply_to_gpx(gpx)
+        extension_no = sum(
+            1 for point in gpx.walk(only_points=True)
+            for node in point.extensions
+            if getattr(node, 'tag', '').endswith('stationing'))
+        self.assertEqual(12, extension_no)
+
+    def test_stationing_waypoint_snapping_and_explicit_break(self) -> None:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        segment = mod_gpx.GPXTrackSegment(self._stationing_track(6))
+        track.segments.append(segment)
+        gpx.waypoints.append(mod_gpx.GPXWaypoint(
+            segment.points[2].latitude, segment.points[2].longitude, name='K5+000'))
+        break_waypoint = mod_gpx.GPXWaypoint(
+            segment.points[4].latitude, segment.points[4].longitude, name='K5+100')
+        break_waypoint.extensions.append(
+            mod_etree.Element(f'{{{mod_stationing.STATIONING_NAMESPACE}}}break'))
+        gpx.waypoints.append(break_waypoint)
+        gpx.waypoints.append(mod_gpx.GPXWaypoint(
+            segment.points[5].latitude, segment.points[5].longitude, name='K5+200'))
+        # An unrelated waypoint is simply ignored.
+        gpx.waypoints.append(mod_gpx.GPXWaypoint(0.0, 0.0, name='junction'))
+
+        model = mod_stationing.StationingModel.from_gpx(gpx)
+        # Stations increase, so the break exists only because of the flag.
+        self.assertEqual(1, len(model.break_points()))
+        self.assertEqual(5100.0, model.break_points()[0].incoming_station_m)
+        self.assertEqual(5200.0, model.break_points()[0].outgoing_station_m)
+
 
 if __name__ == '__main__':
     mod_unittest.main()

@@ -89,6 +89,38 @@ Gpxpy is a GPX parser and by using it you have access to all the data from the o
 
     moving_data = gpx.get_moving_data(raw=True)
 
+## Engineering stationing and broken chains
+
+Road re-alignment can produce a *broken chain*: the old line ends at, for example, `K12+800` and the new line continues at `K12+300`. The same stationing number then legitimately exists on both sides. `gpxpy.stationing` interpolates engineering stationing between ordered markers by **measured path length**, keeps every compatible section on reverse lookup, and distinguishes the incoming (`来向`) from the outgoing (`去向`) stake at a break:
+
+```python
+import gpxpy
+from gpxpy.stationing import StationingModel, StationMarker
+
+gpx = gpxpy.parse(open('survey.gpx'))
+
+# Markers in pass order, bound to flattened track-point indices:
+markers = [
+    StationMarker.parse(0, 'K12+000'),
+    StationMarker.parse(8, 'K12+800'),  # old line ends here (incoming)
+    StationMarker.parse(9, 'K12+300'),  # new line starts here (outgoing)
+    StationMarker.parse(11, 'K13+000'),
+]
+model = StationingModel(list(gpx.walk(only_points=True)), markers)
+
+for result in model.all_stationing():
+    print(result.index, result.station, result.side, result.local_mileage_m)
+
+for break_point in model.break_points():
+    print(break_point.incoming_station, '->', break_point.outgoing_station)
+
+# Reverse lookup returns every compatible track section:
+for hit in model.find('K12+500'):
+    print(hit.index, hit.chain_id, hit.side)
+```
+
+Alternatively, pass station markers as GPX waypoints (their `name` must parse like `K12+800`) and call `StationingModel.from_gpx(gpx)`; waypoints are snapped to their nearest track points. Breaks are auto-detected from a non-increasing stationing step, or forced with a `stn:break` waypoint extension. Track sections without markers keep their own zero-based local mileage (`StationingResult.local`), and GPX segment boundaries never contribute measured distance. `model.apply_to_gpx(gpx)` writes the results back to each track point as `stn:stationing` extension elements, readable again with `StationingModel.read_point_stationing(gpx)`.
+
 ## Pull requests
 
 Branches:
