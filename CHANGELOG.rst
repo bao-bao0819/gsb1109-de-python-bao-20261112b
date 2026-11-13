@@ -2,6 +2,10 @@
 -------------------------
 
 * Add Python 3.13 and 3.14 support. Drop support for end-of-life versions 3.8 and 3.9.
+* Add :func:`agatesql.migration.plan_migration` and
+  :func:`agatesql.migration.apply_migration` for preflighting schema changes
+  against an existing table, reporting blocking rows, and applying safe
+  append or transactional rebuild migrations.
 
 0.7.2 - January 9, 2024
 -----------------------
