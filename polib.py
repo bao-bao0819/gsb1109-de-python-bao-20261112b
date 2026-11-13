@@ -288,6 +288,194 @@ def natural_sort(lst):
     return sorted(lst, key=alphanum_key)
 
 # }}}
+# function _compile_plural_expression() {{{
+
+
+def _compile_plural_expression(expression):
+    """
+    Compiles a C-like gettext plural expression (e.g. ``(n != 1)``) into a
+    callable that takes an integer ``n`` and returns the plural form index.
+    Supported operators, by decreasing precedence: unary ``! - +``,
+    ``* / %``, ``+ -``, ``< <= > >=``, ``== !=``, ``&&``, ``||`` and the
+    ternary ``? :`` operator. Division and modulo follow C semantics
+    (truncation towards zero).
+    """
+    tokens = re.findall(
+        r'\d+|[A-Za-z_]\w*|&&|\|\||==|!=|<=|>=|[?:()!<>+\-*/%]|'
+        r'\S',
+        expression
+    )
+
+    pos = [0]
+
+    def peek():
+        if pos[0] < len(tokens):
+            return tokens[pos[0]]
+        return None
+
+    def advance():
+        token = tokens[pos[0]]
+        pos[0] += 1
+        return token
+
+    def error(expected):
+        raise ValueError(
+            'invalid plural expression %r: expected %s but got %r' %
+            (expression, expected, peek())
+        )
+
+    def c_div(a, b):
+        quotient = abs(a) // abs(b)
+        if (a < 0) != (b < 0):
+            quotient = -quotient
+        return quotient
+
+    def c_mod(a, b):
+        return a - c_div(a, b) * b
+
+    def parse_primary():
+        token = advance()
+        if token == '(':
+            sub = parse_ternary()
+            if peek() != ')':
+                error("')'")
+            advance()
+            return sub
+        if token == 'n':
+            return lambda n: n
+        if token.isdigit():
+            value = int(token)
+            return lambda n: value
+        raise ValueError(
+            'invalid plural expression %r: unexpected token %r' %
+            (expression, token)
+        )
+
+    def parse_unary():
+        token = peek()
+        if token == '!':
+            advance()
+            operand = parse_unary()
+            return lambda n: 0 if operand(n) else 1
+        if token == '-':
+            advance()
+            operand = parse_unary()
+            return lambda n: -operand(n)
+        if token == '+':
+            advance()
+            return parse_unary()
+        return parse_primary()
+
+    def parse_level(subparser, operators, evaluator):
+        left = subparser()
+        while peek() in operators:
+            operator = advance()
+            right = subparser()
+            left = evaluator(operator, left, right)
+        return left
+
+    def binary(operator, left, right):
+        if operator == '*':
+            return lambda n: left(n) * right(n)
+        if operator == '/':
+            return lambda n: c_div(left(n), right(n))
+        if operator == '%':
+            return lambda n: c_mod(left(n), right(n))
+        if operator == '+':
+            return lambda n: left(n) + right(n)
+        if operator == '-':
+            return lambda n: left(n) - right(n)
+        if operator == '<':
+            return lambda n: int(left(n) < right(n))
+        if operator == '<=':
+            return lambda n: int(left(n) <= right(n))
+        if operator == '>':
+            return lambda n: int(left(n) > right(n))
+        if operator == '>=':
+            return lambda n: int(left(n) >= right(n))
+        if operator == '==':
+            return lambda n: int(left(n) == right(n))
+        if operator == '!=':
+            return lambda n: int(left(n) != right(n))
+        if operator == '&&':
+            return lambda n: int(bool(left(n)) and bool(right(n)))
+        if operator == '||':
+            return lambda n: int(bool(left(n)) or bool(right(n)))
+        raise ValueError('unsupported operator %r' % operator)
+
+    def parse_ternary():
+        condition = parse_level(
+            lambda: parse_level(
+                lambda: parse_level(
+                    lambda: parse_level(
+                        lambda: parse_level(
+                            lambda: parse_level(
+                                parse_unary, ('*', '/', '%'), binary),
+                            ('+', '-'), binary),
+                        ('<', '<=', '>', '>='), binary),
+                    ('==', '!='), binary),
+                ('&&',), binary),
+            ('||',), binary)
+        if peek() == '?':
+            advance()
+            if_true = parse_ternary()
+            if peek() != ':':
+                error("':'")
+            advance()
+            if_false = parse_ternary()
+            return lambda n: if_true(n) if condition(n) else if_false(n)
+        return condition
+
+    func = parse_ternary()
+    if pos[0] != len(tokens):
+        error('end of expression')
+    return func
+
+# }}}
+# class _PluralForms {{{
+
+
+class _PluralForms(object):
+    """
+    Parsed representation of the ``Plural-Forms`` metadata header. Maps an
+    integer count ``n`` to a plural form index, clamped to the
+    ``[0, nplurals - 1]`` range.
+    """
+
+    def __init__(self, nplurals, plural_func):
+        self.nplurals = nplurals
+        self._plural_func = plural_func
+
+    @classmethod
+    def from_header(cls, header):
+        """
+        Builds an instance from a ``Plural-Forms`` header value such as
+        ``nplurals=2; plural=(n != 1);``. Missing or empty headers fall
+        back to the gettext default of two forms with ``plural=(n != 1)``.
+        """
+        nplurals = 2
+        expression = 'n != 1'
+        if header:
+            match = re.search(r'nplurals\s*=\s*(\d+)', header)
+            if match:
+                nplurals = int(match.group(1))
+            match = re.search(r'(?<![\w])plural\s*=\s*([^;]+)', header)
+            if match:
+                expression = match.group(1)
+        return cls(nplurals, _compile_plural_expression(expression))
+
+    def form_index(self, n):
+        """
+        Returns the plural form index used for count ``n``.
+        """
+        index = self._plural_func(n)
+        if index < 0:
+            return 0
+        if index >= self.nplurals:
+            return self.nplurals - 1
+        return index
+
+# }}}
 # class _BaseFile {{{
 
 
@@ -716,6 +904,72 @@ class POFile(_BaseFile):
         """
         return [e for e in self if e.obsolete]
 
+    def release_completion(self, min_count=0, max_count=100):
+        """
+        Convenience method that returns the percentage of entries that are
+        usable in a release for the given range of integer counts
+        (``min_count`` to ``max_count``, both included).
+
+        Fuzzy and obsolete entries are excluded from the computation. For
+        plural entries, only the plural forms actually exercised by the
+        counts of the range (according to the ``Plural-Forms`` metadata)
+        are required to have a non-empty translation.
+
+        Keyword arguments:
+
+        ``min_count``
+            integer, first count of the range (default ``0``).
+
+        ``max_count``
+            integer, last count of the range (default ``100``).
+        """
+        entries = [e for e in self if not e.obsolete and not e.fuzzy]
+        if not entries:
+            return 100
+        counts = range(min_count, max_count + 1)
+        plural_forms = self._plural_forms()
+        ready = [e for e in entries
+                 if e.translated_for_counts(counts, plural_forms)]
+        return int(len(ready) * 100 / float(len(entries)))
+
+    def release_ready_entries(self, min_count=0, max_count=100):
+        """
+        Convenience method that returns the list of entries that are usable
+        in a release for the given range of integer counts. See
+        :meth:`~polib.POFile.release_completion` for details.
+        """
+        counts = range(min_count, max_count + 1)
+        plural_forms = self._plural_forms()
+        return [e for e in self if not e.obsolete and not e.fuzzy
+                and e.translated_for_counts(counts, plural_forms)]
+
+    def release_blocked_entries(self, min_count=0, max_count=100):
+        """
+        Convenience method that returns the list of entries that are *not*
+        usable in a release for the given range of integer counts, as
+        ``(entry, count)`` tuples where ``count`` is an example count of
+        the range for which the entry would show an untranslated string.
+        Fuzzy and obsolete entries are not included. See
+        :meth:`~polib.POFile.release_completion` for details.
+        """
+        counts = range(min_count, max_count + 1)
+        plural_forms = self._plural_forms()
+        blocked = []
+        for entry in self:
+            if entry.obsolete or entry.fuzzy:
+                continue
+            count = entry.failing_count(counts, plural_forms)
+            if count is not None:
+                blocked.append((entry, count))
+        return blocked
+
+    def _plural_forms(self):
+        """
+        Returns the :class:`~polib._PluralForms` instance built from the
+        file ``Plural-Forms`` metadata.
+        """
+        return _PluralForms.from_header(self.metadata.get('Plural-Forms', ''))
+
     def merge(self, refpot):
         """
         Convenience method that merges the current pofile with the pot file
@@ -817,6 +1071,24 @@ class MOFile(_BaseFile):
         return []
 
     def obsolete_entries(self):
+        """
+        Convenience method to keep the same interface with POFile instances.
+        """
+        return []
+
+    def release_completion(self, min_count=0, max_count=100):
+        """
+        Convenience method to keep the same interface with POFile instances.
+        """
+        return 100
+
+    def release_ready_entries(self, min_count=0, max_count=100):
+        """
+        Convenience method to keep the same interface with POFile instances.
+        """
+        return self
+
+    def release_blocked_entries(self, min_count=0, max_count=100):
         """
         Convenience method to keep the same interface with POFile instances.
         """
@@ -1161,6 +1433,65 @@ class POEntry(_BaseEntry):
                     return False
             return True
         return False
+
+    def translated_for_counts(self, counts, plural_forms):
+        """
+        Returns ``True`` if the entry is usable in a release for the given
+        counts, ``False`` otherwise. Obsolete and fuzzy entries always
+        return ``False``. For plural entries, only the plural forms
+        actually exercised by ``counts`` (according to ``plural_forms``)
+        are required to have a non-empty translation; forms declared by
+        the plural rules but never selected by the given counts are
+        ignored.
+
+        Arguments:
+
+        ``counts``
+            iterable of integers, the counts to check.
+
+        ``plural_forms``
+            a :class:`~polib._PluralForms` instance, see
+            :meth:`~polib.POFile._plural_forms`.
+        """
+        if self.obsolete or self.fuzzy:
+            return False
+        if not self.msgid_plural:
+            return self.msgstr != ''
+        for n in counts:
+            index = plural_forms.form_index(n)
+            if self.msgstr_plural.get(index, '') == '':
+                return False
+        return True
+
+    def failing_count(self, counts, plural_forms):
+        """
+        Returns the first count of ``counts`` for which the entry would
+        show an untranslated string in a release, or ``None`` if the entry
+        is usable for all the given counts. Obsolete and fuzzy entries
+        always return ``None``.
+
+        Arguments:
+
+        ``counts``
+            iterable of integers, the counts to check.
+
+        ``plural_forms``
+            a :class:`~polib._PluralForms` instance, see
+            :meth:`~polib.POFile._plural_forms`.
+        """
+        if self.obsolete or self.fuzzy:
+            return None
+        if not self.msgid_plural:
+            if self.msgstr != '':
+                return None
+            for n in counts:
+                return n
+            return None
+        for n in counts:
+            index = plural_forms.form_index(n)
+            if self.msgstr_plural.get(index, '') == '':
+                return n
+        return None
 
     def merge(self, other):
         """

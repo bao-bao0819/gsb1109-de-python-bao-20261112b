@@ -1,0 +1,35 @@
+# Test file for release completion helpers.
+msgid ""
+msgstr ""
+"Project-Id-Version: test\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Plural-Forms: nplurals=3; plural=n%10==1 && n%100!=11 ? 0 : n%10>=2 && "
+"n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2;\n"
+
+#: forms 0 and 1 are translated, form 2 is empty but never used by
+#: counts 1..4, so this entry is release-ready for that range only
+msgid "%d file"
+msgid_plural "%d files"
+msgstr[0] "%d файл"
+msgstr[1] "%d файла"
+msgstr[2] ""
+
+#: form 1 is empty and used by counts 2..4
+msgid "%d hour"
+msgid_plural "%d hours"
+msgstr[0] "%d час"
+msgstr[1] ""
+msgstr[2] "%d часов"
+
+msgid "Hello"
+msgstr "Привет"
+
+msgid "Goodbye"
+msgstr ""
+
+#, fuzzy
+msgid "Fuzzy string"
+msgstr "Fuzzy string"
+
+#~ msgid "obsolete string"
+#~ msgstr "obsolete string"

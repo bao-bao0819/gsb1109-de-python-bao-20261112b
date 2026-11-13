@@ -717,6 +717,92 @@ class TestPoFile(unittest.TestCase):
         po = polib.pofile('tests/test_pofile_helpers.po')
         self.assertEqual(len(po.obsolete_entries()), 4)
 
+    def test_release_completion(self):
+        po = polib.pofile('tests/test_release_completion.po')
+        # counts 1..4 only exercise plural forms 0 and 1, so the empty
+        # third form of the "%d file" entry is not held against it
+        self.assertEqual(po.release_completion(1, 4), 50)
+        # count 0 uses the empty third plural form of "%d file"
+        self.assertEqual(po.release_completion(0, 0), 50)
+        po = polib.POFile()
+        self.assertEqual(po.release_completion(), 100)
+
+    def test_release_ready_entries(self):
+        po = polib.pofile('tests/test_release_completion.po')
+        ready = po.release_ready_entries(1, 4)
+        self.assertEqual([e.msgid for e in ready], ['%d file', 'Hello'])
+        ready = po.release_ready_entries(0, 0)
+        self.assertEqual([e.msgid for e in ready], ['%d hour', 'Hello'])
+
+    def test_release_blocked_entries(self):
+        po = polib.pofile('tests/test_release_completion.po')
+        blocked = po.release_blocked_entries(1, 4)
+        self.assertEqual([e.msgid for e, count in blocked],
+                         ['%d hour', 'Goodbye'])
+        # each blocked entry comes with an example failing count
+        self.assertEqual([count for e, count in blocked], [2, 1])
+        blocked = po.release_blocked_entries(0, 0)
+        self.assertEqual([(e.msgid, count) for e, count in blocked],
+                         [('%d file', 0), ('Goodbye', 0)])
+
+    def test_release_completion_ignores_fuzzy_and_obsolete(self):
+        po = polib.pofile('tests/test_release_completion.po')
+        entries = [e for e in po if not e.obsolete and not e.fuzzy]
+        self.assertEqual(len(entries), 4)
+        self.assertEqual(len(po.release_ready_entries(1, 4)) +
+                         len(po.release_blocked_entries(1, 4)), 4)
+
+    def test_translated_for_counts(self):
+        po = polib.pofile('tests/test_release_completion.po')
+        plural_forms = po._plural_forms()
+        entry = po.find('%d file')
+        self.assertTrue(entry.translated_for_counts(range(1, 5), plural_forms))
+        self.assertFalse(entry.translated_for_counts(range(0, 5), plural_forms))
+        entry = po.find('Hello')
+        self.assertTrue(entry.translated_for_counts(range(0, 5), plural_forms))
+        entry = po.find('Goodbye')
+        self.assertFalse(entry.translated_for_counts(range(0, 5), plural_forms))
+
+    def test_failing_count(self):
+        po = polib.pofile('tests/test_release_completion.po')
+        plural_forms = po._plural_forms()
+        self.assertEqual(po.find('%d file').failing_count(
+            range(1, 5), plural_forms), None)
+        self.assertEqual(po.find('%d file').failing_count(
+            range(0, 5), plural_forms), 0)
+        self.assertEqual(po.find('%d hour').failing_count(
+            range(1, 5), plural_forms), 2)
+        self.assertEqual(po.find('Hello').failing_count(
+            range(0, 5), plural_forms), None)
+        self.assertEqual(po.find('Goodbye').failing_count(
+            range(3, 5), plural_forms), 3)
+
+    def test_plural_forms_default(self):
+        po = polib.POFile()
+        plural_forms = po._plural_forms()
+        self.assertEqual(plural_forms.nplurals, 2)
+        self.assertEqual(plural_forms.form_index(1), 0)
+        self.assertEqual(plural_forms.form_index(2), 1)
+
+    def test_plural_forms_parsing(self):
+        po = polib.pofile('tests/test_release_completion.po')
+        plural_forms = po._plural_forms()
+        self.assertEqual(plural_forms.nplurals, 3)
+        expected = {0: 2, 1: 0, 2: 1, 4: 1, 5: 2, 11: 2, 21: 0, 111: 2}
+        for n, index in expected.items():
+            self.assertEqual(plural_forms.form_index(n), index)
+
+    def test_compile_plural_expression(self):
+        expr = polib._compile_plural_expression
+        self.assertEqual(expr('n != 1')(1), 0)
+        self.assertEqual(expr('n != 1')(5), 1)
+        self.assertEqual(expr('n > 1 ? n % 3 : 0')(5), 2)
+        self.assertEqual(expr('(n%10>=2 && n%10<=4) || n==0')(0), 1)
+        # C semantics: division truncates towards zero
+        self.assertEqual(expr('0 - n / 2')(3), -1)
+        self.assertRaises(ValueError, expr, 'n !')
+        self.assertRaises(ValueError, expr, 'n === 1')
+
     def test_unusual_metadata_location(self):
         po = polib.pofile('tests/test_unusual_metadata_location.po')
         self.assertNotEqual(po.metadata, {})
@@ -812,6 +898,9 @@ class TestMoFile(unittest.TestCase):
         self.assertEqual(mo.untranslated_entries(), [])
         self.assertEqual(mo.fuzzy_entries(), [])
         self.assertEqual(mo.obsolete_entries(), [])
+        self.assertEqual(mo.release_completion(), 100)
+        self.assertEqual(mo.release_ready_entries(), mo)
+        self.assertEqual(mo.release_blocked_entries(), [])
 
     def test_save_as_pofile(self):
         """
