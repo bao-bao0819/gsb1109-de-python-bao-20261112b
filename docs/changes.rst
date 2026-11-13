@@ -3,6 +3,16 @@ Changes
 
 .. currentmodule:: xlwt
 
+Unreleased
+----------
+
+- Add :meth:`Worksheet.write_tree_header` and the :mod:`xlwt.TreeHeader`
+  module to build a multi-level, merged header from a tree-shaped field
+  list.  Only adjacent sibling labels with the same parent are merged;
+  uneven branches are extended vertically, and partial overlaps with merge
+  ranges already reserved by a template raise :class:`HeaderConflict`
+  before any cell is written.
+
 1.3.0 (22 August 2017)
 ----------------------
 

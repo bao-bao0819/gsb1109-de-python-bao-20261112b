@@ -34,7 +34,7 @@
 
 import tempfile
 
-from . import BIFFRecords, Bitmap, Style
+from . import BIFFRecords, Bitmap, Style, TreeHeader
 from .Column import Column
 from .Row import Row
 
@@ -1116,6 +1116,74 @@ class Worksheet(object):
         for r in range(r1+1, r2+1):
             self.row(r).write_blanks(c1, c2,  style)
         self.__merged_ranges.append((r1, r2, c1, c2))
+
+    def write_tree_header(self, tree, row=0, col=0,
+                          header_style=Style.default_style,
+                          leaf_style=None, overwrite_reserved=False):
+        """Write a multi-level header built from a tree-shaped field list.
+
+        The tree is a nested mapping ``{label: subtree}`` (or an ordered
+        sequence of ``(label, subtree)`` pairs); an empty node is a leaf and
+        becomes one detail column.  Labels are merged horizontally only when
+        they share the same parent, are adjacent and identical, so two
+        unrelated branches using the same label stay in separate cells.
+        Shallow branches are merged vertically down to the deepest level,
+        keeping a unique field path above every detail column.
+
+        :param tree: the field tree.
+        :param row: zero-based row of the first header row.
+        :param col: zero-based column of the first detail column.
+        :param header_style: style applied to every header cell.
+        :param leaf_style: style used for the bottom header row; defaults to
+            ``header_style``.
+        :param overwrite_reserved: when ``False`` (the default), merge ranges
+            already present on the sheet (reserved regions of an old
+            template) are checked first: a generated range with exactly the
+            same geometry as a reserved range is left to the template, while
+            any other intersection raises
+            :class:`~xlwt.TreeHeader.HeaderConflict` *before* anything is
+            written, with both ranges named in the message. Set to ``True``
+            to ignore the reserved ranges and write the whole header anyway.
+        :returns: the plan produced by
+            :func:`~xlwt.TreeHeader.plan_tree_header`.
+        """
+        plan = TreeHeader.plan_tree_header(tree, row, col)
+        if leaf_style is None:
+            leaf_style = header_style
+
+        reserved_ranges = list(self.__merged_ranges)
+        reusable_merges = set()
+        reusable_cells = set()
+        if reserved_ranges and not overwrite_reserved:
+            conflicts, reusable_pairs = TreeHeader.check_reserved_ranges(
+                plan, reserved_ranges)
+            if conflicts:
+                raise TreeHeader.HeaderConflict(
+                    TreeHeader.describe_conflicts(conflicts))
+            for merged, reserved in reusable_pairs:
+                reusable_merges.add(merged)
+                r1, r2, c1, c2 = reserved[:4]
+                for covered_row in range(r1, r2 + 1):
+                    for covered_col in range(c1, c2 + 1):
+                        reusable_cells.add((covered_row, covered_col))
+
+        last_row = row + plan['depth'] - 1
+        merge_toplefts = {(r1, c1) for r1, r2, c1, c2, label in plan['merges']}
+        for r, c, label in plan['labels']:
+            if (r, c) in merge_toplefts or (r, c) in reusable_cells:
+                continue
+            self.write(r, c, label,
+                       leaf_style if r == last_row else header_style)
+
+        for merged in plan['merges']:
+            if merged in reusable_merges:
+                continue
+            r1, r2, c1, c2, label = merged
+            merge_style = leaf_style if r1 == last_row and r2 == last_row \
+                else header_style
+            self.write_merge(r1, r2, c1, c2,
+                             "" if label is None else label, merge_style)
+        return plan
 
     def insert_bitmap(self, filename, row, col, x = 0, y = 0, scale_x = 1, scale_y = 1):
         bmp = Bitmap.ImDataBmpRecord(filename)

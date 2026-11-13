@@ -22,6 +22,9 @@ API Reference
 .. automodule:: xlwt.Style
    :members:
 
+.. automodule:: xlwt.TreeHeader
+   :members:
+
 .. automodule:: xlwt.Bitmap
    :members:
 
