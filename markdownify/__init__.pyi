@@ -1,5 +1,15 @@
 from _typeshed import Incomplete
+from datetime import date
 from typing import Callable, Union
+
+from .charter import (
+    Amendment,
+    CharterError,
+    CharterResult,
+    ClauseResult,
+    charter_as_markdown,
+    version_charter,
+)
 
 ATX: str
 ATX_CLOSED: str

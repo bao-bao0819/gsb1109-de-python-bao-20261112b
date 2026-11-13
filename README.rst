@@ -242,6 +242,51 @@ Call ``markdownify -h`` to see all available options.
 They are the same as listed above and take the same arguments.
 
 
+Versioning Amended Charters
+===========================
+
+Charter pages that track amendments with ``<ins>`` / ``<del>`` tags can be
+restored to the text that was in force on any given day. Each revision tag
+carries its effective date in a ``data-effective`` (or ``datetime``) attribute
+and its source in a ``cite`` (or ``data-source``) attribute:
+
+.. code:: html
+
+    <article data-clause="第一条">
+      <p>名称
+        <del data-effective="2024-01-01" cite="章程2024A">旧名称</del
+        ><ins data-effective="2024-01-01" cite="章程2024A">新名称</ins>
+      </p>
+    </article>
+
+Call ``version_charter`` with a target date (``datetime.date`` or an
+``YYYY-MM-DD`` string) to get the effective clauses together with their
+sources, or ``charter_as_markdown`` for rendered Markdown:
+
+.. code:: python
+
+    from markdownify import version_charter, charter_as_markdown
+
+    result = version_charter(html, '2024-06-01')
+    for clause in result.clauses:
+        print(clause.identifier, clause.text, clause.sources)
+
+    print(charter_as_markdown(html, '2024-06-01'))
+
+Rules applied while reconstructing a day:
+
+- Revisions are ordered by effective date only, so a future amendment
+  published early and an older amendment recorded later are both handled
+  correctly. Insertions not yet in force are hidden; deletions not yet in
+  force keep the original text.
+- An ``<ins>`` nested inside a whole-paragraph ``<del>`` disappears together
+  with its parent clause; it can never take effect on its own.
+- If two revisions from different sources share an effective date without an
+  unambiguous ``data-order``, the smallest affected clauses are wrapped in a
+  dispute blockquote with both readings marked (``++inserted++`` /
+  ``~~deleted~~``) instead of guessing. Unchanged clauses render normally.
+
+
 Development
 ===========
 

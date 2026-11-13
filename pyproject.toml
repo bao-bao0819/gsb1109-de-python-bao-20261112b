@@ -29,6 +29,7 @@ Download = "http://github.com/matthewwithanm/python-markdownify/tarball/master"
 
 [project.scripts]
 markdownify = "markdownify.main:main"
+charter-version = "markdownify.charter:main"
 
 [tool.setuptools]
 zip-safe = false

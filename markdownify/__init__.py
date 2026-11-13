@@ -791,3 +791,13 @@ class MarkdownConverter(object):
 
 def markdownify(html, **options):
     return MarkdownConverter(**options).convert(html)
+
+
+from .charter import (  # noqa: E402,F401
+    Amendment,
+    CharterError,
+    CharterResult,
+    ClauseResult,
+    charter_as_markdown,
+    version_charter,
+)
