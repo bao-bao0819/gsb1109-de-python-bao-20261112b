@@ -34,6 +34,11 @@ diagnose
 
    .. automodule:: mrjob.tools.diagnose
 
+reconcile-counters
+^^^^^^^^^^^^^^^^^^
+
+   .. automodule:: mrjob.tools.reconcile_counters
+
 .. _report-long-jobs:
 
 report-long-jobs

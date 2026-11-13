@@ -99,6 +99,13 @@ def _report_long_jobs(args):
     main(args)
 
 
+@_command('reconcile-counters',
+          'Reconcile a counter against task logs and job history')
+def _reconcile_counters(args):
+    from mrjob.tools.reconcile_counters import main
+    main(args)
+
+
 @_command('s3-tmpwatch', 'Delete S3 keys older than a specified time')
 def _s3_tmpwatch(args):
     from mrjob.tools.emr.s3_tmpwatch import main

@@ -17,6 +17,7 @@
 from mrjob import cmd
 from mrjob.tools import diagnose
 from mrjob.tools import spark_submit
+from mrjob.tools import reconcile_counters
 from mrjob.tools.emr import audit_usage
 from mrjob.tools.emr import create_cluster
 from mrjob.tools.emr import report_long_jobs
@@ -57,6 +58,9 @@ class CommandTestCase(BasicTestCase):
 
     def test_report_long_jobs(self):
         self._test_main_call(report_long_jobs, 'report-long-jobs')
+
+    def test_reconcile_counters(self):
+        self._test_main_call(reconcile_counters, 'reconcile-counters')
 
     def test_s3_tmpwatch(self):
         self._test_main_call(s3_tmpwatch, 's3-tmpwatch')
