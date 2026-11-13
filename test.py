@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.altimeter as mod_altimeter
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3723,6 +3724,234 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+
+class AltimeterAdjusterTests(mod_unittest.TestCase):
+    def _segment(self, latitudes: List[float], elevations: List[float]) -> mod_gpx.GPXTrackSegment:
+        return mod_gpx.GPXTrackSegment([
+            mod_gpx.GPXTrackPoint(latitude, 14.0, elevation)
+            for latitude, elevation in zip(latitudes, elevations)])
+
+    def _pass_segments(self) -> List[mod_gpx.GPXTrackSegment]:
+        # True profile: 1000 -> 1200 (pass) -> 1350.
+        # First altimeter is zeroed at 1000 m, the second at the pass (1200 m).
+        first = self._segment([46.00, 46.01, 46.02], [0.0, 100.0, 200.0])
+        second = self._segment([46.02, 46.03, 46.04], [0.0, 80.0, 150.0])
+        return [first, second]
+
+    def test_pass_splice_removes_fake_cliff(self) -> None:
+        adjuster = mod_altimeter.AltimeterAdjuster(
+            self._pass_segments(), names=['foot', 'pass'])
+        adjuster.add_benchmark(mod_altimeter.Benchmark(
+            46.00, 14.0, 1000.0, name='trailhead', tolerance=2.0))
+        adjuster.add_benchmark(mod_altimeter.Benchmark(
+            46.04, 14.0, 1350.0, name='ridge', tolerance=2.0))
+        adjuster.add_overlap(mod_altimeter.OverlapObservation(
+            0, 1, 46.02, 14.0, 200.0, 0.0, 0.0, tolerance=2.0))
+
+        report = adjuster.solve()
+
+        self.assertTrue(report.compatible)
+        self.assertEqual([], report.conflicts)
+        offset_zero = report.offset_for(0)
+        offset_one = report.offset_for(1)
+        assert offset_zero is not None and offset_one is not None
+        self.assertAlmostEqual(1000.0, offset_zero, places=6)
+        self.assertAlmostEqual(1200.0, offset_one, places=6)
+        # Both corrected readings at the pass must coincide at 1200 m.
+        corrected = adjuster.corrected_gpx(report)
+        pass_first = corrected.tracks[0].segments[0].points[-1].elevation
+        pass_second = corrected.tracks[0].segments[1].points[0].elevation
+        assert pass_first is not None and pass_second is not None
+        self.assertAlmostEqual(1200.0, pass_first, places=4)
+        self.assertAlmostEqual(1200.0, pass_second, places=4)
+
+    def test_weighted_least_squares_blends_noisy_observations(self) -> None:
+        adjuster = mod_altimeter.AltimeterAdjuster(
+            self._pass_segments(), names=['foot', 'pass'])
+        # Tight benchmark says offset 0 = 1000, loose one says 990.
+        adjuster.add_benchmark(mod_altimeter.Benchmark(
+            46.00, 14.0, 1000.0, name='tight', tolerance=1.0))
+        adjuster.add_benchmark(mod_altimeter.Benchmark(
+            46.00, 14.0, 990.0, name='loose', tolerance=10.0))
+        adjuster.add_overlap(mod_altimeter.OverlapObservation(
+            0, 1, 46.02, 14.0, 200.0, 0.0, 0.0, tolerance=2.0))
+
+        report = adjuster.solve()
+
+        self.assertTrue(report.compatible)
+        # Tight observation must dominate: offset close to 1000, not 995.
+        offset_zero = report.offset_for(0)
+        offset_one = report.offset_for(1)
+        assert offset_zero is not None and offset_one is not None
+        self.assertAlmostEqual(1000.0, offset_zero, delta=1.5)
+        self.assertAlmostEqual(1200.0, offset_one, delta=1.5)
+
+    def test_conflicting_benchmark_is_reported_with_location(self) -> None:
+        adjuster = mod_altimeter.AltimeterAdjuster(
+            self._pass_segments(), names=['foot', 'pass'])
+        adjuster.add_benchmark(mod_altimeter.Benchmark(
+            46.00, 14.0, 1000.0, name='trailhead', tolerance=2.0))
+        adjuster.add_benchmark(mod_altimeter.Benchmark(
+            46.04, 14.0, 9999.0, name='bad-ridge', tolerance=2.0))
+        adjuster.add_overlap(mod_altimeter.OverlapObservation(
+            0, 1, 46.02, 14.0, 200.0, 0.0, 0.0, tolerance=2.0))
+
+        report = adjuster.solve()
+
+        self.assertFalse(report.compatible)
+        conflict_names = {conflict.name for conflict in report.conflicts}
+        self.assertIn('bad-ridge', conflict_names)
+        bad = next(item for item in report.conflicts
+                   if item.name == 'bad-ridge')
+        self.assertGreater(abs(bad.residual), bad.tolerance)
+        self.assertAlmostEqual(46.04, bad.latitude)
+        self.assertAlmostEqual(14.0, bad.longitude)
+
+    def test_floating_component_delivers_climb_only(self) -> None:
+        first = self._segment([47.00, 47.01, 47.02], [0.0, 50.0, 120.0])
+        second = self._segment([47.00, 47.01, 47.02], [30.0, 80.0, 150.0])
+        adjuster = mod_altimeter.AltimeterAdjuster(
+            [first, second], names=['rel-a', 'rel-b'])
+        overlaps = adjuster.find_overlaps(max_distance=30, min_pairs=2)
+        self.assertEqual(3, len(overlaps))
+
+        report = adjuster.solve()
+
+        self.assertTrue(report.compatible)
+        self.assertEqual([0, 1], report.floating_segments)
+        self.assertIsNone(report.offset_for(0))
+        self.assertIsNone(report.offset_for(1))
+        # Constant offsets never change in-segment climbs.
+        self.assertAlmostEqual(120.0, report.adjustments[0].uphill)
+        self.assertAlmostEqual(120.0, report.adjustments[1].uphill)
+        corrected = adjuster.corrected_gpx(report)
+        elevations = [
+            point.elevation
+            for track in corrected.tracks
+            for segment in track.segments
+            for point in segment.points]
+        # No guessed absolute height: recorded values pass through unchanged.
+        self.assertEqual(
+            [0.0, 50.0, 120.0, 30.0, 80.0, 150.0], elevations)
+
+    def test_floating_component_still_detects_overlap_conflict(self) -> None:
+        first = self._segment([48.00, 48.01, 48.02], [0.0, 50.0, 120.0])
+        second = self._segment([48.00, 48.01, 48.02], [30.0, 90.0, 200.0])
+        adjuster = mod_altimeter.AltimeterAdjuster([first, second])
+        adjuster.find_overlaps(max_distance=30, min_pairs=2, tolerance=2.0)
+
+        report = adjuster.solve()
+
+        self.assertFalse(report.compatible)
+        self.assertTrue(all(
+            conflict.kind == 'overlap' for conflict in report.conflicts))
+        self.assertTrue(all(
+            abs(conflict.residual) > conflict.tolerance
+            for conflict in report.conflicts))
+
+    def test_components_with_and_without_datum_coexist(self) -> None:
+        datum_segments = self._pass_segments()
+        floating_first = self._segment(
+            [47.00, 47.01, 47.02], [0.0, 50.0, 120.0])
+        floating_second = self._segment(
+            [47.00, 47.01, 47.02], [30.0, 80.0, 150.0])
+        adjuster = mod_altimeter.AltimeterAdjuster(
+            datum_segments + [floating_first, floating_second],
+            names=['d0', 'd1', 'f0', 'f1'])
+        adjuster.add_benchmark(mod_altimeter.Benchmark(
+            46.00, 14.0, 1000.0, name='trailhead', tolerance=2.0))
+        adjuster.add_overlap(mod_altimeter.OverlapObservation(
+            0, 1, 46.02, 14.0, 200.0, 0.0, 0.0, tolerance=2.0))
+        adjuster.find_overlaps(max_distance=30, min_pairs=2)
+
+        report = adjuster.solve()
+
+        self.assertTrue(report.compatible)
+        offset_zero = report.offset_for(0)
+        offset_one = report.offset_for(1)
+        assert offset_zero is not None and offset_one is not None
+        self.assertAlmostEqual(1000.0, offset_zero, places=6)
+        self.assertAlmostEqual(1200.0, offset_one, places=6)
+        self.assertIsNone(report.offset_for(2))
+        self.assertIsNone(report.offset_for(3))
+        self.assertEqual(
+            [0, 0, 1, 1],
+            [item.component for item in report.adjustments])
+
+    def test_waypoint_benchmarks_and_apply_offsets(self) -> None:
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        for segment in self._pass_segments():
+            gpx.tracks[0].segments.append(segment)
+        gpx.waypoints.append(mod_gpx.GPXWaypoint(
+            46.00, 14.0, elevation=1000.0, name='trailhead'))
+        gpx.waypoints.append(mod_gpx.GPXWaypoint(
+            46.04, 14.0, elevation=1350.0, name='ridge'))
+        segments = gpx.tracks[0].segments
+        adjuster = mod_altimeter.AltimeterAdjuster(segments)
+        matched = adjuster.add_waypoint_benchmarks(gpx, tolerance=2.0)
+        self.assertEqual(2, len(matched))
+        adjuster.add_overlap(mod_altimeter.OverlapObservation(
+            0, 1, 46.02, 14.0, 200.0, 0.0, 0.0, tolerance=2.0))
+
+        report = adjuster.solve()
+        adjuster.apply_offsets(report)
+
+        self.assertTrue(report.compatible)
+        first_elevation = segments[0].points[0].elevation
+        pass_first = segments[0].points[-1].elevation
+        pass_second = segments[1].points[0].elevation
+        assert (first_elevation is not None
+                and pass_first is not None
+                and pass_second is not None)
+        self.assertAlmostEqual(1000.0, first_elevation, places=4)
+        self.assertAlmostEqual(1200.0, pass_first, places=4)
+        self.assertAlmostEqual(1200.0, pass_second, places=4)
+
+    def test_unmatched_benchmark_raises(self) -> None:
+        adjuster = mod_altimeter.AltimeterAdjuster(
+            [self._segment([46.00, 46.01], [0.0, 100.0])])
+        with self.assertRaises(ValueError):
+            adjuster.add_benchmark(mod_altimeter.Benchmark(
+                10.0, 10.0, 500.0, name='nowhere'), max_distance=25.0)
+
+    def test_benchmark_shared_by_two_segments_emitted_once(self) -> None:
+        shared_first = self._segment(
+            [45.00, 45.01, 45.02], [10.0, 60.0, 130.0])
+        shared_second = self._segment(
+            [45.00, 45.01, 45.02], [110.0, 160.0, 230.0])
+        adjuster = mod_altimeter.AltimeterAdjuster(
+            [shared_first, shared_second])
+        matched = adjuster.add_benchmark(mod_altimeter.Benchmark(
+            45.00, 14.0, 1000.0, name='shared', tolerance=2.0))
+        self.assertEqual(2, len(matched))
+
+        report = adjuster.solve()
+        corrected = adjuster.corrected_gpx(report)
+
+        self.assertEqual(
+            ['shared'], [waypoint.name for waypoint in corrected.waypoints])
+
+    def test_reconcile_wrapper(self) -> None:
+        segments = self._pass_segments()
+        report = mod_altimeter.reconcile(
+            segments,
+            benchmarks=[
+                mod_altimeter.Benchmark(
+                    46.00, 14.0, 1000.0, name='trailhead', tolerance=2.0),
+                mod_altimeter.Benchmark(
+                    46.04, 14.0, 1350.0, name='ridge', tolerance=2.0)],
+            overlaps=[
+                mod_altimeter.OverlapObservation(
+                    0, 1, 46.02, 14.0, 200.0, 0.0, 0.0, tolerance=2.0)])
+        self.assertTrue(report.compatible)
+        offset_zero = report.offset_for(0)
+        offset_one = report.offset_for(1)
+        assert offset_zero is not None and offset_one is not None
+        self.assertAlmostEqual(1000.0, offset_zero, places=6)
+        self.assertAlmostEqual(1200.0, offset_one, places=6)
+
 
 if __name__ == '__main__':
     mod_unittest.main()

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- New `gpxpy.altimeter` module: reconcile constant vertical offsets of independently zeroed altimeter track segments using known-elevation benchmarks and co-located overlap observations, with conflict detection, weighted least-squares offsets, and climb-only output for segments without a vertical datum
+
 ## v1.6.1
 
 - Minor fix

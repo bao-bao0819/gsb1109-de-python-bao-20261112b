@@ -65,6 +65,53 @@ gpx_segment.points.append(gpxpy.gpx.GPXTrackPoint(2.1236, 5.1236, elevation=1236
 print('Created GPX:', gpx.to_xml())
 ```
 
+## Reconciling independently zeroed altimeter segments
+
+When several altimeter recordings meet (for example two instruments handed over at a mountain pass, the second one starting its scale at zero), concatenating the raw tracks invents a vertical jump at the junction. The `gpxpy.altimeter` module gives each segment one constant offset and checks whether a single set of offsets can satisfy:
+
+* **Benchmarks** -- points with a known elevation (`Benchmark`), each with an error tolerance.
+* **Overlaps** -- the same ground position walked by two segments (`OverlapObservation`), where the corrected elevations must agree.
+
+Observations are combined in a weighted least-squares adjustment (weights inverse squared tolerance). Segments linked through overlaps form components. A component only gets absolute offsets when it contains a benchmark. Components without any vertical datum stay *floating*: their relative geometry is still checked for internal contradictions, but no absolute elevation is guessed -- only the in-segment climb (which a constant offset cannot change) is delivered.
+
+```python
+import gpxpy.altimeter as altimeter
+
+adjuster = altimeter.AltimeterAdjuster(segments, names=['approach', 'descent'])
+
+adjuster.add_benchmark(altimeter.Benchmark(
+    46.00, 14.0, 1000.0, name='trailhead', tolerance=2.0))
+# Elevated GPX waypoints can be used directly:
+# adjuster.add_waypoint_benchmarks(gpx, tolerance=2.0)
+
+adjuster.add_overlap(altimeter.OverlapObservation(
+    segment_a=0, segment_b=1, latitude=46.02, longitude=14.0,
+    elevation_a=200.0, elevation_b=0.0,
+    horizontal_distance=0.0, tolerance=2.0))
+# Co-located points can also be detected automatically:
+# adjuster.find_overlaps(max_distance=25, min_pairs=3)
+
+report = adjuster.solve()
+
+if not report.compatible:
+    for conflict in report.conflicts:
+        print(conflict.name, conflict.latitude, conflict.longitude,
+              conflict.residual, conflict.tolerance)
+
+for item in report.adjustments:
+    if item.floating:
+        print(item.name, 'no datum; climb', item.uphill, 'm only')
+    else:
+        print(item.name, 'offset', item.offset)
+
+# GPX with corrected elevations; floating components keep relative values.
+corrected_gpx = adjuster.corrected_gpx(report)
+# Or apply the offsets to the input segments in place:
+adjuster.apply_offsets(report)
+```
+
+See `examples/altimeter_offset_example.py` for a complete runnable example.
+
 ## GPX version
 
 gpx.py can parse and generate GPX 1.0 and 1.1 files. The generated file will always be a valid XML document, but it may not be (strictly speaking) a valid GPX document. For example, if you set gpx.email to "my.email AT mail.com" the generated GPX tag won't confirm to the regex pattern. And the file won't be valid. Most applications will ignore such errors, but... Be aware of this!
