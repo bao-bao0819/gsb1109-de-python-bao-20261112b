@@ -196,6 +196,7 @@ get_data(.., library='pyexcel-ods')
    renderer
    extendedcsv
    csvz
+   reconciliation
    sqlalchemy
    django
    extensions
@@ -217,6 +218,8 @@ API
    iget_data
    get_data
    save_data
+   extract_rows
+   reconcile_rows
 
 
 Indices and tables

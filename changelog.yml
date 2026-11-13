@@ -2,6 +2,14 @@ name: pyexcel-io
 organisation: pyexcel
 releases:
 - changes:
+  - action: added
+    details:
+    - "incremental row reconciliation: reconcile_rows() and extract_rows()\
+      \ compare two workbook deliveries by caller defined row identity and\
+      \ coverage scopes, reporting unchanged, migrated, changed, new,\
+      \ missing, conflicted and untouched rows; a missing sheet no longer\
+      \ implies deletion unless its scope is explicitly covered, and\
+      \ conflicting sheet sources are all retained for trace back."
   - action: updated
     details:
     - "`#56`: fix regex error when loading multi-file CSV from a directory with special\

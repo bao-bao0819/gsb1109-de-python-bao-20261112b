@@ -13,6 +13,20 @@ import logging
 import pyexcel_io.plugins as plugins
 
 from .io import get_data, iget_data, save_data  # noqa
+from .reconcile import (  # noqa
+    ROW_CHANGED,
+    ROW_CONFLICTED,
+    ROW_MIGRATED,
+    ROW_MISSING,
+    ROW_NEW,
+    ROW_UNCHANGED,
+    ROW_UNTOUCHED,
+    ReconcileResult,
+    RowRecord,
+    RowSource,
+    extract_rows,
+    reconcile_rows,
+)
 from ._compact import NullHandler
 
 logging.getLogger(__name__).addHandler(NullHandler())  # noqa
