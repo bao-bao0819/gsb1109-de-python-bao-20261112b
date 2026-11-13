@@ -3,6 +3,24 @@ Changes
 
 .. currentmodule:: xlwt
 
+Unreleased
+----------
+
+- Add per-column :class:`Precision.PrecisionPolicy` via
+  :meth:`Worksheet.Worksheet.set_precision_policy`.  Numeric values that fit
+  the configured tolerance keep their binary64 numeric type; values that do not
+  fit can either be rejected (:class:`Precision.PrecisionError`) or written as
+  reversible text.
+
+- Add :attr:`Worksheet.Worksheet.non_numeric_cells`,
+  :meth:`Worksheet.Worksheet.iter_numeric_cells` and
+  :meth:`Worksheet.Worksheet.sum_numeric` so callers can see which cells can no
+  longer take part directly in a sum and sum only the remaining numeric cells.
+
+- Tolerance checks use :class:`decimal.Decimal` arithmetic and are sign
+  symmetric, so values on either side of the midpoint between two representable
+  binary64 numbers are judged by the same convention.
+
 1.3.0 (22 August 2017)
 ----------------------
 

@@ -20,6 +20,10 @@ class Column(object):
         self.best_fit = 0
         self.unused = 0
 
+        # Per-column precision policy.  ``None`` preserves the legacy
+        # behaviour of always converting numeric values to binary64 numbers.
+        self.precision_policy = None
+
     def set_width(self, width):
         if not(isinstance(width, int) and 0 <= width <= 65535):
             raise ValueError("column width (%r) not an int in range(65536)" % width)

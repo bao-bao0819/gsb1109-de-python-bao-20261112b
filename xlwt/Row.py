@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import six
 
-from . import BIFFRecords, ExcelFormula, Style
+from . import BIFFRecords, ExcelFormula, Precision, Style
 from .Cell import (
     BlankCell, BooleanCell, ErrorCell, FormulaCell, MulBlankCell, NumberCell,
     StrCell, _get_cells_biff_data_mul,
@@ -122,6 +122,11 @@ class Row(object):
     def get_cells_count(self):
         return len(self.__cells)
 
+    def get_cells(self):
+        return self.__cells
+
+    cells = property(get_cells)
+
 
     def get_min_col(self):
         return self.__min_col_idx
@@ -227,6 +232,47 @@ class Row(object):
         xf_index = self.__parent_wb.add_style(style)
         self.insert_cell(colx, ErrorCell(self.__idx, colx, xf_index, error_string_or_code))
 
+    def __write_number(self, col, label, style_index):
+        policy = self.__parent.get_precision_policy(col)
+        if policy is None:
+            self.insert_cell(col, NumberCell(self.__idx, col, style_index, label))
+            self.__parent._clear_non_numeric_cell(self.__idx, col)
+            return
+        try:
+            stored = float(label)
+        except OverflowError:
+            stored = float('inf')
+        if Precision.is_finite(stored) and policy.fits(label, stored):
+            self.insert_cell(col, NumberCell(self.__idx, col, style_index, stored))
+            self.__parent._clear_non_numeric_cell(self.__idx, col)
+            return
+        if policy.on_overflow == Precision.REJECT:
+            if Precision.is_finite(stored):
+                absolute_error, relative_error = policy.rounding_error(label, stored)
+                detail = "absolute error=%s, relative error=%s" % (
+                    absolute_error, relative_error)
+            else:
+                detail = "value overflows the binary64 number range"
+            raise Precision.PrecisionError(
+                "value %r at (rowx=%d, colx=%d) cannot be stored as a "
+                "binary64 number within tolerance (%s)"
+                % (label, self.__idx, col, detail))
+        if policy.on_overflow == Precision.FORCE_NUMERIC:
+            if not Precision.is_finite(stored):
+                raise Precision.PrecisionError(
+                    "value %r at (rowx=%d, colx=%d) overflows the binary64 "
+                    "number range and cannot be stored as a number"
+                    % (label, self.__idx, col))
+            self.insert_cell(col, NumberCell(self.__idx, col, style_index, stored))
+            self.__parent._clear_non_numeric_cell(self.__idx, col)
+            return
+        # TEXT: keep the original digits verbatim.  The resulting cell is
+        # text and must not take part directly in spreadsheet sums.
+        text = policy.format_text(label, stored)
+        self.insert_cell(col,
+            StrCell(self.__idx, col, style_index, self.__parent_wb.add_str(text)))
+        self.__parent._mark_non_numeric_cell(self.__idx, col)
+
     def write(self, col, label, style=Style.default_style):
         self.__adjust_height(style)
         self.__adjust_bound_col_idx(col)
@@ -241,7 +287,7 @@ class Row(object):
         elif isinstance(label, bool): # bool is subclass of int; test bool first
             self.insert_cell(col, BooleanCell(self.__idx, col, style_index, label))
         elif isinstance(label, six.integer_types+(float, Decimal)):
-            self.insert_cell(col, NumberCell(self.__idx, col, style_index, label))
+            self.__write_number(col, label, style_index)
         elif isinstance(label, (dt.datetime, dt.date, dt.time)):
             date_number = self.__excel_date_dt(label)
             self.insert_cell(col, NumberCell(self.__idx, col, style_index, date_number))

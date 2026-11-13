@@ -35,6 +35,7 @@
 import tempfile
 
 from . import BIFFRecords, Bitmap, Style
+from .Cell import NumberCell
 from .Column import Column
 from .Row import Row
 
@@ -201,6 +202,11 @@ class Worksheet(object):
         self.row_tempfile = None
         self.__flushed_rows = {}
         self.__row_visible_levels = 0
+
+        # (rowx, colx) coordinates of cells that could not be kept as
+        # binary64 numbers under their column precision policy and were
+        # written as reversible text instead.
+        self.__non_numeric_cells = set()
 
     #################################################################
     ## Properties, "getters", "setters"
@@ -1133,6 +1139,84 @@ class Worksheet(object):
         if indx not in self.__cols:
             self.__cols[indx] = self.Column(indx, self)
         return self.__cols[indx]
+
+    def set_precision_policy(self, colx, policy=None, **kwargs):
+        """
+        Attach a per-column :class:`~xlwt.Precision.PrecisionPolicy`.
+
+        Either pass an existing policy, or pass keyword arguments (for example
+        ``tolerance=1e-12, on_overflow=xlwt.TEXT``) to construct one.  Passing
+        ``None`` removes any policy and restores the legacy behaviour where
+        every numeric value is converted to a binary64 number.
+        """
+        from .Precision import PrecisionPolicy
+        column = self.col(colx)
+        if policy is None:
+            if kwargs:
+                policy = PrecisionPolicy(**kwargs)
+        elif kwargs:
+            raise ValueError(
+                "pass either a PrecisionPolicy or keyword arguments, not both")
+        column.precision_policy = policy
+        return policy
+
+    def get_precision_policy(self, colx):
+        """
+        Return the :class:`~xlwt.Precision.PrecisionPolicy` configured for
+        *colx*, or ``None`` when the column has no precision convention.
+        """
+        column = self.__cols.get(colx)
+        if column is None:
+            return None
+        return column.precision_policy
+
+    def _mark_non_numeric_cell(self, rowx, colx):
+        self.__non_numeric_cells.add((rowx, colx))
+
+    def _clear_non_numeric_cell(self, rowx, colx):
+        self.__non_numeric_cells.discard((rowx, colx))
+
+    def get_non_numeric_cells(self):
+        """
+        Return the sorted ``(rowx, colx)`` coordinates of cells that could not
+        be represented as binary64 numbers within their column policy and were
+        written as reversible text instead.
+
+        These cells are text in the exported file and must not take part
+        directly in spreadsheet sums.
+        """
+        return sorted(self.__non_numeric_cells)
+
+    non_numeric_cells = property(get_non_numeric_cells)
+
+    def iter_numeric_cells(self, colx=None):
+        """
+        Yield ``(rowx, colx, value)`` triples for the cells still stored as
+        numbers.
+
+        When *colx* is given, only that column is inspected; otherwise every
+        numeric cell on the sheet is yielded.  Cells written as text by a
+        precision policy are skipped, so the output is exactly the set of
+        cells that are safe to sum.  Only rows still held in memory (i.e. not
+        handed to :meth:`flush_row_data`) are visible.
+        """
+        for rowx in sorted(self.__rows):
+            row = self.__rows[rowx]
+            for cell_colx, cell in sorted(row.cells.items()):
+                if colx is not None and cell_colx != colx:
+                    continue
+                if isinstance(cell, NumberCell):
+                    yield rowx, cell_colx, cell.number
+
+    def sum_numeric(self, colx):
+        """
+        Sum the ordinary numeric readings in *colx*.
+
+        Text cells produced by the column precision policy are excluded, so
+        finance callers sum exactly the cells that remain directly summable
+        in the exported sheet.
+        """
+        return sum(value for _, _, value in self.iter_numeric_cells(colx))
 
     def row(self, indx):
         if indx not in self.__rows:

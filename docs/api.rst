@@ -16,6 +16,9 @@ API Reference
 .. automodule:: xlwt.Cell
    :members:
 
+.. automodule:: xlwt.Precision
+   :members:
+
 .. automodule:: xlwt.Formatting
    :members:
 
