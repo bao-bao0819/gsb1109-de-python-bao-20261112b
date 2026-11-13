@@ -1280,6 +1280,242 @@ class SchedulerApiTest(unittest.TestCase):
         self.sch.add_task(worker=WORKER, task_id="B", resources={"r1": 1}, priority=1)
         self.assertEqual("B", self.sch.get_work(worker=WORKER)["task_id"])
 
+    def test_starving_task_reserves_capacity_after_waiting(self):
+        # A big task needs both units of R at once; small tasks need one. Because small
+        # tasks have higher priority they would otherwise keep the big task waiting forever.
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=2)
+
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"R": 2}, priority=0)
+        sch.add_task(worker=WORKER, task_id="SMALL", resources={"R": 1}, priority=5)
+        self.assertEqual("SMALL", sch.get_work(worker=WORKER)["task_id"])
+
+        # While BIG is still young, the second unit stays usable.
+        self.setTime(50)
+        sch.add_task(worker=WORKER, task_id="SMALL2", resources={"R": 1}, priority=5)
+        self.assertEqual("SMALL2", sch.get_work(worker=WORKER)["task_id"])
+
+        # After the starvation delay, BIG reserves both units. Freeing one unit is not
+        # enough any more: no new SMALL task may take it.
+        self.setTime(101)
+        sch.add_task(worker=WORKER, task_id="SMALL", status=DONE)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+
+        self.setTime(102)
+        sch.add_task(worker=WORKER, task_id="SMALL2", status=DONE)
+        # The second release hands the whole reservation to BIG.
+        self.assertEqual("BIG", sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual({}, sch._state._reservations)
+
+    def test_fixed_arrival_order_example(self):
+        """
+        t=0    BIG needs {source: 2}  priority 0, two units already busy
+        t=1    s1  needs {source: 1}  priority 9
+        t=2    s2  needs {source: 1}  priority 9
+        t=10   u1  needs {other: 1}   priority 9
+        """
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=60))
+        sch.update_resources(source=2, other=1)
+
+        sch.add_task(worker=WORKER, task_id="L1", resources={"source": 1}, priority=20)
+        sch.add_task(worker=WORKER, task_id="L2", resources={"source": 1}, priority=20)
+        self.assertEqual("L1", sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual("L2", sch.get_work(worker=WORKER)["task_id"])
+
+        self.setTime(0)
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"source": 2}, priority=0)
+        self.setTime(1)
+        sch.add_task(worker=WORKER, task_id="s1", resources={"source": 1}, priority=9)
+        self.setTime(2)
+        sch.add_task(worker=WORKER, task_id="s2", resources={"source": 1}, priority=9)
+        self.setTime(10)
+        sch.add_task(worker=WORKER, task_id="u1", resources={"other": 1}, priority=9)
+
+        # Unrelated resource keeps flowing even after the reservation exists.
+        self.assertEqual("u1", sch.get_work(worker=WORKER)["task_id"])
+
+        # At t=60 BIG gets its reservation, but its units are still busy.
+        self.setTime(60)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual({"BIG": {"source": 2}}, sch._state._reservations)
+
+        # First release (t=70): only one of the two units BIG needs is free.
+        self.setTime(70)
+        sch.add_task(worker=WORKER, task_id="L1", status=DONE)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+
+        # Smaller `source` tasks must not steal the released unit.
+        sch.add_task(worker=WORKER, task_id="s3", resources={"source": 1}, priority=99)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+
+        # Second release (t=90): BIG is claimable and the reservation is gone.
+        self.setTime(90)
+        sch.add_task(worker=WORKER, task_id="L2", status=DONE)
+        self.assertEqual("BIG", sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual({}, sch._state._reservations)
+
+    def test_reservation_only_blocks_conflicting_resources(self):
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=1, OTHER=1)
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"R": 1}, priority=0)
+        sch.add_task(worker=WORKER, task_id="OCCUPY", resources={"R": 1}, priority=5)
+        self.assertEqual("OCCUPY", sch.get_work(worker=WORKER)["task_id"])
+
+        self.setTime(150)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+        self.assertIn("BIG", sch._state._reservations)
+
+        # A task on an unrelated resource is unaffected by BIG's reservation.
+        sch.update_resources(OTHER=1)
+        sch.add_task(worker=WORKER, task_id="UNRELATED", resources={"OTHER": 1})
+        self.assertEqual("UNRELATED", sch.get_work(worker=WORKER)["task_id"])
+
+    def test_impossible_request_does_not_block_others(self):
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=1)
+        # Needs more than the total capacity: it can never run, so it must not reserve.
+        sch.add_task(worker=WORKER, task_id="IMPOSSIBLE", resources={"R": 2})
+        self.setTime(200)
+        sch.add_task(worker=WORKER, task_id="SMALL", resources={"R": 1})
+        self.assertEqual("SMALL", sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual({}, sch._state._reservations)
+
+    def test_reservations_are_first_come_first_served(self):
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=2)
+        sch.add_task(worker=WORKER, task_id="OCCUPY1", resources={"R": 1}, priority=9)
+        sch.add_task(worker=WORKER, task_id="OCCUPY2", resources={"R": 1}, priority=9)
+        self.assertEqual("OCCUPY1", sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual("OCCUPY2", sch.get_work(worker=WORKER)["task_id"])
+
+        self.setTime(0)
+        sch.add_task(worker=WORKER, task_id="FIRST", resources={"R": 2}, priority=0)
+        self.setTime(1)
+        sch.add_task(worker=WORKER, task_id="SECOND", resources={"R": 2}, priority=0)
+
+        self.setTime(101)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+        # Only one of the two can hold the whole capacity; the earlier arrival wins.
+        self.assertEqual({"FIRST": {"R": 2}}, sch._state._reservations)
+
+        self.setTime(102)
+        sch.add_task(worker=WORKER, task_id="OCCUPY1", status=DONE)
+        sch.add_task(worker=WORKER, task_id="OCCUPY2", status=DONE)
+        self.assertEqual("FIRST", sch.get_work(worker=WORKER)["task_id"])
+
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=1)
+        sch.add_task(worker=WORKER, task_id="OCCUPY", resources={"R": 1}, priority=5)
+        self.assertEqual("OCCUPY", sch.get_work(worker=WORKER)["task_id"])
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"R": 1})
+
+        self.setTime(101)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+        self.assertIn("BIG", sch._state._reservations)
+
+        # The big task is cancelled before it ever ran: its reservation must disappear.
+        sch.add_task(worker=WORKER, task_id="BIG", status=FAILED)
+        self.assertNotIn("BIG", sch._state._reservations)
+
+        sch.add_task(worker=WORKER, task_id="OCCUPY", status=DONE)
+        sch.add_task(worker=WORKER, task_id="SMALL", resources={"R": 1})
+        self.assertEqual("SMALL", sch.get_work(worker=WORKER)["task_id"])
+
+    def test_reservation_released_when_task_is_pruned(self):
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=1)
+        sch.add_task(worker=WORKER, task_id="OCCUPY", resources={"R": 1}, priority=5)
+        self.assertEqual("OCCUPY", sch.get_work(worker=WORKER)["task_id"])
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"R": 1})
+
+        self.setTime(101)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+        self.assertIn("BIG", sch._state._reservations)
+
+        # Let the worker (and with it the task) disappear, then prune.
+        self.setTime(10000)
+        sch.prune()
+        sch.prune()
+        self.assertNotIn("BIG", sch._state._reservations)
+
+    def test_reservation_is_removed_if_worker_is_gone(self):
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=1)
+        sch.add_task(worker=WORKER, task_id="OCCUPY", resources={"R": 1}, priority=5)
+        self.assertEqual("OCCUPY", sch.get_work(worker=WORKER)["task_id"])
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"R": 1})
+        self.setTime(101)
+        sch.get_work(worker=WORKER)
+        self.assertIn("BIG", sch._state._reservations)
+
+        # The only worker interested in BIG goes silent. A reservation nobody can use
+        # must not keep blocking other work.
+        self.setTime(10000)
+        sch.get_work(worker="other-worker")
+        self.assertNotIn("BIG", sch._state._reservations)
+
+    def test_reservation_does_not_outlive_task_completion(self):
+        self.setTime(0)
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=100))
+        sch.update_resources(R=1)
+        sch.add_task(worker=WORKER, task_id="OCCUPY", resources={"R": 1}, priority=5)
+        self.assertEqual("OCCUPY", sch.get_work(worker=WORKER)["task_id"])
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"R": 1})
+        self.setTime(101)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+        self.assertIn("BIG", sch._state._reservations)
+
+        sch.add_task(worker=WORKER, task_id="BIG", status=DONE)
+        self.assertNotIn("BIG", sch._state._reservations)
+
+    def test_starvation_enabled_by_default_and_can_be_disabled(self):
+        self.setTime(0)
+        sch = Scheduler(**self.get_scheduler_config())
+        self.assertGreater(sch._config.resource_starvation_delay, 0)
+
+        sch = Scheduler(**dict(self.get_scheduler_config(), resource_starvation_delay=0))
+        sch.update_resources(R=1)
+        sch.add_task(worker=WORKER, task_id="OCCUPY", resources={"R": 1}, priority=5)
+        self.assertEqual("OCCUPY", sch.get_work(worker=WORKER)["task_id"])
+        sch.add_task(worker=WORKER, task_id="BIG", resources={"R": 1})
+        self.setTime(100000)
+        self.assertIsNone(sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual({}, sch._state._reservations)
+
+    def test_multiple_workers_cannot_overdraw_resources(self):
+        import threading
+
+        self.setTime(0)
+        sch = Scheduler(**self.get_scheduler_config())
+        sch.update_resources(R=1)
+        for i in range(20):
+            sch.add_task(worker="W{}".format(i), task_id="T{}".format(i), resources={"R": 1})
+
+        granted = []
+        barrier = threading.Barrier(20)
+
+        def claim(worker):
+            barrier.wait()
+            task_id = sch.get_work(worker=worker)["task_id"]
+            if task_id:
+                granted.append(task_id)
+
+        threads = [threading.Thread(target=claim, args=(worker,)) for worker in ("W{}".format(i) for i in range(20))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(1, len(granted))
+
     def test_stop_locking_resource_for_uninterested_worker(self):
         self.setTime(0)
         self.sch.update_resources(r1=1)

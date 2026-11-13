@@ -226,6 +226,57 @@ the task parameters or other dynamic attributes:
 Since, by default, resources have a usage limit of 1, no two instances of Task A
 will now run if they have the same `important_file_name` property.
 
+Avoiding starvation between large and small tasks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A task that needs several resource units at once can be starved by a stream of
+small tasks that each need only one. If the small tasks keep arriving and each one
+is scheduled as soon as a single unit frees up, the large task never sees enough
+free capacity at the same time. Priority alone does not help here, because every
+individual small task fits into the free capacity.
+
+Set :ref:`resource_starvation_delay <scheduler-config>` to let the scheduler
+reserve capacity for tasks that have waited too long:
+
+.. code:: ini
+
+  [scheduler]
+  resource_starvation_delay = 60
+
+  [resources]
+  source = 2
+
+After waiting 60 seconds, a pending task that needs ``{"source": 2}`` reserves both
+units. Tasks that need ``{"source": 1}`` can no longer start, but tasks that use a
+different resource are unaffected. The reservation is released as soon as the
+waiting task starts running, fails, is cancelled or is pruned, and reserved tasks
+are admitted first come, first served.
+
+With the configuration above, suppose two long-running tasks already hold one unit
+of ``source`` each and the following tasks are submitted in order:
+
+.. code-block:: text
+
+    t=0    BIG   needs {"source": 2}   priority 0
+    t=1    s1    needs {"source": 1}   priority 9
+    t=2    s2    needs {"source": 1}   priority 9
+    t=10   u1    needs {"other": 1}    priority 9
+
+At ``t=0`` the units are still busy, so ``BIG`` starts waiting. Before ``t=60`` it
+holds no reservation, so capacity that frees up in that window is still offered to
+the ordinary priority order. ``u1`` runs at any time because it does not touch
+``source``.
+
+``BIG`` becomes eligible for a reservation at ``t=60``. From then on the two units
+it needs are held back from small tasks, although ``BIG`` is not taken out of the
+queue either: a unit that frees up while the other is still busy is simply left
+idle rather than handed to a small task. In the example the first long task
+finishes at ``t=70``, leaving only one unit free, so ``BIG`` keeps waiting. When the
+second long task finishes at ``t=90``, both units are free and ``BIG`` is the next
+task granted work. Its wait is therefore bounded by the delay plus the time until
+the last unit it needs is released; here it is claimable at the second release,
+``t=90``.
+
 Decreasing resources of running tasks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

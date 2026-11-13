@@ -868,6 +868,20 @@ metrics_custom_import
   Optional setting allowing Luigi to import a custom subclass of MetricsCollector
   at runtime. The string should be formatted like "module.sub_module.ClassName".
 
+resource_starvation_delay
+  Number of seconds a pending task with :ref:`resource requirements <resources-config>`
+  has to wait before the scheduler reserves the capacity it needs. This prevents a
+  stream of small tasks from indefinitely taking the resource units a large task is
+  waiting for. Once the delay has elapsed the scheduler holds back exactly the amount
+  (and only the resource names) that the waiting task requires, so tasks that use
+  unrelated resources keep running normally. The reservation is first come, first
+  served and is released as soon as the task starts running, fails, is cancelled or
+  is pruned. Defaults to 30. Set to 0 to disable reservations entirely.
+
+  Reservations never reserve capacity that the task itself could not use; a task that
+  asks for more units than a resource has in total is left to the ordinary priority
+  rules instead of blocking the resource.
+
 
 [sendgrid]
 ----------

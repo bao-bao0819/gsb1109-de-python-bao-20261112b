@@ -31,6 +31,7 @@ import logging
 import os
 import pickle
 import re
+import threading
 import time
 import uuid
 from collections.abc import MutableSet
@@ -83,6 +84,29 @@ RetryPolicy = collections.namedtuple("RetryPolicy", _retry_policy_fields)  # typ
 
 def _get_empty_retry_policy():
     return RetryPolicy(*[None] * len(_retry_policy_fields))
+
+
+def _locked(fn):
+    """
+    Serialize a scheduler operation against other workers' claims.
+
+    The scheduler is usually driven by a single-threaded event loop, but
+    multiple request threads (or direct API users) may call into it at the
+    same time. Resource checks and the subsequent status change must be
+    atomic, otherwise two workers can both observe enough free capacity and
+    over-issue the same resource units.
+    """
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+
+    # rpc_method inspects the signature lazily, so keep the original one visible
+    # through the wrapper instead of letting it see (*args, **kwargs).
+    wrapper.__signature__ = signature
+    return wrapper
 
 
 def rpc_method(**request_args):
@@ -144,6 +168,15 @@ class scheduler(Config):
     """
     Sets a cooldown period in seconds after a task was completed, during this period the same task will not accepted by the scheduler.
     """
+
+    resource_starvation_delay = parameter.FloatParameter(
+        default=30.0,
+        description=(
+            "Number of seconds a pending task with resource requirements has to wait before the scheduler reserves "
+            "the capacity it needs. Reservations stop smaller tasks from indefinitely taking the resources a "
+            "long-waiting task requires, while tasks using unrelated resources keep running. Set to 0 to disable."
+        ),
+    )
 
     def _get_retry_policy(self):
         return RetryPolicy(self.retry_count, self.disable_hard_timeout, self.disable_window)
@@ -280,6 +313,11 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # Set when the task is first seen as a pending, runnable task with resource requirements.
+        # Used to decide when a starving task has waited long enough to reserve capacity.
+        self.waiting_since = None
+        # True while this task holds a reservation of its own resource requirements.
+        self.reserved = False
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -442,6 +480,11 @@ class SimpleTaskState:
         self._active_workers = {}  # map from id to a Worker object
         self._task_batchers = {}
         self._metrics_collector = None
+        # task id -> {resource: amount} that must stay free for a starving task.
+        self._reservations = {}
+        # Ids of PENDING tasks with resource requirements, so that starvation checks stay
+        # proportional to the number of resource users rather than the whole queue.
+        self._resource_pending = set()
 
     def get_state(self):
         return self._tasks, self._active_workers, self._task_batchers
@@ -450,6 +493,16 @@ class SimpleTaskState:
         self._tasks, self._active_workers = state[:2]
         if len(state) >= 3:
             self._task_batchers = state[2]
+        self._status_tasks = collections.defaultdict(dict)
+        self._resource_pending = set()
+        # Reservations are cheap to recompute and must not be trusted across restarts;
+        # a stale one would hide capacity from the new scheduler instance.
+        self._reservations = {}
+        for task in self._tasks.values():
+            task.reserved = False
+            self._status_tasks[task.status][task.id] = task
+            if task.status == PENDING and task.resources:
+                self._resource_pending.add(task.id)
 
     def dump(self):
         try:
@@ -472,9 +525,6 @@ class SimpleTaskState:
                 return
 
             self.set_state(state)
-            self._status_tasks = collections.defaultdict(dict)
-            for task in self._tasks.values():
-                self._status_tasks[task.status][task.id] = task
         else:
             logger.info("No prior state file exists at %s. Starting with empty state", self._state_path)
 
@@ -525,6 +575,12 @@ class SimpleTaskState:
             self.set_status(task, FAILED, config)
             task.clear_failures()
 
+    def release_reservation(self, task):
+        """Drop any capacity reserved on behalf of ``task``. Idempotent."""
+        if self._reservations.pop(task.id, None) is not None or getattr(task, "reserved", False):
+            task.reserved = False
+            logger.debug("Released reservation of task %r", task.id)
+
     def set_batch_running(self, task, batch_id, worker_id):
         self.set_status(task, BATCH_RUNNING)
         task.batch_id = batch_id
@@ -532,12 +588,26 @@ class SimpleTaskState:
         task.resources_running = task.resources
         task.time_running = time.time()
 
+    def _note_resource_pending(self, task):
+        """Track pending tasks that declare resources (used by the starvation checks)."""
+        if task.status == PENDING and task.resources:
+            if getattr(task, "waiting_since", None) is None:
+                task.waiting_since = time.time()
+            self._resource_pending.add(task.id)
+        else:
+            self._resource_pending.discard(task.id)
+
     def set_status(self, task, new_status, config=None):
         if new_status == FAILED:
             assert config is not None
 
         if new_status == DISABLED and task.status in (RUNNING, BATCH_RUNNING):
             return
+
+        if new_status != PENDING:
+            # A task that stops waiting (runs, finishes, fails or gets cancelled) must give
+            # its reservation back right away, otherwise the capacity stays blocked.
+            self.release_reservation(task)
 
         remove_on_failure = task.batch_id is not None and not task.batchable
 
@@ -579,6 +649,12 @@ class SimpleTaskState:
             task.status = new_status
             task.updated = time.time()
             self.update_metrics(task, config)
+            if new_status == PENDING:
+                # Start the starvation clock from the moment the task actually waits in the
+                # queue (not from when it was first created as a dependency placeholder).
+                task.waiting_since = time.time()
+                task.reserved = False
+            self._note_resource_pending(task)
 
         if new_status == FAILED:
             task.retry = time.time() + config.retry_delay
@@ -625,6 +701,8 @@ class SimpleTaskState:
         for task in delete_tasks:
             task_obj = self._tasks.pop(task)
             self._status_tasks[task_obj.status].pop(task)
+            self.release_reservation(task_obj)
+            self._resource_pending.discard(task_obj.id)
 
     def get_active_workers(self, last_active_lt=None, last_get_work_gt=None):
         for worker in self._active_workers.values():
@@ -701,6 +779,7 @@ class Scheduler:
         self._make_task = functools.partial(Task, retry_policy=self._config._get_retry_policy())
         self._worker_requests = {}
         self._paused = False
+        self._lock = threading.RLock()
 
         if self._config.batch_emails:
             self._email_batcher = BatchNotifier()
@@ -716,10 +795,13 @@ class Scheduler:
             self._email_batcher.send_email()
 
     @rpc_method()
+    @_locked
     def prune(self):
         logger.debug("Starting pruning of task graph")
         self._prune_workers()
         self._prune_tasks()
+        # Pruning may have removed the workers that a reservation was waiting for.
+        self._refresh_reservations()
         self._prune_emails()
         logger.debug("Done pruning task graph")
 
@@ -775,6 +857,7 @@ class Scheduler:
         self._state.set_batcher(worker, task_family, batched_args, max_batch_size)
 
     @rpc_method()
+    @_locked
     def forgive_failures(self, task_id=None):
         status = PENDING
         task = self._state.get_task(task_id)
@@ -789,6 +872,7 @@ class Scheduler:
         return {"task_id": task_id, "status": task.status}
 
     @rpc_method()
+    @_locked
     def mark_as_done(self, task_id=None):
         status = DONE
         task = self._state.get_task(task_id)
@@ -802,6 +886,7 @@ class Scheduler:
         return {"task_id": task_id, "status": task.status}
 
     @rpc_method()
+    @_locked
     def add_task(
         self,
         task_id=None,
@@ -943,7 +1028,16 @@ class Scheduler:
             task.deps.update(new_deps)
 
         if resources is not None:
+            changed = task.resources != resources
             task.resources = resources
+            if changed and getattr(task, "waiting_since", None) is not None:
+                # A different requirement means a different wait; start it over.
+                task.waiting_since = time.time()
+                self._state.release_reservation(task)
+
+        # Resources might have been declared after the task was created (common when a
+        # dependency placeholder is filled in later), so refresh the index here as well.
+        self._state._note_resource_pending(task)
 
         if worker.enabled and not assistant:
             task.stakeholders.add(worker_id)
@@ -1036,32 +1130,162 @@ class Scheduler:
             self._paused = False
 
     @rpc_method()
+    @_locked
     def update_resources(self, **resources):
         if self._resources is None:
             self._resources = {}
         self._resources.update(resources)
+        self._discard_impossible_reservations()
 
     @rpc_method()
+    @_locked
     def update_resource(self, resource, amount):
         if not isinstance(amount, int) or amount < 0:
             return False
         self._resources[resource] = amount
+        self._discard_impossible_reservations()
         return True
+
+    def _discard_impossible_reservations(self):
+        """Drop reservations that can no longer fit, e.g. after capacity was lowered."""
+        for task_id, reservation in list(self._state._reservations.items()):
+            task = self._state.get_task(task_id)
+            if task is None or not self._reservation_fits(reservation, self._reserved_resources(excluding_task_id=task_id)):
+                self._state._reservations.pop(task_id, None)
+                if task is not None:
+                    task.reserved = False
 
     def _generate_retry_policy(self, task_retry_policy_dict):
         retry_policy_dict = self._config._get_retry_policy()._asdict()
         retry_policy_dict.update({k: v for k, v in task_retry_policy_dict.items() if v is not None})
         return RetryPolicy(**retry_policy_dict)
 
-    def _has_resources(self, needed_resources, used_resources):
+    def _has_resources(self, needed_resources, used_resources, reserved_resources=None):
         if needed_resources is None:
             return True
 
         available_resources = self._resources or {}
         for resource, amount in needed_resources.items():
-            if amount + used_resources[resource] > available_resources.get(resource, 1):
+            reserved = (reserved_resources or {}).get(resource, 0)
+            if amount + used_resources[resource] + reserved > available_resources.get(resource, 1):
                 return False
         return True
+
+    def _reserved_resources(self, excluding_task_id=None):
+        """
+        Capacity currently promised to starving tasks.
+
+        Reservations withheld by the task itself are ignored, since that task is the one
+        trying to claim its reservation.
+        """
+        reserved_resources = collections.defaultdict(int)
+        for task_id, reservation in self._state._reservations.items():
+            if task_id == excluding_task_id:
+                continue
+            for resource, amount in reservation.items():
+                reserved_resources[resource] += amount
+        return reserved_resources
+
+    def _without_reservation(self, reserved_resources, task_id):
+        """Copy of ``reserved_resources`` with ``task_id``'s own reservation removed."""
+        own = self._state._reservations.get(task_id)
+        if not own:
+            return reserved_resources
+        result = dict(reserved_resources)
+        for resource, amount in own.items():
+            remaining = result.get(resource, 0) - amount
+            if remaining > 0:
+                result[resource] = remaining
+            else:
+                result.pop(resource, None)
+        return result
+
+    def _reservation_fits(self, needed_resources, reserved_resources):
+        """
+        Whether a starving task can be promised its whole resource requirement.
+
+        Current usage is deliberately ignored: the whole point of the reservation is to
+        stop *new* tasks from taking capacity that is about to be released.
+        """
+        if not needed_resources:
+            return False
+        available_resources = self._resources or {}
+        for resource, amount in needed_resources.items():
+            if amount > available_resources.get(resource, 1):
+                return False  # impossible to ever satisfy, so reserving would block everyone
+            if amount + reserved_resources[resource] > available_resources.get(resource, 1):
+                return False
+        return True
+
+    def _refresh_reservations(self, now=None):
+        """
+        Grant reservations to tasks that have been waiting for their resources too long.
+
+        Reservations are handed out in arrival order. Once granted, a reservation is kept
+        until the task leaves the pending state (gets run, fails, is cancelled or pruned).
+        """
+        now = time.time() if now is None else now
+        reservations = self._state._reservations
+
+        # Reservations are only useful if the task can actually be run by some live worker.
+        # Otherwise a dead worker could block unrelated work forever.
+        activity_limit = now - self._config.worker_disconnect_delay
+        for task_id in list(reservations):
+            task = self._state.get_task(task_id)
+            if task is None or task.status != PENDING or not self._has_active_worker(task, activity_limit):
+                reservations.pop(task_id, None)
+                if task is not None:
+                    task.reserved = False
+
+        delay = self._config.resource_starvation_delay
+        if delay is None or delay <= 0:
+            return
+
+        reserved_resources = self._reserved_resources()
+        used_resources = self._used_resources()
+        starving_tasks = []
+        for task_id in list(self._state._resource_pending):
+            task = self._state.get_task(task_id)
+            if task is None or task.status != PENDING or not task.resources:
+                self._state._resource_pending.discard(task_id)
+                continue
+            if task_id in reservations:
+                continue
+            if not self._schedulable(task):
+                continue
+            # Only reserve when the task actually cannot run right now. A task that fits
+            # comfortably should just be scheduled by the normal rules.
+            if self._has_resources(task.resources, used_resources):
+                continue
+            if not self._has_active_worker(task, activity_limit):
+                continue
+            waiting_since = getattr(task, "waiting_since", None)
+            if waiting_since is None:
+                task.waiting_since = now
+                continue
+            if now - waiting_since < delay:
+                continue
+            starving_tasks.append(task)
+
+        # First come, first served. This is what makes the wait of a starving task finite.
+        starving_tasks.sort(key=lambda task: (getattr(task, "waiting_since", now), task.id))
+        for task in starving_tasks:
+            if self._reservation_fits(task.resources, reserved_resources):
+                reservations[task.id] = dict(task.resources)
+                task.reserved = True
+                for resource, amount in task.resources.items():
+                    reserved_resources[resource] += amount
+                logger.debug("Reserved %r for starving task %r", task.resources, task.id)
+
+    def _has_active_worker(self, task, activity_limit):
+        # Any recent sign of life is enough (ping, add_task or get_work). Requiring a recent
+        # get_work would drop the reservation of a task whose workers are all busy running
+        # other work, which is exactly the situation reservations are meant to handle.
+        for worker_id in task.workers:
+            worker = self._state._active_workers.get(worker_id)
+            if worker is not None and worker.last_active > activity_limit:
+                return True
+        return False
 
     def _used_resources(self):
         used_resources = collections.defaultdict(int)
@@ -1136,6 +1360,7 @@ class Scheduler:
         }
 
     @rpc_method(allow_null=False)
+    @_locked
     def get_work(self, host=None, assistant=False, current_tasks=None, worker=None, **kwargs):
         # TODO: remove any expired nodes
 
@@ -1181,6 +1406,10 @@ class Scheduler:
             # batch running tasks that weren't claimed since the last get_work go back in the pool
             self._reset_orphaned_batch_running_tasks(worker_id)
 
+        # Recompute who is starving before this claim is evaluated. Doing it here (rather
+        # than on a timer) makes the guarantee independent of the scheduler's prune cycle.
+        self._refresh_reservations()
+
         greedy_resources = collections.defaultdict(int)
 
         worker = self._state.get_worker(worker_id)
@@ -1199,7 +1428,12 @@ class Scheduler:
         tasks = list(relevant_tasks)
         tasks.sort(key=self._rank, reverse=True)
 
+        # Recomputed once per claim; reservations only change through _refresh_reservations.
+        reserved_resources = self._reserved_resources()
+
         for task in tasks:
+            # Reservations are few and small, so subtracting this task's own is cheap.
+            reserved_for_task = self._without_reservation(reserved_resources, task.id)
             if (
                 best_task
                 and batched_params
@@ -1221,9 +1455,12 @@ class Scheduler:
                 for resource, amount in (getattr(task, "resources_running", task.resources) or {}).items():
                     greedy_resources[resource] += amount
 
-            if self._schedulable(task) and self._has_resources(task.resources, greedy_resources):
+            # A task may claim capacity that is reserved for a *different* starving task
+            # only up to the unreserved part of its demand. Its own reservation never
+            # blocks it.
+            if self._schedulable(task) and self._has_resources(task.resources, greedy_resources, reserved_for_task):
                 in_workers = (assistant and task.runnable) or worker_id in task.workers
-                if in_workers and self._has_resources(task.resources, used_resources):
+                if in_workers and self._has_resources(task.resources, used_resources, reserved_for_task):
                     best_task = task
                     batch_param_names, max_batch_size = self._state.get_batcher(worker_id, task.family)
                     if batch_param_names and task.is_batchable():
@@ -1234,6 +1471,11 @@ class Scheduler:
                         except KeyError:
                             batched_params, unbatched_params = None, None
                 else:
+                    if not self._has_resources(task.resources, collections.defaultdict(int), reserved_for_task):
+                        # The task cannot run for anyone right now because its capacity is
+                        # reserved. Simulating it as consuming resources would wrongly make
+                        # the greedy pass believe the reserved units are still taken.
+                        continue
                     workers = itertools.chain(task.workers, [worker_id]) if assistant else task.workers
                     for task_worker in workers:
                         if greedy_workers.get(task_worker, 0) > 0:
@@ -1621,6 +1863,7 @@ class Scheduler:
             return {"taskId": task_id, "progressPercentage": None}
 
     @rpc_method()
+    @_locked
     def decrease_running_task_resources(self, task_id, decrease_resources):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
