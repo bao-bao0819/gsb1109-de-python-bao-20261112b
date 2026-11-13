@@ -74,6 +74,6 @@ if __name__ == '__main__':
             'Topic :: Software Development :: Localization',
             'Topic :: Text Processing :: Linguistic'
         ],
-        py_modules=['polib']
+        py_modules=['polib', 'po_impact']
     )
 

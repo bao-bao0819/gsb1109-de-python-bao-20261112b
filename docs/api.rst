@@ -33,6 +33,23 @@ The ``unescape`` function
 .. autofunction:: polib.unescape
 
 
+The translation impact helpers
+------------------------------
+
+.. autofunction:: polib.analyze_impact
+
+.. autofunction:: polib.affected_modules
+
+.. autoclass:: polib.PathMapping
+    :members:
+
+.. autoclass:: polib.PathMappingEntry
+    :members:
+
+.. autoclass:: polib.ImpactReport
+    :members:
+
+
 The ``POFile`` class
 --------------------
 

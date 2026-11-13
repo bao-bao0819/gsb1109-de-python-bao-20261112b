@@ -1,0 +1,31 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#: legacy/common/shared.py:10 legacy/beta/only.py:20
+msgid "Shared message"
+msgstr "Message partagé"
+
+#: legacy/alpha/moved.py:30
+msgid "Moved only"
+msgstr "Déplacé seulement"
+
+#: legacy/alpha/changed.py:40
+msgid "Changed translation"
+msgstr "Ancienne traduction"
+
+#: legacy/common/dropped.py:50 legacy/beta/shared.py:60
+msgid "Dropped from one module"
+msgstr "Partagé entre deux modules"
+
+#: legacy/gamma/removed.py:70
+msgid "Removed message"
+msgstr "Message supprimé"
+
+#: legacy/split/item.py:80
+msgid "Ambiguous split"
+msgstr "Réparti"
+
+#: legacy/split/unique_old.py:85
+msgid "Split changed"
+msgstr "Avant répartition"

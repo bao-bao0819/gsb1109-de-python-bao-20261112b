@@ -1,0 +1,31 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#: new/common/shared.py:11 new/beta/only.py:21
+msgid "Shared message"
+msgstr "Message partagé"
+
+#: new/alpha/moved.py:99
+msgid "Moved only"
+msgstr "Déplacé seulement"
+
+#: new/alpha/changed.py:41
+msgid "Changed translation"
+msgstr "Nouvelle traduction"
+
+#: new/beta/shared.py:61
+msgid "Dropped from one module"
+msgstr "Partagé entre deux modules"
+
+#: new/common/new.py:75
+msgid "New message"
+msgstr "Nouveau message"
+
+#: new/split-a/item.py:81
+msgid "Ambiguous split"
+msgstr "Réparti"
+
+#: new/split-a/unique_new.py:86
+msgid "Split changed"
+msgstr "Après répartition"

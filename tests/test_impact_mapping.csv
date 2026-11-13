@@ -1,0 +1,7 @@
+old,new
+legacy/common/,new/common/
+legacy/alpha/,new/alpha/
+legacy/beta/,new/beta/
+legacy/gamma/,new/gamma/
+legacy/split/,new/split-a/
+legacy/split/,new/split-b/

@@ -231,3 +231,51 @@ Reverse a mo file to a po file::
     # or to save the mo file as an po file
     mo.save_as_pofile('path/to/catalog.po')
 
+
+Reporting modules affected by message changes
+---------------------------------------------
+
+When a refactor moves source files, a PO catalog can change a lot without any
+message text changing. :func:`~polib.analyze_impact` compares two catalogs and
+reports affected modules using message identity and occurrences.
+
+Message identity is ``msgctxt`` + ``msgid`` + ``msgid_plural``. Translations,
+occurrences, comments and line numbers are not part of the identity, so moving
+a message to another file or line is not reported as a text change. A message
+shared by several modules is only marked for retranslation when one of its
+remaining modules has a different translation; removing one user does not force
+the other modules to retranslate it.
+
+Occurrences are mapped through an old-to-new path table. The table may be a
+CSV/TSV file with optional ``old,new,module`` header, a JSON file or a Python
+mapping::
+
+    import polib
+
+    report = polib.analyze_impact(
+        'catalog-before.po',
+        'catalog-after.po',
+        [
+            ('legacy/accounts/', 'app/accounts/'),
+            ('legacy/shared/', 'app/common/'),
+        ]
+    )
+    print(report['summary']['retranslate_modules'])
+    print(report.to_text())
+
+The same analysis is available from the command line::
+
+    python po_impact.py catalog-before.po catalog-after.po mapping.csv
+
+Use ``--format json`` for machine-readable output and ``--output FILE`` to
+write the report to a file. Paths are resolved by longest prefix. If one old
+directory is mapped to several new directories, affected occurrences are not
+guessed: they are listed under ``ambiguous`` in the JSON report or in the
+"歧义，信息不足单列" section of the text report. Occurrences that match no
+mapping are listed under ``unmapped``.
+
+The JSON report contains ``changed`` (translation changes, additions and
+removals), ``location_only`` (a message kept its translation but changed
+modules), ``moved_only`` (only files or line numbers moved), ``modules``
+(per-module detail), ``ambiguous``, ``unmapped`` and ``summary``.
+

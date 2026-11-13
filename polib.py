@@ -1,4 +1,4 @@
-# -* coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 #
 # License: MIT (see LICENSE file provided)
 # vim: set expandtab tabstop=4 shiftwidth=4 softtabstop=4:
@@ -12,8 +12,11 @@ modify entries, comments or metadata, etc. or create new po files from scratch.
 :func:`~polib.mofile` convenience functions.
 """
 
+import argparse
 import array
 import codecs
+import csv
+import json
 import os
 import re
 import struct
@@ -25,7 +28,9 @@ import io
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'default_encoding', 'escape', 'unescape', 'detect_encoding',
+           'PathMapping', 'PathMappingEntry', 'ImpactReport',
+           'impact', 'analyze_impact', 'affected_modules', 'main', ]
 
 
 # the default encoding to use when encoding cannot be detected
@@ -1236,6 +1241,769 @@ class MOEntry(_BaseEntry):
 
     def __hash__(self):
         return hash((self.msgid, self.msgstr))
+
+# }}}
+# translation impact analysis {{{
+
+
+def _normalize_path(path, keep_trailing=False):
+    """
+    Normalize a path used in a PO occurrence or a path mapping.
+    """
+    if path is None:
+        return ''
+    if not isinstance(path, text_type):
+        path = text_type(path)
+    path = path.replace('\\', '/')
+    while path.startswith('./'):
+        path = path[2:]
+    if keep_trailing and path.endswith('/') and path != '/':
+        path = path.rstrip('/') + '/'
+    elif len(path) > 1:
+        path = path.rstrip('/')
+    return path
+
+
+def _path_is_under(path, root):
+    if root == '/':
+        return path.startswith('/')
+    return path == root or path.startswith(root + '/')
+
+
+def _path_basename(path):
+    if '/' not in path:
+        return path
+    return path.rsplit('/', 1)[1]
+
+
+def _default_module(path):
+    """
+    Return the module root for a mapping target. A trailing slash or a target
+    that does not look like a filename is considered a directory. Mappings that
+    point at individual files may provide an explicit module as third column.
+    """
+    if path.endswith('/'):
+        return path.rstrip('/') or '/'
+    name = _path_basename(path)
+    if re.search(r'\.[A-Za-z0-9_+-]{1,10}$', name):
+        parent = path.rsplit('/', 1)[0]
+        return parent or '.'
+    return path
+
+
+class PathMappingEntry(object):
+    """
+    A single old path to new path correspondence.
+
+    ``module`` is optional and defaults to the mapping target. It is useful
+    when the table maps individual files but the report should be grouped by
+    their containing module directory.
+    """
+
+    def __init__(self, old, new, module=None):
+        self.old = _normalize_path(old, keep_trailing=True)
+        self.new = _normalize_path(new, keep_trailing=True)
+        if not self.old or not self.new:
+            raise ValueError('mapping paths must not be empty')
+        if module:
+            module = _normalize_path(module)
+        if module is None:
+            if self.new.endswith('/'):
+                module = self.new.rstrip('/') or '/'
+            else:
+                module = _default_module(self.new)
+        self.module = module
+
+    def as_dict(self):
+        return {'old': self.old, 'new': self.new, 'module': self.module}
+
+    def __repr__(self):
+        return 'PathMappingEntry(%r, %r, %r)' % (
+            self.old, self.new, self.module
+        )
+
+
+class PathMapping(object):
+    """
+    Old path to new path correspondences, resolved with longest-prefix
+    matching. The same old directory may be mapped to several new directories;
+    such occurrences are reported as ambiguous rather than guessed.
+    """
+
+    def __init__(self, entries=None):
+        self.entries = []
+        if entries is None:
+            return
+        if isinstance(entries, PathMapping):
+            for entry in entries.entries:
+                self.add(entry.old, entry.new, entry.module)
+            return
+        if isinstance(entries, dict):
+            for old in sorted(entries):
+                value = entries[old]
+                if isinstance(value, (list, tuple)) and not \
+                        isinstance(value, text_type):
+                    for item in value:
+                        if isinstance(item, dict):
+                            self.add(old, item.get('new'), item.get('module'))
+                        elif isinstance(item, (list, tuple)):
+                            self.add(old, item[0],
+                                     item[1] if len(item) > 1 else None)
+                        else:
+                            self.add(old, item)
+                else:
+                    self.add(old, value)
+            return
+        for item in entries:
+            if isinstance(item, PathMappingEntry):
+                self.add(item.old, item.new, item.module)
+            elif isinstance(item, dict):
+                self.add(item.get('old'), item.get('new'), item.get('module'))
+            elif isinstance(item, (list, tuple)):
+                if len(item) not in (2, 3):
+                    raise ValueError('mapping rows must have 2 or 3 columns')
+                self.add(item[0], item[1],
+                         item[2] if len(item) == 3 else None)
+            else:
+                raise ValueError('invalid mapping entry: %r' % (item,))
+
+    def add(self, old, new, module=None):
+        entry = PathMappingEntry(old, new, module)
+        for existing in self.entries:
+            if existing.old == entry.old and existing.new == entry.new and \
+                    existing.module == entry.module:
+                return
+        self.entries.append(entry)
+
+    @classmethod
+    def from_file(cls, path):
+        """
+        Load a mapping from a CSV/TSV file or a JSON file. CSV files may have
+        an optional header and two or three columns: old, new, module.
+        """
+        if path.lower().endswith('.json'):
+            with io.open(path, 'r', encoding='utf-8-sig') as handle:
+                data = json.load(handle)
+            return cls(data)
+        with io.open(path, 'r', encoding='utf-8-sig') as handle:
+            sample = handle.read(4096)
+            handle.seek(0)
+            if '\t' in sample and ',' not in sample:
+                delimiter = '\t'
+            else:
+                try:
+                    delimiter = csv.Sniffer().sniff(sample, ',;\t').delimiter
+                except csv.Error:
+                    delimiter = ','
+            rows = list(csv.reader(handle, delimiter=delimiter))
+        entries = []
+        for row in rows:
+            if not row:
+                continue
+            row = [cell.strip() for cell in row]
+            if not any(row):
+                continue
+            if row[0].startswith('#'):
+                continue
+            lowered = [cell.lower() for cell in row[:3]]
+            if lowered and lowered[0] in ('old', 'before', 'from', u'旧',
+                                          u'旧路径'):
+                continue
+            if len(row) < 2:
+                raise ValueError('mapping row has less than 2 columns: %r' %
+                                 (row,))
+            entries.append((row[0], row[1],
+                            row[2] if len(row) > 2 and row[2] else None))
+        return cls(entries)
+
+    def _match(self, path, side):
+        path = _normalize_path(path)
+        candidates = []
+        for entry in self.entries:
+            root = _normalize_path(getattr(entry, side))
+            if _path_is_under(path, root):
+                candidates.append((len(root), entry))
+        if not candidates:
+            return {'path': path, 'matched': False, 'modules': (),
+                    'candidates': (), 'ambiguous': False}
+        best_len = max(item[0] for item in candidates)
+        best = [item[1] for item in candidates if item[0] == best_len]
+        modules = sorted(set(entry.module for entry in best))
+        return {
+            'path': path,
+            'matched': True,
+            'modules': tuple(modules),
+            'candidates': tuple(modules),
+            'ambiguous': len(modules) > 1,
+        }
+
+    def resolve_old(self, path):
+        return self._match(path, 'old')
+
+    def resolve_new(self, path):
+        return self._match(path, 'new')
+
+    def ambiguous_splits(self):
+        """
+        Return old directories that are mapped to more than one module.
+        """
+        groups = {}
+        for entry in self.entries:
+            groups.setdefault(_normalize_path(entry.old), set()).add(
+                entry.module
+            )
+        result = []
+        for old in sorted(groups):
+            modules = sorted(groups[old])
+            if len(modules) > 1:
+                result.append({'old': old, 'new': modules})
+        return result
+
+    def as_list(self):
+        return [entry.as_dict() for entry in self.entries]
+
+
+class _MessageUsage(object):
+    def __init__(self, identity):
+        self.identity = identity
+        self.entries = []
+        self.occurrences = []
+
+
+class ImpactReport(object):
+    """
+    The result of :func:`analyze_impact`. It behaves like a read-only
+    dictionary and can render itself as JSON or as a text report.
+    """
+
+    def __init__(self, data):
+        self.data = data
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def keys(self):
+        return self.data.keys()
+
+    def as_dict(self):
+        return self.data
+
+    def to_json(self, indent=2):
+        return json.dumps(self.data, ensure_ascii=False, indent=indent,
+                          sort_keys=True)
+
+    def to_text(self):
+        return _format_impact_text(self.data)
+
+
+def _as_pofile(value):
+    if isinstance(value, _BaseFile):
+        return value
+    if isinstance(value, dict) and 'pofile' in value:
+        value = value['pofile']
+    return pofile(value)
+
+
+def _as_mapping(mapping):
+    if isinstance(mapping, PathMapping):
+        return mapping
+    if isinstance(mapping, (text_type, str)):
+        return PathMapping.from_file(mapping)
+    return PathMapping(mapping)
+
+
+def _message_key(entry):
+    return (entry.msgctxt or '', entry.msgid, entry.msgid_plural or '')
+
+
+def _identity_dict(identity):
+    return {
+        'msgctxt': identity[0] or None,
+        'msgid': identity[1],
+        'msgid_plural': identity[2] or None,
+    }
+
+
+def _translation_dict(entry):
+    plural = {}
+    for index in sorted(entry.msgstr_plural):
+        plural[text_type(index)] = entry.msgstr_plural[index]
+    return {'msgstr': entry.msgstr, 'msgstr_plural': plural}
+
+
+def _translation_signature(entry):
+    plural = tuple(
+        (text_type(index), entry.msgstr_plural[index])
+        for index in sorted(entry.msgstr_plural)
+    )
+    return (entry.msgstr, plural)
+
+
+def _usage_signatures(usage):
+    signatures = []
+    for entry in usage.entries:
+        signature = _translation_signature(entry)
+        if signature not in signatures:
+            signatures.append(signature)
+    signatures.sort()
+    return tuple(signatures)
+
+
+def _index_entries(pofile_obj):
+    index = {}
+    for entry in pofile_obj:
+        if entry.obsolete:
+            continue
+        key = _message_key(entry)
+        usage = index.get(key)
+        if usage is None:
+            usage = _MessageUsage(key)
+            index[key] = usage
+        usage.entries.append(entry)
+        usage.occurrences.extend(entry.occurrences)
+    return index
+
+
+def _normalized_occurrences(occurrences):
+    result = []
+    for path, line in occurrences:
+        if line is None:
+            line = ''
+        result.append((_normalize_path(path), text_type(line)))
+    result.sort()
+    return result
+
+
+def _resolve_usage(usage, mapping, side):
+    modules = set()
+    occurrences = []
+    ambiguous = []
+    unmapped = []
+    for path, line in _normalized_occurrences(usage.occurrences):
+        occurrences.append({'path': path, 'line': line})
+        if side == 'old':
+            resolution = mapping.resolve_old(path)
+        else:
+            resolution = mapping.resolve_new(path)
+        if not resolution['matched']:
+            unmapped.append({
+                'identity': _identity_dict(usage.identity),
+                'side': 'before' if side == 'old' else 'after',
+                'path': path,
+                'line': line,
+            })
+        elif resolution['ambiguous']:
+            ambiguous.append({
+                'identity': _identity_dict(usage.identity),
+                'side': 'before' if side == 'old' else 'after',
+                'path': path,
+                'line': line,
+                'candidates': list(resolution['candidates']),
+            })
+        else:
+            modules.update(resolution['modules'])
+    return {
+        'modules': sorted(modules),
+        'occurrences': occurrences,
+        'ambiguous': ambiguous,
+        'unmapped': unmapped,
+    }
+
+
+def _usage_dict(usage, resolved):
+    if usage is None:
+        return None
+    entry = usage.entries[0]
+    data = _translation_dict(entry)
+    data['occurrences'] = resolved['occurrences']
+    data['modules'] = resolved['modules']
+    data['ambiguous_occurrences'] = resolved['ambiguous']
+    data['unmapped_occurrences'] = resolved['unmapped']
+    if len(usage.entries) > 1:
+        data['duplicate_entries'] = len(usage.entries)
+    return data
+
+
+def _identity_label(identity):
+    msgid = identity['msgid']
+    if msgid == '':
+        msgid = u'(header)'
+    msgid = msgid.replace(u'\n', u'\\n')
+    if len(msgid) > 60:
+        msgid = msgid[:57] + u'...'
+    label = u'"%s"' % msgid
+    if identity.get('msgid_plural'):
+        plural = identity['msgid_plural'].replace(u'\n', u'\\n')
+        if len(plural) > 40:
+            plural = plural[:37] + u'...'
+        label += u' / "%s"' % plural
+    if identity.get('msgctxt'):
+        context = identity['msgctxt'].replace(u'\n', u'\\n')
+        label += u' [ctx: %s]' % context
+    return label
+
+
+def _format_translation(value):
+    if not value:
+        return u'""'
+    if value.get('msgstr_plural'):
+        parts = []
+        for index in sorted(value['msgstr_plural'],
+                            key=lambda item: int(item)):
+            parts.append(u'[%s] %r' % (index, value['msgstr_plural'][index]))
+        return u' '.join(parts)
+    return repr(value.get('msgstr', ''))
+
+
+def _format_impact_text(data):
+    lines = []
+    lines.append(u'文案变化: %d' % len(data['changed']))
+    for item in data['changed']:
+        label = _identity_label(item['identity'])
+        lines.append(u'- [%s] %s' % (item['change'], label))
+        before = item.get('before')
+        after = item.get('after')
+        if item['change'] == 'added':
+            lines.append(u'  新译文: %s' % _format_translation(after))
+        elif item['change'] == 'removed':
+            lines.append(u'  原译文: %s' % _format_translation(before))
+        else:
+            lines.append(u'  原译文: %s -> 新译文: %s' % (
+                _format_translation(before), _format_translation(after)
+            ))
+        if item.get('affected_modules'):
+            lines.append(u'  受影响模块: %s' %
+                         u', '.join(item['affected_modules']))
+        else:
+            lines.append(u'  受影响模块: (无法归属)')
+        if item.get('location_removed_modules'):
+            lines.append(u'  不再使用该文案的模块: %s' %
+                         u', '.join(item['location_removed_modules']))
+        if item.get('ambiguous'):
+            lines.append(u'  含无法唯一归属的出现位置，见歧义部分')
+    lines.append(u'')
+    lines.append(u'仅位置变化，不算文案变化: %d' % len(data['location_only']))
+    for item in data['location_only']:
+        label = _identity_label(item['identity'])
+        lines.append(u'- %s' % label)
+        if item.get('location_added_modules'):
+            lines.append(u'  新增使用模块: %s' %
+                         u', '.join(item['location_added_modules']))
+        if item.get('location_removed_modules'):
+            lines.append(u'  移除使用模块: %s' %
+                         u', '.join(item['location_removed_modules']))
+    lines.append(u'')
+    lines.append(u'仅移动文件或行号: %d' % len(data['moved_only']))
+    for item in data['moved_only']:
+        lines.append(u'- %s' % _identity_label(item['identity']))
+    lines.append(u'')
+    ambiguous = data['ambiguous']
+    lines.append(u'歧义，信息不足单列: %d' % (
+        len(ambiguous['mappings']) + len(ambiguous['occurrences'])
+    ))
+    for item in ambiguous['mappings']:
+        lines.append(u'- 旧目录 %s 同时映射到: %s' % (
+            item['old'], u', '.join(item['new'])
+        ))
+    for item in ambiguous['occurrences']:
+        lines.append(u'- [%s] %s:%s 可能属于: %s' % (
+            item['side'], item['path'], item['line'],
+            u', '.join(item['candidates'])
+        ))
+    lines.append(u'')
+    lines.append(u'未映射路径: %d' % len(data['unmapped']))
+    for item in data['unmapped']:
+        lines.append(u'- [%s] %s:%s' % (
+            item['side'], item['path'], item['line']
+        ))
+    lines.append(u'')
+    summary = data['summary']
+    lines.append(u'模块汇总')
+    if summary['affected_modules']:
+        for module in summary['affected_modules']:
+            detail = data['modules'][module]
+            parts = []
+            for key, label in (
+                    ('translation_changed', u'译文变更'),
+                    ('added', u'新增文案'),
+                    ('removed', u'移除文案'),
+                    ('location_added', u'新增使用'),
+                    ('location_removed', u'移除使用')):
+                if detail[key]:
+                    parts.append(u'%s %d' % (label, len(detail[key])))
+            lines.append(u'- %s: %s' % (module, u'; '.join(parts)))
+    else:
+        lines.append(u'- (无)')
+    lines.append(u'需要重译的模块: %s' % (
+        u', '.join(summary['retranslate_modules']) or u'(无)'
+    ))
+    lines.append(u'仅位置变化的消息: %d' % summary['location_only_messages'])
+    lines.append(u'仅移动文件或行号: %d' % summary['moved_only_messages'])
+    lines.append(u'未映射出现位置: %d' % summary['unmapped_occurrences'])
+    lines.append(u'歧义出现位置: %d' % summary['ambiguous_occurrences'])
+    return u'\n'.join(lines) + u'\n'
+
+
+def analyze_impact(before, after, mapping):
+    """
+    Compare two PO files and report which modules are affected by message
+    changes.
+
+    ``before`` and ``after`` may be paths, PO file contents or
+    :class:`~polib.POFile` instances. ``mapping`` may be a
+    :class:`PathMapping`, a CSV/TSV/JSON path, a dictionary or a list of
+    ``(old_path, new_path[, module])`` rows.
+
+    Message identity is context + msgid + msgid_plural. Translations,
+    occurrences, comments and line numbers are not part of the identity.
+    Consequently a pure file or line move is not a text change. Modules are
+    derived only from occurrences, so messages without an attributable
+    occurrence are reported separately rather than assigned to a guessed
+    module.
+    """
+    before_po = _as_pofile(before)
+    after_po = _as_pofile(after)
+    mapping = _as_mapping(mapping)
+
+    before_index = _index_entries(before_po)
+    after_index = _index_entries(after_po)
+    keys = sorted(set(before_index) | set(after_index))
+
+    changed = []
+    location_only = []
+    moved_only = []
+    ambiguous_occurrences = []
+    unmapped_occurrences = []
+    module_impact = {}
+
+    def add_impact(module, category, identity):
+        detail = module_impact.get(module)
+        if detail is None:
+            detail = {
+                'translation_changed': set(),
+                'added': set(),
+                'removed': set(),
+                'location_added': set(),
+                'location_removed': set(),
+            }
+            module_impact[module] = detail
+        detail[category].add(identity)
+
+    for key in keys:
+        before_usage = before_index.get(key)
+        after_usage = after_index.get(key)
+        before_resolved = _resolve_usage(before_usage, mapping, 'old') \
+            if before_usage is not None else None
+        after_resolved = _resolve_usage(after_usage, mapping, 'new') \
+            if after_usage is not None else None
+
+        if before_resolved is not None:
+            ambiguous_occurrences.extend(before_resolved['ambiguous'])
+            unmapped_occurrences.extend(before_resolved['unmapped'])
+        if after_resolved is not None:
+            ambiguous_occurrences.extend(after_resolved['ambiguous'])
+            unmapped_occurrences.extend(after_resolved['unmapped'])
+
+        before_modules = set(before_resolved['modules']) \
+            if before_resolved is not None else set()
+        after_modules = set(after_resolved['modules']) \
+            if after_resolved is not None else set()
+        before_ambiguous = bool(before_resolved and
+                                before_resolved['ambiguous'])
+        after_ambiguous = bool(after_resolved and
+                               after_resolved['ambiguous'])
+
+        identity = _identity_dict(key)
+        item = {
+            'identity': identity,
+            'before': _usage_dict(before_usage, before_resolved),
+            'after': _usage_dict(after_usage, after_resolved),
+        }
+
+        if before_usage is not None and after_usage is not None:
+            before_signature = _usage_signatures(before_usage)
+            after_signature = _usage_signatures(after_usage)
+            if before_signature != after_signature:
+                item['change'] = 'translation_changed'
+                item['affected_modules'] = sorted(after_modules)
+                item['location_removed_modules'] = sorted(
+                    before_modules - after_modules
+                )
+                item['location_added_modules'] = sorted(
+                    after_modules - before_modules
+                )
+                item['ambiguous'] = before_ambiguous or after_ambiguous
+                changed.append(item)
+                for module in after_modules:
+                    add_impact(module, 'translation_changed', key)
+                for module in before_modules - after_modules:
+                    add_impact(module, 'location_removed', key)
+            else:
+                if before_ambiguous or after_ambiguous:
+                    continue
+                added_modules = after_modules - before_modules
+                removed_modules = before_modules - after_modules
+                before_occ = _normalized_occurrences(
+                    before_usage.occurrences
+                )
+                after_occ = _normalized_occurrences(after_usage.occurrences)
+                occurrence_changed = before_occ != after_occ
+                if added_modules or removed_modules:
+                    item['change'] = 'location_only'
+                    item['affected_modules'] = []
+                    item['location_added_modules'] = sorted(added_modules)
+                    item['location_removed_modules'] = sorted(removed_modules)
+                    location_only.append(item)
+                    for module in added_modules:
+                        add_impact(module, 'location_added', key)
+                    for module in removed_modules:
+                        add_impact(module, 'location_removed', key)
+                elif occurrence_changed and not (
+                        before_resolved['unmapped'] or
+                        after_resolved['unmapped']):
+                    item['change'] = 'moved'
+                    item['affected_modules'] = []
+                    item['location_added_modules'] = []
+                    item['location_removed_modules'] = []
+                    moved_only.append(item)
+        elif after_usage is not None:
+            item['change'] = 'added'
+            item['affected_modules'] = sorted(after_modules)
+            item['ambiguous'] = after_ambiguous
+            changed.append(item)
+            for module in after_modules:
+                add_impact(module, 'added', key)
+        else:
+            item['change'] = 'removed'
+            item['affected_modules'] = sorted(before_modules)
+            item['ambiguous'] = before_ambiguous
+            changed.append(item)
+            for module in before_modules:
+                add_impact(module, 'removed', key)
+
+    modules = {}
+    for module in sorted(module_impact):
+        detail = module_impact[module]
+        modules[module] = {}
+        for category in ('translation_changed', 'added', 'removed',
+                         'location_added', 'location_removed'):
+            modules[module][category] = [
+                _identity_dict(key) for key in sorted(detail[category])
+            ]
+
+    text_modules = set()
+    removed_modules = set()
+    location_modules = set()
+    retranslate_modules = set()
+    for module, detail in modules.items():
+        if detail['translation_changed'] or detail['added']:
+            text_modules.add(module)
+            retranslate_modules.add(module)
+        if detail['removed']:
+            removed_modules.add(module)
+        if detail['location_added'] or detail['location_removed']:
+            location_modules.add(module)
+
+    data = {
+        'before': {
+            'messages': len(before_index),
+            'occurrences': sum(
+                len(usage.occurrences) for usage in before_index.values()
+            ),
+        },
+        'after': {
+            'messages': len(after_index),
+            'occurrences': sum(
+                len(usage.occurrences) for usage in after_index.values()
+            ),
+        },
+        'mapping': mapping.as_list(),
+        'changed': changed,
+        'location_only': location_only,
+        'moved_only': moved_only,
+        'ambiguous': {
+            'mappings': mapping.ambiguous_splits(),
+            'occurrences': ambiguous_occurrences,
+        },
+        'unmapped': unmapped_occurrences,
+        'modules': modules,
+        'affected_modules': sorted(modules),
+        'summary': {
+            'changed_messages': len(changed),
+            'added_messages': len([item for item in changed
+                                   if item['change'] == 'added']),
+            'removed_messages': len([item for item in changed
+                                     if item['change'] == 'removed']),
+            'translation_changed_messages': len([
+                item for item in changed
+                if item['change'] == 'translation_changed'
+            ]),
+            'location_only_messages': len(location_only),
+            'moved_only_messages': len(moved_only),
+            'ambiguous_occurrences': len(ambiguous_occurrences),
+            'ambiguous_mappings': len(mapping.ambiguous_splits()),
+            'unmapped_occurrences': len(unmapped_occurrences),
+            'affected_modules': sorted(modules),
+            'text_change_modules': sorted(text_modules),
+            'removed_modules': sorted(removed_modules),
+            'location_modules': sorted(location_modules),
+            'retranslate_modules': sorted(retranslate_modules),
+        },
+    }
+    return ImpactReport(data)
+
+
+def impact(before, after, mapping):
+    """
+    Shortcut for :func:`analyze_impact`.
+    """
+    return analyze_impact(before, after, mapping)
+
+
+def affected_modules(before, after, mapping):
+    """
+    Return the per-module impact details produced by
+    :func:`analyze_impact`.
+    """
+    return analyze_impact(before, after, mapping)['modules']
+
+
+def _write_report(report, output_format, output):
+    if output_format == 'json':
+        text = report.to_json() + '\n'
+    else:
+        text = report.to_text()
+    if output:
+        with io.open(output, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+    else:
+        if not PY3:
+            text = text.encode(getattr(sys.stdout, 'encoding', None)
+                               or 'utf-8')
+        sys.stdout.write(text)
+
+
+def main(argv=None):
+    """
+    Command line entry point for the translation impact report.
+    """
+    parser = argparse.ArgumentParser(
+        description='Report modules affected by PO message changes.'
+    )
+    parser.add_argument('before', help='PO file before the change')
+    parser.add_argument('after', help='PO file after the change')
+    parser.add_argument('mapping',
+                        help='old-to-new path mapping (CSV, TSV or JSON)')
+    parser.add_argument('-f', '--format', choices=('text', 'json'),
+                        default='text', help='output format (default: text)')
+    parser.add_argument('-o', '--output', help='write the report to a file')
+    args = parser.parse_args(argv)
+    report = analyze_impact(args.before, args.after, args.mapping)
+    _write_report(report, args.format, args.output)
+    return 0
 
 # }}}
 # class _POFileParser {{{

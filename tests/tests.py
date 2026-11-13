@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import codecs
+import json
 import os
 import subprocess
 import sys
@@ -875,6 +876,217 @@ msgid "foo"
 msgstr "oof"
 ''')
         self.assertEqual(mo.__unicode__(), expected)
+
+
+class TestImpact(unittest.TestCase):
+    """
+    Tests for the translation impact analysis.
+    """
+
+    def setUp(self):
+        self.report = polib.analyze_impact(
+            'tests/test_impact_before.po',
+            'tests/test_impact_after.po',
+            'tests/test_impact_mapping.csv'
+        )
+
+    def _identities(self, items):
+        return set((item['identity']['msgctxt'],
+                    item['identity']['msgid'],
+                    item['identity']['msgid_plural'])
+                   for item in items)
+
+    def test_changed_messages(self):
+        identity = self._identities(self.report['changed'])
+        self.assertIn((None, 'Changed translation', None), identity)
+        self.assertIn((None, 'New message', None), identity)
+        self.assertIn((None, 'Removed message', None), identity)
+
+    def test_moved_entries_are_not_text_changes(self):
+        identity = self._identities(self.report['changed'])
+        self.assertNotIn((None, 'Moved only', None), identity)
+        self.assertNotIn((None, 'Shared message', None), identity)
+        self.assertEqual(
+            self._identities(self.report['moved_only']),
+            set([(None, 'Moved only', None),
+                 (None, 'Shared message', None)])
+        )
+
+    def test_shared_message_with_remaining_user_is_not_retranslated(self):
+        identity = set([(None, 'Dropped from one module', None)])
+        self.assertEqual(
+            self._identities(self.report['location_only']), identity
+        )
+        modules = self.report['modules']
+        self.assertEqual(
+            [item['msgid'] for item in modules['new/common']['location_removed']],
+            ['Dropped from one module']
+        )
+        self.assertEqual(
+            [item['msgid'] for item in modules['new/common']['translation_changed']],
+            []
+        )
+        self.assertNotIn('new/beta', self.report['summary']['retranslate_modules'])
+
+    def test_translated_module_reported(self):
+        item = [entry for entry in self.report['changed']
+                if entry['identity']['msgid'] == 'Changed translation'][0]
+        self.assertEqual(item['affected_modules'], ['new/alpha'])
+
+    def test_shifted_path_is_not_a_new_location(self):
+        modules = self.report['modules']
+        self.assertNotIn('location_added',
+                         modules.get('new/beta', {}).get('location_added',
+                                                        []))
+        self.assertNotIn('location_removed',
+                         modules.get('new/beta', {}).get('location_removed',
+                                                        []))
+
+    def test_ambiguous_split_is_isolated(self):
+        ambiguous = self.report['ambiguous']
+        self.assertEqual(
+            [mapping['old'] for mapping in ambiguous['mappings']],
+            ['legacy/split']
+        )
+        self.assertEqual(
+            sorted(set(item['identity']['msgid']
+                       for item in ambiguous['occurrences'])),
+            ['Ambiguous split', 'Split changed']
+        )
+        modules = self.report['modules']
+        self.assertEqual(modules['new/split-a']['location_added'], [])
+        self.assertNotIn('new/split-b', modules)
+
+    def test_unambiguous_message_in_split_still_changes(self):
+        item = [entry for entry in self.report['changed']
+                if entry['identity']['msgid'] == 'Split changed'][0]
+        self.assertEqual(item['affected_modules'], ['new/split-a'])
+        self.assertTrue(item['ambiguous'])
+
+    def test_context_is_part_of_identity(self):
+        before = polib.POFile()
+        before.append(polib.POEntry(
+            msgid='same', msgstr='old', occurrences=[('old/a.py', '1')],
+        ))
+        before.append(polib.POEntry(
+            msgid='same', msgctxt='ctx', msgstr='ctx old',
+            occurrences=[('old/a.py', '2')],
+        ))
+        after = polib.POFile()
+        after.append(polib.POEntry(
+            msgid='same', msgstr='new', occurrences=[('new/a.py', '1')],
+        ))
+        after.append(polib.POEntry(
+            msgid='same', msgctxt='ctx', msgstr='ctx old',
+            occurrences=[('new/a.py', '2')],
+        ))
+        report = polib.analyze_impact(before, after,
+                                      [('old/', 'new/')])
+        self.assertEqual(len(report['changed']), 1)
+        self.assertEqual(report['changed'][0]['identity']['msgctxt'], None)
+        self.assertIn((u'ctx', u'same', None),
+                      [(item['identity']['msgctxt'],
+                        item['identity']['msgid'],
+                        item['identity']['msgid_plural'])
+                       for item in report['moved_only']])
+
+    def test_plural_translation_change(self):
+        before = polib.POFile()
+        before.append(polib.POEntry(
+            msgid='one', msgid_plural='many',
+            msgstr_plural={0: 'un', 1: 'plusieurs'},
+            occurrences=[('old/a.py', '1')],
+        ))
+        after = polib.POFile()
+        after.append(polib.POEntry(
+            msgid='one', msgid_plural='many',
+            msgstr_plural={0: 'un', 1: 'des'},
+            occurrences=[('new/a.py', '1')],
+        ))
+        report = polib.analyze_impact(before, after, [('old/', 'new/')])
+        self.assertEqual(len(report['changed']), 1)
+        self.assertEqual(report['changed'][0]['affected_modules'], ['new'])
+        self.assertEqual(
+            report['changed'][0]['before']['msgstr_plural']['1'],
+            'plusieurs'
+        )
+
+    def test_mapping_dict_and_longest_prefix(self):
+        mapping = {
+            'legacy/': 'new/',
+            'legacy/common/': 'new/common/',
+        }
+        report = polib.analyze_impact(
+            'tests/test_impact_before.po',
+            'tests/test_impact_after.po',
+            mapping
+        )
+        self.assertIn('legacy/common/', [
+            entry['old'] for entry in report['mapping']
+        ])
+        modules = report['modules']
+        self.assertIn('new/common', modules)
+        self.assertIn('new', modules)
+        self.assertEqual(
+            [item['msgid'] for item in modules['new/common']['location_removed']],
+            ['Dropped from one module']
+        )
+
+    def test_mapping_json_file(self):
+        mapping = [{'old': 'legacy/alpha/', 'new': 'new/alpha/'}]
+        handle = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.json', delete=False
+        )
+        try:
+            handle.write(json.dumps(mapping))
+            handle.close()
+            report = polib.analyze_impact(
+                'tests/test_impact_before.po',
+                'tests/test_impact_after.po',
+                handle.name
+            )
+            self.assertEqual(report['mapping'],
+                             [{'old': 'legacy/alpha/',
+                               'new': 'new/alpha/',
+                               'module': 'new/alpha'}])
+        finally:
+            os.remove(handle.name)
+
+    def test_unmapped_occurrences_are_reported(self):
+        before = polib.POFile()
+        before.append(polib.POEntry(
+            msgid='orphan', msgstr='old', occurrences=[('elsewhere/a.py', '1')],
+        ))
+        after = polib.POFile()
+        after.append(polib.POEntry(
+            msgid='orphan', msgstr='new', occurrences=[('elsewhere/a.py', '1')],
+        ))
+        report = polib.analyze_impact(before, after, [('old/', 'new/')])
+        self.assertEqual(len(report['unmapped']), 2)
+        self.assertEqual(report['changed'][0]['affected_modules'], [])
+
+    def test_report_serialization(self):
+        data = json.loads(self.report.to_json())
+        self.assertEqual(data['summary'], self.report['summary'])
+        self.assertIn(u'文案变化', self.report.to_text())
+
+    def test_cli_text_and_json(self):
+        fd, output = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            code = polib.main([
+                'tests/test_impact_before.po',
+                'tests/test_impact_after.po',
+                'tests/test_impact_mapping.csv',
+                '--format', 'json', '--output', output,
+            ])
+            self.assertEqual(code, 0)
+            with codecs.open(output, 'r', encoding='utf-8') as handle:
+                data = json.load(handle)
+            self.assertEqual(data['summary'],
+                             self.report['summary'])
+        finally:
+            os.remove(output)
 
 
 if __name__ == '__main__':
