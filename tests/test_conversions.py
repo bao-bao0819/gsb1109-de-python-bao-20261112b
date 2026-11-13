@@ -119,6 +119,35 @@ def test_dl():
     assert md('<dl><dt>term</dt><dd><ol><li><p>1</p><ul><li>2a</li><li>2b</li></ul></li><li><p>3</p></li></ol></dd></dl>') == '\n\nterm\n:   1. 1\n\n       * 2a\n       * 2b\n    2. 3\n\n'
 
 
+def test_dl_consecutive_terms():
+    # Consecutive <dt> elements are aliases sharing all following <dd> senses.
+    # They must be rendered adjacent, not as separate paragraphs.
+    assert md('<dl><dt>A</dt><dt>B</dt><dd>definition 1</dd><dd>definition 2</dd></dl>') == '\n\nA\nB\n:   definition 1\n:   definition 2\n\n'
+    assert md('<dl><dt>A</dt><dt>B</dt><dt>C</dt><dd>definition</dd></dl>') == '\n\nA\nB\nC\n:   definition\n\n'
+    assert md('<dl><dt>A</dt>\n<dt>B</dt>\n<dd>definition</dd></dl>') == '\n\nA\nB\n:   definition\n\n'
+    assert md('<dl><dt><p>A</p></dt><dt><p>B</p></dt><dd>definition</dd></dl>') == '\n\nA\nB\n:   definition\n\n'
+    # Chained terms with their own definitions are not aliases.
+    assert md('<dl><dt>A</dt><dd>a</dd><dt>B</dt><dd>b</dd></dl>') == '\n\nA\n:   a\n\nB\n:   b\n\n'
+    # Terms without definitions stay separate entries.
+    assert md('<dl><dt>A</dt><dt>B</dt></dl>') == '\n\nA\nB\n\n'
+
+
+def test_dl_nested():
+    # A nested definition list stays inside its parent sense, including a
+    # following outer sense, which must not be captured as an inner sense.
+    html = '<dl><dt>outer</dt><dd>sense one</dd><dd>sense two<dl><dt>inner 1</dt><dt>inner 2</dt><dd>inner sense</dd></dl></dd><dd>sense three</dd><dd>sense four</dd></dl>'
+    assert md(html) == '\n\nouter\n:   sense one\n:   sense two\n\n    inner 1\n    inner 2\n    :   inner sense\n\n:   sense three\n:   sense four\n\n'
+    assert md('<dl><dt>outer</dt><dd><dl><dt>inner</dt><dt>inner 2</dt><dd>inner sense</dd></dl></dd><dd>after</dd></dl>') == '\n\nouter\n:   inner\n    inner 2\n    :   inner sense\n\n:   after\n\n'
+    # A term nested inside a sense must not become an alias of the outer term.
+    assert md('<dl><dt>outer</dt><dd>text<dl><dt>inner</dt><dd>inner sense</dd></dl></dd><dt>next</dt><dd>next sense</dd></dl>') == '\n\nouter\n:   text\n\n    inner\n    :   inner sense\n\nnext\n:   next sense\n\n'
+
+
+def test_dl_empty_definitions():
+    # A term with no definition is still a term; an empty <dd> is still a sense.
+    assert md('<dl><dt>A</dt><dd></dd><dt>B</dt><dd>definition</dd></dl>') == '\n\nA\n\n\nB\n:   definition\n\n'
+    assert md('<dl><dt>A</dt></dl>') == '\n\nA\n\n'
+
+
 def test_del():
     inline_tests('del', '~~')
 

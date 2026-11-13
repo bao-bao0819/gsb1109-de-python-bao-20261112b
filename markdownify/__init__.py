@@ -533,6 +533,12 @@ class MarkdownConverter(object):
         # insert definition marker into first-line indent whitespace
         text = ':' + text[1:]
 
+        # A definition containing a nested definition list needs a blank line
+        # before the next term or sense, or following entries are parsed as
+        # further senses of the innermost nested term.
+        if el.find('dl') is not None and _next_block_content_sibling(el) is not None:
+            text += '\n'
+
         return '%s\n' % text
 
     # definition lists are formatted as follows:
@@ -549,10 +555,14 @@ class MarkdownConverter(object):
         if not text:
             return '\n'
 
-        # TODO - format consecutive <dt> elements as directly adjacent lines):
+        # Consecutive <dt> elements are aliases of the same term and must be
+        # rendered as directly adjacent lines so that their shared <dd>
+        # elements stay attached to every alias rather than only the last one.
         #   https://michelf.ca/projects/php-markdown/extra/#def-list
+        prev_sibling = _prev_block_content_sibling(el)
+        prefix = '\n' if prev_sibling is not None and prev_sibling.name == 'dt' else '\n\n'
 
-        return '\n\n%s\n' % text
+        return '%s%s\n' % (prefix, text)
 
     def convert_hN(self, n, el, text, parent_tags):
         # convert_hN() converts <hN> tags, where N is any integer
