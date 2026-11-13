@@ -63,6 +63,9 @@ RSTRIP = 'rstrip'
 STRIP = 'strip'
 STRIP_ONE = 'strip_one'
 
+# Tags whose contents are preformatted and must not be whitespace-normalized
+PREFORMATTED_TAGS = frozenset(('pre', 'code', 'kbd', 'samp'))
+
 
 def strip1_pre(text):
     """Strip one leading and trailing newline from a <pre> string."""
@@ -76,6 +79,41 @@ def strip_pre(text):
     text = re_pre_lstrip.sub('', text)
     text = re_pre_rstrip.sub('', text)
     return text
+
+
+def extract_pre_text(el, is_decoration=None):
+    """
+    Extract the verbatim text of a preformatted element.
+
+    Every character is preserved exactly as authored: spaces split across
+    highlight tags, empty lines and trailing backticks are all retained.
+    Elements for which ``is_decoration`` returns a truthy value are skipped
+    wholesale (e.g. line-number ``<span>`` s), while a decorated ``<br>`` is
+    treated as a soft wrap, i.e. it contributes no character. Plain ``<br>``
+    elements are converted to a single newline.
+
+    ``is_decoration`` receives one argument (the BeautifulSoup element) and
+    defaults to a callable that treats nothing as decoration, so the element's
+    complete text is returned unchanged.
+    """
+    if is_decoration is None:
+        def is_decoration(node):
+            return False
+
+    def walk(node):
+        if isinstance(node, NavigableString):
+            if isinstance(node, (Comment, Doctype)):
+                return ''
+            return str(node)
+        if not isinstance(node, Tag):
+            return ''
+        if is_decoration(node):
+            return ''
+        if node.name == 'br':
+            return '\n'
+        return ''.join(walk(child) for child in node.children)
+
+    return walk(el)
 
 
 def chomp(text):
@@ -179,6 +217,7 @@ class MarkdownConverter(object):
         bullets = '*+-'  # An iterable of bullet types.
         code_language = ''
         code_language_callback = None
+        pre_text_callback = None
         convert = None
         default_title = False
         escape_asterisks = True
@@ -279,7 +318,7 @@ class MarkdownConverter(object):
             parent_tags_for_children.add('_inline')
 
         # if this tag is a preformatted element, add a '_noformat' parent pseudo-tag
-        if node.name in {'pre', 'code', 'kbd', 'samp'}:
+        if node.name in PREFORMATTED_TAGS:
             parent_tags_for_children.add('_noformat')
 
         # Convert the children elements into a list of result strings.
@@ -685,6 +724,9 @@ class MarkdownConverter(object):
         return '\n\n%s\n\n' % text if text else ''
 
     def convert_pre(self, el, text, parent_tags):
+        if self.options['pre_text_callback']:
+            return self._convert_pre_verbatim(el)
+
         if not text:
             return ''
         code_language = self.options['code_language']
@@ -701,6 +743,25 @@ class MarkdownConverter(object):
         else:
             raise ValueError('Invalid value for strip_pre: %s' % self.options['strip_pre'])
 
+        return '\n\n```%s\n%s\n```\n\n' % (code_language, text)
+
+    def _convert_pre_verbatim(self, el):
+        """
+        Convert a <pre> block by extracting its text verbatim, trusting the
+        supplied pre_text_callback to identify decorative nodes.
+        """
+        # Re-extract the text from the element tree instead of using the
+        # already-rendered child text, so that every character is preserved.
+        text = extract_pre_text(el, self.options['pre_text_callback'])
+        if not text:
+            return ''
+
+        code_language = self.options['code_language']
+        if self.options['code_language_callback']:
+            code_language = self.options['code_language_callback'](el) or code_language
+
+        # Do not strip the verbatim text: leading/trailing blank lines and
+        # whitespace are part of the original code and must survive round trips.
         return '\n\n```%s\n%s\n```\n\n' % (code_language, text)
 
     def convert_q(self, el, text, parent_tags):

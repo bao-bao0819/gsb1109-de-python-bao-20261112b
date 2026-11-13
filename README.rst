@@ -119,6 +119,23 @@ code_language_callback
 
   Defaults to ``None``.
 
+pre_text_callback
+  Enables verbatim extraction of ``<pre>`` blocks for sources (such as
+  scraped technical manuals) that mix the code with decoration. The callback
+  receives each element inside a ``<pre>`` block and returns ``True`` for
+  elements that are purely decorative, for example line-number ``<span>``
+  elements or ``<br>`` elements representing soft line wraps. Decorative
+  elements contribute no characters; every other character is preserved
+  exactly as authored, including spaces split across highlight tags, empty
+  lines, newlines from real ``<br>`` elements and trailing backticks, so the
+  fenced content can be copied back out character-for-character. Note that
+  ``strip_pre`` is intentionally ignored while this callback is set.
+  Defaults to ``None``, which keeps the regular conversion.
+
+  The same extraction is available directly through the
+  ``extract_pre_text(element, is_decoration)`` helper for callers that do not
+  need the full Markdown conversion.
+
 escape_asterisks
   If set to ``False``, do not escape ``*`` to ``\*`` in text.
   Defaults to ``True``.

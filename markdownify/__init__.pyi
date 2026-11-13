@@ -1,5 +1,5 @@
 from _typeshed import Incomplete
-from typing import Callable, Union
+from typing import Any, Callable, Union
 
 ATX: str
 ATX_CLOSED: str
@@ -13,6 +13,16 @@ LSTRIP: str
 RSTRIP: str
 STRIP: str
 STRIP_ONE: str
+PREFORMATTED_TAGS: frozenset[str]
+
+
+def strip1_pre(text: str) -> str: ...
+def strip_pre(text: str) -> str: ...
+def chomp(text: str) -> tuple[str, str, str]: ...
+def extract_pre_text(
+    el: Incomplete,
+    is_decoration: Union[Callable[[Any], bool], None] = ...,
+) -> str: ...
 
 
 def markdownify(
@@ -22,6 +32,7 @@ def markdownify(
     bullets: str = ...,
     code_language: str = ...,
     code_language_callback: Union[Callable[[Incomplete], Union[str, None]], None] = ...,
+    pre_text_callback: Union[Callable[[Incomplete], bool], None] = ...,
     convert: Union[list[str], None] = ...,
     default_title: bool = ...,
     escape_asterisks: bool = ...,
@@ -50,6 +61,7 @@ class MarkdownConverter:
         bullets: str = ...,
         code_language: str = ...,
         code_language_callback: Union[Callable[[Incomplete], Union[str, None]], None] = ...,
+        pre_text_callback: Union[Callable[[Incomplete], bool], None] = ...,
         convert: Union[list[str], None] = ...,
         default_title: bool = ...,
         escape_asterisks: bool = ...,

@@ -1,4 +1,4 @@
-from markdownify import markdownify, ASTERISK, BACKSLASH, LSTRIP, RSTRIP, SPACES, STRIP, UNDERLINED, UNDERSCORE, MarkdownConverter
+from markdownify import markdownify, ASTERISK, BACKSLASH, LSTRIP, RSTRIP, SPACES, STRIP, UNDERLINED, UNDERSCORE, MarkdownConverter, extract_pre_text
 from bs4 import BeautifulSoup
 from typing import Union
 
@@ -15,6 +15,7 @@ MarkdownConverter(
     bullets='*+-',
     code_language='',
     code_language_callback=None,
+    pre_text_callback=None,
     convert=None,
     default_title=False,
     escape_asterisks=True,
@@ -68,3 +69,14 @@ MarkdownConverter(code_language_callback=lambda el: None).convert("")
 
 markdownify('<pre class="python">test\n    foo\nbar</pre>', code_language_callback=callback)
 markdownify('<pre class="python">test\n    foo\nbar</pre>', code_language_callback=lambda el: None)
+
+
+def decoration(el: BeautifulSoup) -> bool:
+    return el.name in ('span', 'br') and el.has_attr('data-decoration')
+
+
+verbatim_soup = BeautifulSoup('<pre><span data-decoration>1</span>code</pre>', 'html.parser')
+extract_pre_text(verbatim_soup.pre, decoration)
+extract_pre_text(verbatim_soup.pre)
+MarkdownConverter(pre_text_callback=decoration).convert(str(verbatim_soup))
+markdownify(str(verbatim_soup), pre_text_callback=lambda el: el.name == 'br')
