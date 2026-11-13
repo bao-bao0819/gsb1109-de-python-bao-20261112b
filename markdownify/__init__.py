@@ -154,6 +154,234 @@ def _is_block_content_element(el):
         return False
 
 
+# Tags that break a line of text when post segments are extracted.
+# <blockquote> is handled separately because it raises the quote level.
+re_html_heading_tag = re.compile(r'h[1-6]$')
+SEGMENT_BLOCK_TAGS = frozenset((
+    'p', 'div', 'section', 'article', 'aside', 'header', 'footer',
+    'main', 'nav', 'figure', 'figcaption', 'pre', 'hr', 'br',
+    'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+    'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption',
+))
+
+
+def _is_segment_block_tag(el):
+    """Whether a tag starts a new line in the extracted post segments."""
+    return isinstance(el, Tag) and (
+        el.name in SEGMENT_BLOCK_TAGS or re_html_heading_tag.match(el.name) is not None
+    )
+
+
+class PostSegment(object):
+    """
+    An ordered text fragment of a converted forum post.
+
+    Attributes:
+        index: 1-based position of the fragment in document order.
+        kind: 'own' for text written by the post author (quote level 0),
+            'quote' for text nested inside a <blockquote>.
+        level: quote nesting depth; 0 for the author's own text, 1 for a
+            direct quote, 2 for a quote within a quote, and so on. The depth
+            is derived from the HTML tag structure, so a formula line that
+            literally starts with '>' is never mistaken for a quote.
+        reply_index: 1-based number of the author reply that an 'own'
+            fragment belongs to. Every maximal run of author text between
+            two quotes is one reply and keeps its original position.
+            Always 0 for 'quote' fragments.
+        text: plain-text content of the fragment, with inline markup
+            removed and HTML entities decoded.
+"""
+
+    def __init__(self, index, kind, level, reply_index, text):
+        self.index = index
+        self.kind = kind
+        self.level = level
+        self.reply_index = reply_index
+        self.text = text
+
+    @property
+    def is_own(self):
+        return self.kind == 'own'
+
+    @property
+    def is_quote(self):
+        return self.kind == 'quote'
+
+    def as_dict(self):
+        return {
+            'index': self.index,
+            'kind': self.kind,
+            'level': self.level,
+            'reply_index': self.reply_index,
+            'text': self.text,
+        }
+
+    def __repr__(self):
+        return (
+            'PostSegment(index=%r, kind=%r, level=%r, reply_index=%r, text=%r)'
+            % (self.index, self.kind, self.level, self.reply_index, self.text)
+        )
+
+    def __eq__(self, other):
+        if isinstance(other, PostSegment):
+            return self.as_dict() == other.as_dict()
+        if isinstance(other, dict):
+            return self.as_dict() == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+
+class _PostSegmentBuilder(object):
+    """
+    Walks a parsed document in document order and collects ordered text
+    fragments, tracking <blockquote> nesting depth and author replies.
+    """
+
+    def __init__(self):
+        self.segments = []
+        # Parallel to self.segments: the element (or None) that each segment
+        # originates from, used to keep adjacent <blockquote> elements apart.
+        self._segment_sources = []
+        self._buffer_parts = []
+        self._level = None
+        self._source = None
+        self._preformatted = False
+        self._own_reply_count = 0
+
+    def _reply_index_for(self, kind):
+        if kind != 'own':
+            return 0
+        if not self.segments or self.segments[-1].kind != 'own':
+            self._own_reply_count += 1
+        return self._own_reply_count
+
+    def _emit(self, level, source, text):
+        if not text:
+            return
+        kind = 'own' if level == 0 else 'quote'
+        reply_index = self._reply_index_for(kind)
+        if (self.segments and self.segments[-1].kind == kind
+                and self.segments[-1].level == level
+                and self._segment_sources[-1] is source):
+            previous = self.segments[-1]
+            self.segments[-1] = PostSegment(
+                previous.index, kind, level, reply_index,
+                previous.text + '\n' + text,
+            )
+        else:
+            self.segments.append(PostSegment(
+                len(self.segments) + 1, kind, level, reply_index, text,
+            ))
+            self._segment_sources.append(source)
+
+    def _flush(self):
+        if self._level is None:
+            return
+        text = ''.join(self._buffer_parts)
+        self._buffer_parts = []
+        level = self._level
+        source = self._source
+        preformatted = self._preformatted
+        self._level = None
+        self._source = None
+        self._preformatted = False
+        if not preformatted:
+            # Collapse whitespace the same way process_text() does outside
+            # of <pre>: trim every line and drop the blank lines introduced
+            # by block boundaries.
+            text = '\n'.join(
+                line.strip() for line in text.split('\n') if line.strip()
+            )
+        if text:
+            self._emit(level, source, text)
+
+    def _ensure_level(self, level, source):
+        if self._level != level or self._source is not source:
+            self._flush()
+            self._level = level
+            self._source = source
+
+    def add_text(self, level, source, el):
+        text = str(el)
+        text = re_newline_whitespace.sub('\n', text)
+        text = re_whitespace.sub(' ', text)
+        if text:
+            self._ensure_level(level, source)
+            self._buffer_parts.append(text)
+
+    def add_pre(self, level, source, el):
+        # Preformatted content keeps its internal line breaks and indentation
+        # verbatim and bypasses the whitespace normalization above.
+        text = strip1_pre(el.get_text())
+        if not text:
+            return
+        self._flush()
+        self._level = level
+        self._source = source
+        self._preformatted = True
+        self._buffer_parts.append(text)
+        self._flush()
+
+    def add_line_break(self, level, source):
+        self._ensure_level(level, source)
+        self._buffer_parts.append('\n')
+
+    def close_quote(self):
+        # End the current fragment so adjacent <blockquote> elements do not
+        # merge into a single quote segment.
+        self._flush()
+
+    def finish(self):
+        self._flush()
+        for index, segment in enumerate(self.segments, 1):
+            segment.index = index
+        return self.segments
+
+
+def _build_post_segments(soup):
+    """
+    Collect ordered PostSegment objects from a parsed document.
+
+    Quote depth is taken from the actual <blockquote> nesting, so text that
+    merely starts with a '>' character (e.g. a formula) is not treated as a
+    quote layer.
+    """
+    builder = _PostSegmentBuilder()
+
+    def walk(node, level, source):
+        for child in node.children:
+            if isinstance(child, (Comment, Doctype)):
+                continue
+            if isinstance(child, NavigableString):
+                builder.add_text(level, source, child)
+                continue
+            if child.name in ('script', 'style'):
+                # Their contents are not post text and are dropped by the
+                # Markdown conversion as well.
+                continue
+            if child.name == 'blockquote':
+                walk(child, level + 1, child)
+                builder.close_quote()
+                continue
+            if child.name == 'pre':
+                builder.add_pre(level, child, child)
+                continue
+            is_block = _is_segment_block_tag(child)
+            if is_block:
+                builder.add_line_break(level, source)
+            walk(child, level, source)
+            if is_block:
+                builder.add_line_break(level, source)
+
+    walk(soup, 0, None)
+    return builder.finish()
+
+
 def _prev_block_content_sibling(el):
     """Returns the first previous sibling that is a content element, else None."""
     while el is not None:
@@ -223,6 +451,28 @@ class MarkdownConverter(object):
 
     def convert_soup(self, soup):
         return self.process_tag(soup, parent_tags=set())
+
+    def convert_post_segments(self, html=None, soup=None):
+        """
+        Convert a forum post into the ordered text fragments it is made of.
+
+        Only text written by the post author is meant to be indexed into a
+        search library; quoted text is still returned, marked with its quote
+        level, so it can be kept as context. Each run of the author's own
+        text between two quotes is numbered as a separate reply and stays in
+        its original position.
+
+        Pass either an HTML string (via ``html``) or an already parsed
+        BeautifulSoup object (via ``soup``). Returns a list of
+        :class:`PostSegment` objects in document order.
+        """
+        if soup is None:
+            if html is None:
+                raise ValueError(
+                    'convert_post_segments() requires an html string or a soup'
+                )
+            soup = BeautifulSoup(html, **self.options['bs4_options'])
+        return _build_post_segments(soup)
 
     def process_element(self, node, parent_tags=None):
         if isinstance(node, NavigableString):
@@ -791,3 +1041,16 @@ class MarkdownConverter(object):
 
 def markdownify(html, **options):
     return MarkdownConverter(**options).convert(html)
+
+
+def post_segments(html=None, soup=None, **options):
+    """
+    Return the ordered text fragments of a forum post.
+
+    Convenience wrapper around
+    :meth:`MarkdownConverter.convert_post_segments`. Each fragment records
+    whether it is the post author's own text (the only content that should
+    be indexed) or a quote, the <blockquote> nesting level it came from, and
+    which author reply it belongs to.
+    """
+    return MarkdownConverter(**options).convert_post_segments(html=html, soup=soup)

@@ -1,5 +1,5 @@
 from _typeshed import Incomplete
-from typing import Callable, Union
+from typing import Any, Callable, List, Optional, Union
 
 ATX: str
 ATX_CLOSED: str
@@ -13,6 +13,26 @@ LSTRIP: str
 RSTRIP: str
 STRIP: str
 STRIP_ONE: str
+
+
+class PostSegment:
+    index: int
+    kind: str
+    level: int
+    reply_index: int
+    text: str
+
+    def __init__(
+        self, index: int, kind: str, level: int, reply_index: int, text: str
+    ) -> None: ...
+
+    @property
+    def is_own(self) -> bool: ...
+
+    @property
+    def is_quote(self) -> bool: ...
+
+    def as_dict(self) -> dict[str, Any]: ...
 
 
 def markdownify(
@@ -40,6 +60,13 @@ def markdownify(
     wrap: bool = ...,
     wrap_width: Union[int, None] = ...,
 ) -> str: ...
+
+
+def post_segments(
+    html: Optional[str] = ...,
+    soup: Optional[Incomplete] = ...,
+    **options: Any,
+) -> List[PostSegment]: ...
 
 
 class MarkdownConverter:
@@ -74,4 +101,11 @@ class MarkdownConverter:
         ...
 
     def convert_soup(self, soup: Incomplete) -> str:
+        ...
+
+    def convert_post_segments(
+        self,
+        html: Optional[str] = ...,
+        soup: Optional[Incomplete] = ...,
+    ) -> List[PostSegment]:
         ...

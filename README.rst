@@ -190,6 +190,53 @@ Converting BeautifulSoup objects
         return MarkdownConverter(**options).convert_soup(soup)
 
 
+Extracting forum post segments
+==============================
+
+When old forum posts are fed into a search library, only the text written by
+the post author should be indexed, while quoted text is kept as context.
+``post_segments`` (or ``MarkdownConverter.convert_post_segments``) splits a
+post into an ordered list of ``PostSegment`` objects. Each segment records:
+
+- ``index``: its 1-based position in document order,
+- ``kind``: ``"own"`` for the author's own text, ``"quote"`` for quoted text,
+- ``level``: the ``<blockquote>`` nesting depth (0 for own text, 1 for a
+  direct quote, 2 for a quote inside a quote, and so on),
+- ``reply_index``: the 1-based number of the author reply an ``"own"`` segment
+  belongs to; every maximal run of the author's text between two quotes is one
+  reply and keeps its original position (always 0 for quotes),
+- ``text``: the plain-text content, with inline markup removed.
+
+Quote depth is derived from the HTML structure, so a formula line that
+literally starts with a ``>`` is never mistaken for a quote.
+
+.. code:: python
+
+    from markdownify import post_segments
+
+    html = (
+        '<p>开场</p>'
+        '<blockquote>'
+        '<blockquote><p>第一段引用</p></blockquote>'
+        '<p>夹在两段引用之间的回复</p>'
+        '<blockquote><p>第二段引用</p></blockquote>'
+        '</blockquote>'
+        '<p>看公式：&gt; a^2 + b^2 = c^2</p>'
+    )
+
+    for segment in post_segments(html):
+        print(segment.as_dict())
+
+    # {'index': 1, 'kind': 'own',   'level': 0, 'reply_index': 1, 'text': '开场'}
+    # {'index': 2, 'kind': 'quote', 'level': 2, 'reply_index': 0, 'text': '第一段引用'}
+    # {'index': 3, 'kind': 'quote', 'level': 1, 'reply_index': 0, 'text': '夹在两段引用之间的回复'}
+    # {'index': 4, 'kind': 'quote', 'level': 2, 'reply_index': 0, 'text': '第二段引用'}
+    # {'index': 5, 'kind': 'own',   'level': 0, 'reply_index': 2, 'text': '看公式：> a^2 + b^2 = c^2'}
+
+    # Index only what the author wrote, quotes stay available as context.
+    own_text = [s.text for s in post_segments(html) if s.is_own]
+
+
 Creating Custom Converters
 ==========================
 
