@@ -35,6 +35,7 @@ from luigi.tools.range import (
     _constrain_glob,
     _get_filesystems_and_globs,
 )
+from luigi.task import BulkCompleteStatus
 
 
 class CommonDateMinuteTask(luigi.Task):
@@ -1305,6 +1306,266 @@ class RangeDailyTest(unittest.TestCase):
         ]
         actual = [str(t) for t in task.requires()]
         self.assertEqual(actual, expected)
+
+    def test_unreadable_source_does_not_block_other_sources(self):
+        class SourcedDailyTask(luigi.Task):
+            d = luigi.DateParameter()
+            shard = luigi.Parameter()
+
+            partitions = {"2015-11-25": "a", "2015-11-26": "a", "2015-11-27": "b", "2015-11-28": "b", "2015-11-29": "a", "2015-11-30": "a"}
+            present = {"2015-11-25", "2015-11-29", "2015-11-30"}
+            unreadable = {"b"}
+            checked_sources = []
+
+            @classmethod
+            def bulk_complete_source(cls, parameter_tuple):
+                return cls.partitions[str(parameter_tuple)]
+
+            @classmethod
+            def bulk_complete_source_items(cls, source, parameter_tuples):
+                cls.checked_sources.append(source)
+                if source in cls.unreadable:
+                    raise IOError("shard %s temporarily unreadable" % source)
+                return {p: str(p) in cls.present for p in parameter_tuples}
+
+            @classmethod
+            def bulk_complete(cls, parameter_tuples):
+                return [p for p in parameter_tuples if str(p) in cls.present]
+
+        def build():
+            return RangeDaily(
+                now=datetime_to_epoch(datetime.datetime(2015, 12, 1)),
+                of=SourcedDailyTask,
+                of_params={"shard": "unused"},
+                start=datetime.date(2015, 11, 25),
+                stop=datetime.date(2015, 12, 1),
+            )
+
+        task = build()
+        actual = [str(t) for t in task.requires()]
+        self.assertEqual(actual, ["SourcedDailyTask(d=2015-11-26, shard=unused)"])
+        self.assertEqual(
+            task.last_bulk_check["complete"],
+            [datetime.datetime(2015, 11, 25), datetime.datetime(2015, 11, 29), datetime.datetime(2015, 11, 30)],
+        )
+        self.assertEqual(
+            task.last_bulk_check["undecidable"],
+            [datetime.datetime(2015, 11, 27), datetime.datetime(2015, 11, 28)],
+        )
+        # The healthy shard was still checked even though the other one failed.
+        self.assertIn("a", SourcedDailyTask.checked_sources)
+
+    def test_complete_evidence_is_reused_but_missing_is_reconfirmed(self):
+        class VersionedDailyTask(luigi.Task):
+            d = luigi.DateParameter()
+
+            reads = 0
+            missing = {datetime.date(2015, 11, 27)}
+
+            @classmethod
+            def bulk_complete_source(cls, parameter_tuple):
+                return "one"
+
+            @classmethod
+            def bulk_complete_source_version(cls, source):
+                return "generation-1"
+
+            @classmethod
+            def bulk_complete_source_items(cls, source, parameter_tuples):
+                cls.reads += 1
+                return {p: p not in cls.missing for p in parameter_tuples}
+
+            @classmethod
+            def bulk_complete(cls, parameter_tuples):
+                return [p for p in parameter_tuples if p not in cls.missing]
+
+        def build():
+            return RangeDaily(
+                now=datetime_to_epoch(datetime.datetime(2015, 12, 1)),
+                of=VersionedDailyTask,
+                start=datetime.date(2015, 11, 25),
+                stop=datetime.date(2015, 12, 1),
+            )
+
+        luigi.task_register.Register.clear_instance_cache()
+        first = build()
+        self.assertEqual([str(t) for t in first.requires()], ["VersionedDailyTask(d=2015-11-27)"])
+        self.assertEqual(VersionedDailyTask.reads, 1)
+
+        # The second round re-reads the source to re-confirm the missing
+        # partition, but the completed partitions do not need re-reading. It
+        # claims the still-missing partition and nothing else.
+        luigi.task_register.Register.clear_instance_cache()
+        second = build()
+        self.assertEqual([str(t) for t in second.requires()], ["VersionedDailyTask(d=2015-11-27)"])
+        self.assertEqual(VersionedDailyTask.reads, 2)
+
+    def test_undecidable_items_do_not_count_as_complete_in_metrics(self):
+        events = {}
+
+        @RangeDaily.event_handler(RangeEvent.COMPLETE_COUNT)
+        def on_count(*args):
+            events.setdefault(RangeEvent.COMPLETE_COUNT, []).append(args)
+
+        @RangeDaily.event_handler(RangeEvent.COMPLETE_FRACTION)
+        def on_fraction(*args):
+            events.setdefault(RangeEvent.COMPLETE_FRACTION, []).append(args)
+
+        class ShardedDailyTask(luigi.Task):
+            d = luigi.DateParameter()
+
+            @classmethod
+            def bulk_complete_source(cls, parameter_tuple):
+                return "one"
+
+            @classmethod
+            def bulk_complete_source_items(cls, source, parameter_tuples):
+                result = {}
+                for p in parameter_tuples:
+                    if p.day == 25:
+                        result[p] = BulkCompleteStatus.COMPLETE
+                    elif p.day == 26:
+                        result[p] = BulkCompleteStatus.MISSING
+                    else:
+                        result[p] = BulkCompleteStatus.UNKNOWN
+                return result
+
+            @classmethod
+            def bulk_complete(cls, parameter_tuples):
+                return [p for p in parameter_tuples if p.day == 25]
+
+        task = RangeDaily(
+            now=datetime_to_epoch(datetime.datetime(2015, 12, 1)),
+            of=ShardedDailyTask,
+            start=datetime.date(2015, 11, 25),
+            stop=datetime.date(2015, 12, 1),
+        )
+        list(task.requires())
+        self.assertEqual(events[RangeEvent.COMPLETE_COUNT], [("ShardedDailyTask", 1)])
+        self.assertEqual(events[RangeEvent.COMPLETE_FRACTION], [("ShardedDailyTask", 1.0 / 6)])
+
+    def test_undecidable_items_are_neither_claimed_nor_completed(self):
+        class ShardedDailyTask(luigi.Task):
+            d = luigi.DateParameter()
+            shard = luigi.Parameter()
+
+            complete_partitions = {datetime.date(2015, 11, 25), datetime.date(2015, 11, 29), datetime.date(2015, 11, 30)}
+            missing_partitions = {datetime.date(2015, 11, 27)}
+
+            @classmethod
+            def bulk_complete_source(cls, parameter_tuple):
+                return "one"
+
+            @classmethod
+            def bulk_complete_source_items(cls, source, parameter_tuples):
+                result = {}
+                for p in parameter_tuples:
+                    if p in cls.complete_partitions:
+                        result[p] = BulkCompleteStatus.COMPLETE
+                    elif p in cls.missing_partitions:
+                        result[p] = BulkCompleteStatus.MISSING
+                    else:
+                        result[p] = BulkCompleteStatus.UNKNOWN
+                return result
+
+            @classmethod
+            def bulk_complete(cls, parameter_tuples):
+                return [p for p in parameter_tuples if p in cls.complete_partitions]
+
+        task = RangeDaily(
+            now=datetime_to_epoch(datetime.datetime(2015, 12, 1)),
+            of=ShardedDailyTask,
+            of_params={"shard": "one"},
+            start=datetime.date(2015, 11, 25),
+            stop=datetime.date(2015, 12, 1),
+        )
+        actual = [str(t) for t in task.requires()]
+        self.assertEqual(actual, ["ShardedDailyTask(d=2015-11-27, shard=one)"])
+        self.assertEqual(
+            task.last_bulk_check["complete"],
+            [datetime.datetime(2015, 11, 25), datetime.datetime(2015, 11, 29), datetime.datetime(2015, 11, 30)],
+        )
+        self.assertEqual(
+            task.last_bulk_check["undecidable"],
+            [datetime.datetime(2015, 11, 26), datetime.datetime(2015, 11, 28)],
+        )
+        self.assertEqual(task.last_bulk_check["missing"], [datetime.datetime(2015, 11, 27)])
+        self.assertFalse(task.complete())
+
+    def test_undecidable_items_are_retried_on_the_next_round(self):
+        class RecoveringDailyTask(luigi.Task):
+            d = luigi.DateParameter()
+            shard = luigi.Parameter()
+
+            readable = False
+            missing = {datetime.date(2015, 11, 27)}
+            reads = 0
+
+            @classmethod
+            def bulk_complete_source(cls, parameter_tuple):
+                return "one"
+
+            @classmethod
+            def bulk_complete_source_items(cls, source, parameter_tuples):
+                cls.reads += 1
+                if not cls.readable:
+                    raise IOError("temporarily unreadable")
+                return {p: p not in cls.missing for p in parameter_tuples}
+
+            @classmethod
+            def bulk_complete(cls, parameter_tuples):
+                return [p for p in parameter_tuples if p not in cls.missing]
+
+        def build():
+            return RangeDaily(
+                now=datetime_to_epoch(datetime.datetime(2015, 12, 1)),
+                of=RecoveringDailyTask,
+                of_params={"shard": "one"},
+                start=datetime.date(2015, 11, 25),
+                stop=datetime.date(2015, 12, 1),
+            )
+
+        first = build()
+        self.assertEqual(list(first.requires()), [])
+        self.assertEqual(len(first.last_bulk_check["undecidable"]), 6)
+        self.assertEqual(first.last_bulk_check["missing"], [])
+        self.assertFalse(first.complete())
+
+        RecoveringDailyTask.readable = True
+        luigi.task_register.Register.clear_instance_cache()
+        second = build()
+        claimed = [str(t) for t in second.requires()]
+        # Only the genuinely missing partition is claimed; the previously
+        # undecidable ones are re-checked and found complete.
+        self.assertEqual(claimed, ["RecoveringDailyTask(d=2015-11-27, shard=one)"])
+        self.assertEqual(len(second.last_bulk_check["undecidable"]), 0)
+
+    def test_unknown_is_not_turned_into_permanent_completion(self):
+        class FlakyDailyTask(luigi.Task):
+            d = luigi.DateParameter()
+            shard = luigi.Parameter()
+
+            @classmethod
+            def bulk_complete_source(cls, parameter_tuple):
+                return "one"
+
+            @classmethod
+            def bulk_complete_source_items(cls, source, parameter_tuples):
+                raise IOError("temporarily unreadable")
+
+            @classmethod
+            def bulk_complete(cls, parameter_tuples):
+                raise IOError("temporarily unreadable")
+
+        task = RangeDaily(
+            now=datetime_to_epoch(datetime.datetime(2015, 12, 1)),
+            of=FlakyDailyTask,
+            of_params={"shard": "one"},
+            start=datetime.date(2015, 11, 25),
+            stop=datetime.date(2015, 12, 1),
+        )
+        self.assertEqual(list(task.requires()), [])
+        self.assertFalse(task.complete())
 
 
 class RangeHourlyTest(unittest.TestCase):

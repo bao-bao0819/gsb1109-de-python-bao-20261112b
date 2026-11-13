@@ -86,6 +86,49 @@ Namely the task must implement an efficient bulk_complete method, or
 must be writing output to file system Target with date parameter value
 consistently represented in the file path.
 
+Checking sources independently and conservatively
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A single bulk_complete call often spans partitions kept in several
+independent sources, e.g. datasets or storage shards. If one source
+cannot be read at the moment, that must not turn its partitions into
+missing ones (which would trigger needless reprocessing) nor block the
+checks of the other sources. Implement :py:meth:`~luigi.task.Task.bulk_complete_source`
+and :py:meth:`~luigi.task.Task.bulk_complete_source_items` so that each
+source is read on its own:
+
+.. code-block:: python
+
+    class PartitionTask(luigi.Task):
+        date = luigi.DateParameter()
+        shard = luigi.Parameter()
+
+        @classmethod
+        def bulk_complete_source(cls, parameter_tuple):
+            return parameter_tuple[1]
+
+        @classmethod
+        def bulk_complete_source_items(cls, source, parameter_tuples):
+            listing = read_source(source)  # raises if source is unreadable
+            return {p: p[0] in listing for p in parameter_tuples}
+
+Then :py:meth:`~luigi.task.Task.bulk_complete_result` reports every
+partition as ``COMPLETE``, ``MISSING`` or ``UNKNOWN``. Only positively
+missing partitions are claimed by the range tools; ``UNKNOWN`` ones are
+retried on the next round and never count as complete.
+
+Successful ``COMPLETE`` conclusions can be reused across calls through
+:py:class:`~luigi.task.BulkCompleteEvidence`, but only while the source
+version returned by :py:meth:`~luigi.task.Task.bulk_complete_source_version`
+stays the same. ``MISSING`` and ``UNKNOWN`` conclusions are never carried
+over, so they are re-established (and, if still missing, claimed) on the
+next round. Return ``None`` from ``bulk_complete_source_version`` to
+disable reuse for that source.
+
+:py:class:`~luigi.task.MixinBulkCompleteBySource` packages this pattern;
+:py:class:`~luigi.contrib.bigquery.MixinBigQueryBulkComplete` applies it
+per BigQuery dataset.
+
 Backfilling tasks
 ~~~~~~~~~~~~~~~~~
 

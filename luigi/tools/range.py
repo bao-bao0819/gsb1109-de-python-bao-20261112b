@@ -39,7 +39,7 @@ from dateutil.relativedelta import relativedelta
 import luigi
 from luigi.parameter import ParameterException
 from luigi.target import FileSystemTarget
-from luigi.task import Register, flatten_output
+from luigi.task import BulkCompleteStatus, Register, flatten_output
 
 logger = logging.getLogger("luigi-interface")
 
@@ -175,8 +175,9 @@ class RangeBase(luigi.WrapperTask):
         delay_in_jobs = len(datetimes) - datetimes.index(missing_datetimes[0]) if datetimes and missing_datetimes else 0
         self.trigger_event(RangeEvent.DELAY, self.of_cls.task_family, delay_in_jobs)
 
+        undecidable = getattr(self, "last_bulk_check", {}).get("undecidable", [])
         expected_count = len(datetimes)
-        complete_count = expected_count - len(missing_datetimes)
+        complete_count = expected_count - len(missing_datetimes) - len(undecidable)
         self.trigger_event(RangeEvent.COMPLETE_COUNT, self.of_cls.task_family, complete_count)
         self.trigger_event(RangeEvent.COMPLETE_FRACTION, self.of_cls.task_family, float(complete_count) / expected_count if expected_count else 1)
 
@@ -203,6 +204,19 @@ class RangeBase(luigi.WrapperTask):
         kwargs[self._param_name] = param
         return kwargs
 
+    def complete(self):
+        """
+        A range is complete only if it has nothing missing and nothing undecidable.
+
+        An undecidable instance is not evidence of completion, so a range with
+        undecidable instances must not report itself as done.
+        """
+        if not hasattr(self, "_cached_requires"):
+            self.requires()
+        has_work = bool(self._cached_requires)
+        undecidable = bool(getattr(self, "last_bulk_check", {}).get("undecidable"))
+        return not has_work and not undecidable
+
     def requires(self):
         # cache because we anticipate a fair amount of computation
         if hasattr(self, "_cached_requires"):
@@ -227,14 +241,28 @@ class RangeBase(luigi.WrapperTask):
 
         if datetimes:
             logger.debug("Actually checking if range %s of %s is complete", self._format_range(datetimes), self.of_cls.task_family)
-            missing_datetimes = sorted(self._missing_datetimes(datetimes))
+        complete_datetimes, missing_datetimes, undecidable_datetimes = self._partition_datetimes(datetimes) if datetimes else ([], [], [])
+        if undecidable_datetimes:
+            logger.warning(
+                "Could not decide on %d of %d %s instances in range %s; they will neither be claimed nor marked done",
+                len(undecidable_datetimes),
+                len(datetimes),
+                self.of_cls.task_family,
+                self._format_range(undecidable_datetimes),
+            )
+        if datetimes:
             logger.debug(
                 "Range %s lacked %d of expected %d %s instances", self._format_range(datetimes), len(missing_datetimes), len(datetimes), self.of_cls.task_family
             )
         else:
-            missing_datetimes = []
             logger.debug("Empty range. No %s instances expected", self.of_cls.task_family)
 
+        self.last_bulk_check = {
+            "checked": list(datetimes),
+            "complete": list(complete_datetimes),
+            "missing": list(missing_datetimes),
+            "undecidable": list(undecidable_datetimes),
+        }
         self._emit_metrics(missing_datetimes, finite_start, finite_stop)
 
         if self.reverse:
@@ -262,6 +290,55 @@ class RangeBase(luigi.WrapperTask):
         Inadvisable as it may be slow.
         """
         return [d for d in finite_datetimes if not self._instantiate_task_cls(self.datetime_to_parameter(d)).complete()]
+
+    def complete_datetimes(self, finite_datetimes):
+        """
+        Returns those of ``finite_datetimes`` that are known to be complete.
+
+        Subclasses that can distinguish "known complete" from "not known to be
+        missing" should override this together with :py:meth:`missing_datetimes`.
+        The default derives it from :py:meth:`missing_datetimes`.
+        """
+        return set(finite_datetimes) - set(self._missing_datetimes(finite_datetimes))
+
+    def undecidable_datetimes(self, finite_datetimes):
+        """
+        Returns those of ``finite_datetimes`` that could not be checked.
+
+        Undecidable instances are neither missing nor complete. The range tool
+        never claims them for work, and never reports them as done. The default
+        assumes every instance that is not missing could be decided.
+        """
+        return []
+
+    def _partition_datetimes(self, finite_datetimes):
+        """
+        Split ``finite_datetimes`` into (complete, missing, undecidable), each sorted.
+
+        Implementations are expected to be conservative: only instances
+        positively identified as missing may be returned as missing, since
+        those are the only ones the range tool will claim for work. A
+        ``MISSING`` conclusion wins over an ``UNDECIDABLE`` one for the same
+        instance, and the two cannot both claim it.
+        """
+        datetimes = list(finite_datetimes)
+        missing = sorted(set(self._missing_datetimes(datetimes)))
+        missing_set = set(missing)
+        # Cheap single-check implementations override all three hooks. Legacy
+        # implementations that only override missing_datetimes get the
+        # historical "everything not missing is complete" treatment.
+        if type(self).complete_datetimes is RangeBase.complete_datetimes:
+            complete = set(datetimes) - missing_set
+        else:
+            complete = set(self.complete_datetimes(datetimes)) - missing_set
+        if type(self).undecidable_datetimes is RangeBase.undecidable_datetimes:
+            undecidable = set()
+        else:
+            undecidable = set(self.undecidable_datetimes(datetimes)) - missing_set
+        # A positive missing conclusion wins over an "unknown" one; the two
+        # cannot both claim an instance.
+        complete -= undecidable
+        return sorted(complete), missing, sorted(undecidable)
 
     def _missing_datetimes(self, finite_datetimes):
         """
@@ -635,6 +712,48 @@ def infer_bulk_complete_from_fs(datetimes, datetime_to_task, datetime_to_re):
     return missing_datetimes
 
 
+def _bulk_complete_datetimes(of_cls, datetime_to_parameter, parameter_to_datetime, finite_datetimes, of_params):
+    """
+    Run a tri-state bulk check for ``of_cls`` over ``finite_datetimes``.
+
+    Returns ``(complete, missing, undecidable)`` as lists of datetimes.
+    ``missing`` only contains instances positively confirmed to be absent, so
+    these are the only ones a range tool may claim. An unreadable source
+    contributes only its own ``undecidable`` items; the other sources are
+    still checked.
+    """
+    parameter_tuples = [datetime_to_parameter(d) for d in finite_datetimes]
+    callable_of = functools.partial(of_cls, **of_params)
+    result = _invoke_bulk_complete_result(callable_of, parameter_tuples)
+    if result is None:
+        raise NotImplementedError("bulk_complete_result is not implemented")
+
+    complete = []
+    missing = []
+    undecidable = []
+    for datetime_value, parameter_tuple in zip(finite_datetimes, parameter_tuples):
+        status = result.status(parameter_tuple)
+        if status is BulkCompleteStatus.COMPLETE:
+            complete.append(datetime_value)
+        elif status is BulkCompleteStatus.MISSING:
+            missing.append(datetime_value)
+        else:
+            undecidable.append(datetime_value)
+    return complete, missing, undecidable
+
+
+def _invoke_bulk_complete_result(callable_of, parameter_tuples):
+    """Call ``bulk_complete_result`` on ``callable_of``, or return None if unavailable."""
+    task_cls = callable_of.func if isinstance(callable_of, functools.partial) else callable_of
+    result_fn = getattr(task_cls, "bulk_complete_result", None)
+    if result_fn is None:
+        return None
+    try:
+        return getattr(result_fn, "__func__", result_fn)(callable_of, parameter_tuples)
+    except NotImplementedError:
+        return None
+
+
 class RangeMonthly(RangeBase):
     """
     Produces a contiguous completed range of a monthly recurring task.
@@ -709,7 +828,55 @@ class RangeMonthly(RangeBase):
                 dates.append(t)
 
 
-class RangeDaily(RangeDailyBase):
+class _BulkCompleteRangeMixin:
+    """
+    Adds a tri-state bulk check and filesystem-listing fallback to a range class.
+
+    Subclasses provide ``_bulk_regex`` and benefit from a single bulk check per
+    :py:meth:`requires` call: the check splits instances into complete, missing
+    and undecidable, so a claim is made only for positively missing instances.
+    """
+
+    _bulk_regex = None
+
+    def _bulk_check(self, finite_datetimes):
+        """Return (complete, missing, undecidable) datetimes after one bulk check."""
+        cached = getattr(self, "_cached_bulk_check", None)
+        if cached is not None and cached[0] == list(finite_datetimes):
+            return cached[1], cached[2], cached[3]
+        try:
+            complete, missing, undecidable = _bulk_complete_datetimes(
+                self.of,
+                self.datetime_to_parameter,
+                self.parameter_to_datetime,
+                finite_datetimes,
+                self.of_params,
+            )
+        except NotImplementedError:
+            missing = infer_bulk_complete_from_fs(
+                finite_datetimes,
+                lambda d: self._instantiate_task_cls(self.datetime_to_parameter(d)),
+                lambda d: d.strftime(self._bulk_regex),
+            )
+            complete, undecidable = sorted(set(finite_datetimes) - set(missing)), []
+        self._cached_bulk_check = (list(finite_datetimes), complete, missing, undecidable)
+        return complete, missing, undecidable
+
+    def missing_datetimes(self, finite_datetimes):
+        return self._bulk_check(finite_datetimes)[1]
+
+    def complete_datetimes(self, finite_datetimes):
+        return self._bulk_check(finite_datetimes)[0]
+
+    def undecidable_datetimes(self, finite_datetimes):
+        return self._bulk_check(finite_datetimes)[2]
+
+    def _partition_datetimes(self, finite_datetimes):
+        complete, missing, undecidable = self._bulk_check(finite_datetimes)
+        return sorted(complete), sorted(missing), sorted(undecidable)
+
+
+class RangeDaily(_BulkCompleteRangeMixin, RangeDailyBase):
     """Efficiently produces a contiguous completed range of a daily recurring
     task that takes a single ``DateParameter``.
 
@@ -723,18 +890,10 @@ class RangeDaily(RangeDailyBase):
         luigi --module your.module RangeDaily --of YourActualTask --start 2014-01-01
     """
 
-    def missing_datetimes(self, finite_datetimes):
-        try:
-            cls_with_params = functools.partial(self.of, **self.of_params)
-            complete_parameters = self.of.bulk_complete.__func__(cls_with_params, map(self.datetime_to_parameter, finite_datetimes))
-            return set(finite_datetimes) - set(map(self.parameter_to_datetime, complete_parameters))
-        except NotImplementedError:
-            return infer_bulk_complete_from_fs(
-                finite_datetimes, lambda d: self._instantiate_task_cls(self.datetime_to_parameter(d)), lambda d: d.strftime("(%Y).*(%m).*(%d)")
-            )
+    _bulk_regex = "(%Y).*(%m).*(%d)"
 
 
-class RangeHourly(RangeHourlyBase):
+class RangeHourly(_BulkCompleteRangeMixin, RangeHourlyBase):
     """Efficiently produces a contiguous completed range of an hourly recurring
     task that takes a single ``DateHourParameter``.
 
@@ -750,19 +909,10 @@ class RangeHourly(RangeHourlyBase):
         luigi --module your.module RangeHourly --of YourActualTask --start 2014-01-01T00
     """
 
-    def missing_datetimes(self, finite_datetimes):
-        try:
-            # TODO: Why is there a list() here but not for the RangeDaily??
-            cls_with_params = functools.partial(self.of, **self.of_params)
-            complete_parameters = self.of.bulk_complete.__func__(cls_with_params, list(map(self.datetime_to_parameter, finite_datetimes)))
-            return set(finite_datetimes) - set(map(self.parameter_to_datetime, complete_parameters))
-        except NotImplementedError:
-            return infer_bulk_complete_from_fs(
-                finite_datetimes, lambda d: self._instantiate_task_cls(self.datetime_to_parameter(d)), lambda d: d.strftime("(%Y).*(%m).*(%d).*(%H)")
-            )
+    _bulk_regex = "(%Y).*(%m).*(%d).*(%H)"
 
 
-class RangeByMinutes(RangeByMinutesBase):
+class RangeByMinutes(_BulkCompleteRangeMixin, RangeByMinutesBase):
     """Efficiently produces a contiguous completed range of an recurring
     task every interval minutes that takes a single ``DateMinuteParameter``.
 
@@ -778,12 +928,4 @@ class RangeByMinutes(RangeByMinutesBase):
         luigi --module your.module RangeByMinutes --of YourActualTask --start 2014-01-01T0123
     """
 
-    def missing_datetimes(self, finite_datetimes):
-        try:
-            cls_with_params = functools.partial(self.of, **self.of_params)
-            complete_parameters = self.of.bulk_complete.__func__(cls_with_params, map(self.datetime_to_parameter, finite_datetimes))
-            return set(finite_datetimes) - set(map(self.parameter_to_datetime, complete_parameters))
-        except NotImplementedError:
-            return infer_bulk_complete_from_fs(
-                finite_datetimes, lambda d: self._instantiate_task_cls(self.datetime_to_parameter(d)), lambda d: d.strftime("(%Y).*(%m).*(%d).*(%H).*(%M)")
-            )
+    _bulk_regex = "(%Y).*(%m).*(%d).*(%H).*(%M)"

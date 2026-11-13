@@ -64,9 +64,14 @@ from luigi.parameter import (
 from luigi.rpc import RemoteScheduler, RPCError
 from luigi.target import Target
 from luigi.task import (
+    BulkCompleteEvidence,
+    BulkCompleteResult,
+    BulkCompleteStatus,
     Config,
     DynamicRequirements,
     ExternalTask,
+    MixinBulkCompleteBySource,
+    MixinNaiveBulkComplete,
     Task,
     WrapperTask,
     auto_namespace,
@@ -83,6 +88,11 @@ __all__ = [
     "namespace",
     "auto_namespace",
     "DynamicRequirements",
+    "BulkCompleteStatus",
+    "BulkCompleteResult",
+    "BulkCompleteEvidence",
+    "MixinNaiveBulkComplete",
+    "MixinBulkCompleteBySource",
     "target",
     "task_register",
     "Target",

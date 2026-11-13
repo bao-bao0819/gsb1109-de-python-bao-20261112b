@@ -422,9 +422,37 @@ class MixinBigQueryBulkComplete:
     Allows to efficiently check if a range of BigQueryTargets are complete.
     This enables scheduling tasks with luigi range tools.
 
+    Checks are grouped per dataset: an unreadable dataset yields undecidable
+    results only for the tables in it, while other datasets are still checked.
+
     If you implement a custom Luigi task with a BigQueryTarget output, make sure to also inherit
     from this mixin to enable range support.
     """
+
+    @classmethod
+    def bulk_complete_source(cls, parameter_tuple):
+        """The dataset a parameter tuple's output table lives in."""
+        task = cls(parameter_tuple)
+        return task.output().table.dataset
+
+    @classmethod
+    def bulk_complete_source_items(cls, source, parameter_tuples):
+        """
+        Report complete/missing tables for one dataset.
+
+        Raises if the dataset cannot be read, marking only its own items
+        undecidable. A table that is absent from an otherwise readable dataset
+        is reported as missing.
+        """
+        tasks_with_params = [(cls(p), p) for p in parameter_tuples]
+        if not tasks_with_params:
+            return {}
+
+        client = tasks_with_params[0][0].output().client
+        if not client.dataset_exists(source):
+            return {p: False for _, p in tasks_with_params}
+        available_tables = set(client.list_tables(source))
+        return {p: t.output().table.table_id in available_tables for t, p in tasks_with_params}
 
     @classmethod
     def bulk_complete(cls, parameter_tuples):

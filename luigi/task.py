@@ -23,14 +23,18 @@ See :doc:`/tasks` for an overview.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import enum
 import functools
 import hashlib
 import json
 import logging
 import re
+import threading
 import traceback
 import warnings
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, Optional, TypeAlias, TypeVar
 
@@ -151,6 +155,237 @@ class BulkCompleteNotImplementedError(NotImplementedError):
     an abstract method."""
 
     pass
+
+
+class BulkCompleteStatus(enum.Enum):
+    """
+    Per-item outcome of a bulk completeness check.
+
+    ``COMPLETE`` and ``MISSING`` are conclusions backed by evidence. ``UNKNOWN``
+    means that the check could not reach a conclusion for that item, e.g.
+    because the source it lives in was temporarily unreadable. Unknown items
+    are neither missing nor complete: they must not be claimed for work and
+    they must not be reported as done.
+    """
+
+    COMPLETE = "COMPLETE"
+    MISSING = "MISSING"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclasses.dataclass(frozen=True)
+class BulkCompleteResult:
+    """
+    A tri-state, per-item outcome of a bulk completeness check.
+
+    ``items`` maps every checked parameter tuple to a
+    :py:class:`BulkCompleteStatus`. ``source`` and ``source_version``
+    optionally record where the evidence was read from; they are only
+    meaningful for reuse of ``COMPLETE`` evidence and are ignored for the
+    other statuses.
+
+    ``errors`` maps a source identifier to the exception raised while reading
+    it, so callers can tell "no evidence yet" apart from "evidence says no".
+    """
+
+    items: Dict[Any, BulkCompleteStatus]
+    source: Optional[Any] = None
+    source_version: Optional[Any] = None
+    errors: Dict[Any, BaseException] = dataclasses.field(default_factory=dict)
+
+    def status(self, parameter_tuple):
+        return self.items.get(parameter_tuple, BulkCompleteStatus.UNKNOWN)
+
+    def complete_items(self):
+        return [p for p, status in self.items.items() if status is BulkCompleteStatus.COMPLETE]
+
+    def missing_items(self):
+        return [p for p, status in self.items.items() if status is BulkCompleteStatus.MISSING]
+
+    def unknown_items(self):
+        return [p for p, status in self.items.items() if status is BulkCompleteStatus.UNKNOWN]
+
+
+class BulkCompleteEvidence:
+    """
+    Reusable evidence from successful bulk completeness checks.
+
+    Evidence is keyed by task family, source and source version. Only
+    ``COMPLETE`` conclusions are recorded: a source that could not be read
+    produces no evidence, and a ``MISSING`` conclusion is deliberately not
+    cached so that it is re-confirmed (and can be claimed) on the next round.
+
+    Because the source version is part of the key, evidence recorded for one
+    version of a source is never used to answer questions about another
+    version of it. Callers that cannot provide a version get no reuse at all,
+    which errs on the side of re-checking.
+
+    ``max_entries`` bounds the number of retained source versions so that a
+    long-running process does not accumulate evidence for every generation a
+    source ever had. The least recently recorded version is evicted first.
+    """
+
+    def __init__(self, max_entries=1000):
+        self._evidence: Dict[Any, set] = {}
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(task_family, source, version):
+        return task_family, source, version
+
+    def _evict_if_needed(self):
+        while len(self._evidence) > self._max_entries:
+            self._evidence.pop(next(iter(self._evidence)))
+
+    def get(self, task_family, source, version):
+        """Return the frozen set of parameter tuples already known complete."""
+        if version is None:
+            return frozenset()
+        key = self._key(task_family, source, version)
+        with self._lock:
+            return frozenset(self._evidence.get(key, ()))
+
+    def record(self, task_family, source, version, parameter_tuples):
+        """Record successfully checked parameter tuples for a source version."""
+        if version is None:
+            return
+        key = self._key(task_family, source, version)
+        values = set(parameter_tuples)
+        if not values:
+            return
+        with self._lock:
+            # Refresh the key's position so it is the last to be evicted.
+            self._evidence.pop(key, None)
+            self._evidence[key] = values
+            self._evict_if_needed()
+
+    def discard(self, task_family=None, source=None, version=None):
+        """Drop evidence matching the given filters (all evidence if omitted)."""
+        with self._lock:
+            keys = [
+                key
+                for key in self._evidence
+                if (task_family is None or key[0] == task_family) and (source is None or key[1] == source) and (version is None or key[2] == version)
+            ]
+            for key in keys:
+                del self._evidence[key]
+
+    def clear(self):
+        with self._lock:
+            self._evidence.clear()
+
+
+DEFAULT_BULK_COMPLETE_EVIDENCE = BulkCompleteEvidence()
+
+
+def _resolve_hook(task_cls, name):
+    """
+    Return the plain function implementing ``name`` on ``task_cls``.
+
+    Overrides may be written as a ``@classmethod`` (a bound method, via
+    ``__func__``) or, for backward compatibility, as a plain instance method
+    declared on the class (in which case it takes the class as first argument
+    when looked up on the class). Both are invoked as ``hook(cls, ...)``.
+    """
+    implementation = getattr(task_cls, name)
+    return getattr(implementation, "__func__", implementation)
+
+
+class BoundTaskClass:
+    """
+    A task class with some parameters pre-bound, for use as the first hook argument.
+
+    Calling it instantiates the task with the bound parameters merged into the
+    call, like ``functools.partial(task_cls, **params)``. Unlike a partial,
+    attribute access (and therefore ``cls.SOME_CLASS_ATTRIBUTE`` inside
+    ``bulk_complete`` implementations) is forwarded to the task class.
+    """
+
+    __slots__ = ("func", "_params")
+
+    def __init__(self, task_cls, params=None):
+        self.func = task_cls
+        self._params = dict(params or {})
+
+    def __call__(self, *args, **kwargs):
+        merged = dict(self._params)
+        merged.update(kwargs)
+        return self.func(*args, **merged)
+
+    def __getattr__(self, name):
+        return getattr(self.func, name)
+
+    def __setattr__(self, name, value):
+        # Keep the proxy's own slots local; behave like the task class for
+        # everything else (e.g. ``cls.some_counter += 1`` in a hook).
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self.func, name, value)
+
+
+def _resolve_task_cls(cls):
+    """Return the task class behind a plain class, partial or bound-task proxy."""
+    return getattr(cls, "func", cls)
+
+
+def _has_source_items_hook(task_cls):
+    """True if the class provides a per-source check hook of its own."""
+    return getattr(task_cls, "bulk_complete_source_items", None) is not None
+
+
+def _invoke_source_items_hook(call_cls, task_cls, source, parameter_tuples):
+    """Prefer the source-aware per-item hook, otherwise call ``bulk_complete``."""
+    source_items = getattr(task_cls, "bulk_complete_source_items", None)
+    if source_items is not None:
+        return _resolve_hook(task_cls, "bulk_complete_source_items")(call_cls, source, parameter_tuples)
+    return _resolve_hook(task_cls, "bulk_complete")(call_cls, parameter_tuples)
+
+
+def _has_bulk_implementation(task_cls):
+    """True if the class overrides either the per-source or the bulk hook."""
+    return _resolve_hook(task_cls, "bulk_complete") is not _resolve_hook(Task, "bulk_complete") or _has_source_items_hook(task_cls)
+
+
+def _bulk_complete_status(value):
+    """Coerce a per-item status to a :py:class:`BulkCompleteStatus`."""
+    if isinstance(value, BulkCompleteStatus):
+        return value
+    if isinstance(value, bool):
+        return BulkCompleteStatus.COMPLETE if value else BulkCompleteStatus.MISSING
+    if value is None:
+        return BulkCompleteStatus.UNKNOWN
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if normalized in {"COMPLETE", "DONE", "PRESENT", "EXISTS", "SUCCESS", "TRUE"}:
+            return BulkCompleteStatus.COMPLETE
+        if normalized in {"MISSING", "ABSENT", "NOT_FOUND", "INCOMPLETE", "FALSE"}:
+            return BulkCompleteStatus.MISSING
+        if normalized in {"UNKNOWN", "INDETERMINATE", "UNDECIDABLE", "UNAVAILABLE", "PENDING", "DEFERRED"}:
+            return BulkCompleteStatus.UNKNOWN
+    raise ValueError("Unrecognized bulk completion status %r" % (value,))
+
+
+def _flatten_bulk_complete_statuses(raw, requested):
+    """
+    Normalize the many acceptable ``bulk_complete`` return shapes to a status
+    mapping covering every requested parameter tuple.
+
+    Supported shapes are a :py:class:`BulkCompleteResult`, a mapping of
+    parameter tuple to status/bool/string, or the legacy iterable of complete
+    parameter tuples (anything not listed is assumed missing).
+    """
+    requested = list(requested)
+    if isinstance(raw, BulkCompleteResult):
+        return {p: raw.status(p) for p in requested}
+    if isinstance(raw, Mapping):
+        normalized = {p: _bulk_complete_status(raw[p]) for p in requested if p in raw}
+        for p in requested:
+            normalized.setdefault(p, BulkCompleteStatus.MISSING)
+        return normalized
+    complete = set(raw or ())
+    return {p: BulkCompleteStatus.COMPLETE if p in complete else BulkCompleteStatus.MISSING for p in requested}
 
 
 @dataclass_transform(eq_default=False, order_default=False, kw_only_default=True, field_specifiers=(Parameter,))
@@ -618,8 +853,140 @@ class Task(metaclass=Register):
 
         Override (with an efficient implementation) for efficient scheduling
         with range tools. Keep the logic consistent with that of complete().
+
+        Returning an iterable implies that everything left out is missing. To
+        report partitions that could not be checked (for example because their
+        source was temporarily unreadable) without claiming them for work,
+        override :py:meth:`bulk_complete_source` and
+        :py:meth:`bulk_complete_source_items`; :py:meth:`bulk_complete_result`
+        then distinguishes complete, missing and undecidable items. It also
+        accepts a mapping of parameter tuple to bool/status, or a
+        :py:class:`BulkCompleteResult`, from this method.
         """
         raise BulkCompleteNotImplementedError()
+
+    @classmethod
+    def bulk_complete_source(cls, parameter_tuple):
+        """
+        Returns the source a parameter tuple is checked against.
+
+        A source is any hashable identifier, e.g. a dataset, bucket or storage
+        shard. The default is ``None``, meaning one implicit source for the
+        whole class. Override this (together with
+        :py:meth:`bulk_complete_source_version`) to let
+        :py:meth:`bulk_complete_result` isolate sources from each other: a
+        source that cannot be read then yields undecidable results only for
+        its own items, while items in other sources are still checked.
+        """
+        return None
+
+    @classmethod
+    def bulk_complete_source_version(cls, source):
+        """
+        Returns a token identifying the state of ``source``.
+
+        Evidence from a successful check is reused only within the same
+        ``(task family, source, version)`` triple. Returning ``None`` (the
+        default) disables reuse for that source, so every check re-reads it.
+
+        The token must change whenever new partitions may have appeared or
+        disappeared, otherwise completed items would never be re-examined.
+        """
+        return None
+
+    @classmethod
+    def bulk_complete_result(cls, parameter_tuples, source=None, source_version=None, evidence=None):
+        """
+        Checks many parameter tuples and keeps a per-item, tri-state result.
+
+        Each requested parameter tuple ends up as ``COMPLETE``, ``MISSING`` or
+        ``UNKNOWN``. A failure to read one source marks only that source's
+        items ``UNKNOWN``; other sources are still checked. Successful
+        ``COMPLETE`` conclusions are recorded in ``evidence`` scoped to the
+        item's source version, while ``MISSING`` and ``UNKNOWN`` are never
+        recorded, so they have to be re-established on the next check.
+
+        :param parameter_tuples: iterable of parameter tuples to check
+        :param source: optional explicit source for all items (overrides
+            :py:meth:`bulk_complete_source`)
+        :param source_version: optional explicit source version for all items
+        :param evidence: optional :py:class:`BulkCompleteEvidence` store; the
+            process-wide default is used when omitted
+        """
+        requested = list(parameter_tuples)
+        if evidence is None:
+            evidence = DEFAULT_BULK_COMPLETE_EVIDENCE
+
+        # Calling the hook of the base Task class means "not implemented" for
+        # the whole check, exactly like the historical bulk_complete contract.
+        task_cls = _resolve_task_cls(cls)
+        if isinstance(cls, functools.partial):
+            bound_cls = BoundTaskClass(task_cls, cls.keywords)
+        else:
+            bound_cls = cls
+        task_family = task_cls.get_task_family()
+        if not _has_bulk_implementation(task_cls):
+            raise BulkCompleteNotImplementedError()
+
+        if source is not None:
+            groups = {source: requested}
+        else:
+            source_hook = _resolve_hook(task_cls, "bulk_complete_source")
+            groups = {}
+            for parameter_tuple in requested:
+                item_source = source_hook(bound_cls, parameter_tuple)
+                groups.setdefault(item_source, []).append(parameter_tuple)
+
+        version_hook = _resolve_hook(task_cls, "bulk_complete_source_version")
+        items = {}
+        errors = {}
+        for item_source, group in groups.items():
+            group_version = source_version if source_version is not None else version_hook(bound_cls, item_source)
+            cached = evidence.get(task_family, item_source, group_version)
+            remaining = []
+            for parameter_tuple in group:
+                if parameter_tuple in cached:
+                    items[parameter_tuple] = BulkCompleteStatus.COMPLETE
+                else:
+                    remaining.append(parameter_tuple)
+
+            if not remaining:
+                continue
+            try:
+                raw = _invoke_source_items_hook(bound_cls, task_cls, item_source, remaining)
+                statuses = _flatten_bulk_complete_statuses(raw, remaining)
+                if isinstance(raw, BulkCompleteResult):
+                    if raw.source is not None:
+                        item_source = raw.source
+                    if source_version is None and raw.source_version is not None:
+                        group_version = raw.source_version
+                    reported_errors = raw.errors
+                    errors.update(reported_errors)
+                else:
+                    reported_errors = {}
+            except NotImplementedError:
+                raise
+            except Exception as exc:
+                errors[item_source] = exc
+                for parameter_tuple in remaining:
+                    items[parameter_tuple] = BulkCompleteStatus.UNKNOWN
+                continue
+
+            # An error reported for this source makes its evidence unusable,
+            # even if some individual items were also reported with a status.
+            if item_source in reported_errors:
+                for parameter_tuple in remaining:
+                    items[parameter_tuple] = BulkCompleteStatus.UNKNOWN
+                continue
+
+            for parameter_tuple in remaining:
+                items[parameter_tuple] = statuses[parameter_tuple]
+            checked_complete = [p for p in remaining if statuses[p] is BulkCompleteStatus.COMPLETE]
+            evidence.record(task_family, item_source, group_version, checked_complete)
+
+        for parameter_tuple in requested:
+            items.setdefault(parameter_tuple, BulkCompleteStatus.UNKNOWN)
+        return BulkCompleteResult(items=items, errors=errors)
 
     def output(self) -> FlattenableItems["Target"]:
         """
@@ -782,6 +1149,76 @@ class MixinNaiveBulkComplete:
                 if cls(parameter_tuple).complete():
                     generated_tuples.append(parameter_tuple)
         return generated_tuples
+
+
+class MixinBulkCompleteBySource:
+    """
+    Bulk completion for tasks whose outputs live in independent sources.
+
+    Subclasses declare how to map a parameter tuple to a source and how to
+    check one source. A source that raises while being read is reported as
+    ``UNKNOWN`` for its own items only; every other source is still checked,
+    so one unreadable store cannot block the whole range. Successful
+    ``COMPLETE`` conclusions are recorded per source version and reused only
+    while that version stays the same.
+
+    Example::
+
+        class MyTask(MixinBulkCompleteBySource, luigi.Task):
+            def bulk_complete_source(self, parameter_tuple):
+                return parameter_tuple[0]          # e.g. the storage shard
+
+            def bulk_complete_source_version(self, source):
+                return shard_generation(source)    # e.g. an etag or generation
+
+            def bulk_complete_source_items(self, source, parameter_tuples):
+                listing = list_partitions(source)  # may raise if unreadable
+                return {p: partition_exists(p, listing) for p in parameter_tuples}
+    """
+
+    @classmethod
+    def bulk_complete_source(cls, parameter_tuple):
+        """Return the source a parameter tuple belongs to."""
+        raise NotImplementedError("bulk_complete_source() must be implemented to check sources independently")
+
+    @classmethod
+    def bulk_complete_source_version(cls, source):
+        """
+        Return a token for the current state of ``source``.
+
+        The token scopes reuse of ``COMPLETE`` evidence. Returning ``None``
+        (the default) disables reuse, which is safe but re-reads the source
+        on every check.
+        """
+        return None
+
+    @classmethod
+    def bulk_complete_source_items(cls, source, parameter_tuples):
+        """
+        Return per-item statuses for all ``parameter_tuples`` of ``source``.
+
+        The return value may be a mapping of parameter tuple to
+        :py:class:`~luigi.task.BulkCompleteStatus`, or to a bool (``True``
+        meaning complete and ``False`` meaning missing). Raising an exception
+        marks this source's items undecidable without affecting other sources.
+        """
+        raise NotImplementedError("bulk_complete_source_items() must be implemented to check sources independently")
+
+    @classmethod
+    def bulk_complete(cls, parameter_tuples):
+        groups = {}
+        for parameter_tuple in parameter_tuples:
+            groups.setdefault(cls.bulk_complete_source(parameter_tuple), []).append(parameter_tuple)
+
+        complete = []
+        for source, group in groups.items():
+            try:
+                statuses = _flatten_bulk_complete_statuses(cls.bulk_complete_source_items(source, group), group)
+            except Exception as exc:
+                logger.warning("Skipping source %r during bulk completeness check: %s", source, exc)
+                continue
+            complete.extend(p for p in group if statuses[p] is BulkCompleteStatus.COMPLETE)
+        return complete
 
 
 class DynamicRequirements(object):
