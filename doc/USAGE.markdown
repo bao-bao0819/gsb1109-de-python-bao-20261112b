@@ -36,6 +36,8 @@ The following filename types are supported:
 * Delimited-file filenames, including relative/absolute paths
 * sqlite3 database filenames, with an additional `:::<table_name>` for accessing a specific table. If a database contains only one table, then denoting the table name is not needed. Examples: `mydatabase.sqlite3:::users_table` or `my_single_table_database.sqlite`.
 
+Filenames that contain spaces (or other characters that are not valid in a bare sqlite identifier) can be quoted, e.g. `select * from "my data file.csv"`.
+
 Use `-H` to signify that the input contains a header line. Column names will be detected automatically in that case, and can be used in the query. If this option is not provided, columns will be named cX, starting with 1 (e.g. q "SELECT c3,c8 from ...").
 
 Use `-d` to specify the input delimiter.
@@ -46,7 +48,7 @@ Please note that column names that include spaces need to be used in the query w
 
 Query/Input/Output encodings are fully supported (and q tries to provide out-of-the-box usability in that area). Please use `-e`,`-E` and `-Q` to control encoding if needed.
 
-All sqlite3 SQL constructs are supported, including joins across files (use an alias for each table), with the exception of CTE (for now).
+All sqlite3 SQL constructs are supported, including joins across files (use an alias for each table), CTEs and nested subqueries. CTE names are local to the scope in which they are defined, and hide files or tables with the same name. A source name which appears inside a string or a comment is not treated as a filename.
 
 See https://github.com/harelba/q for more details.
 
@@ -55,7 +57,7 @@ q gets one parameter - An SQL-like query.
 
 Any standard SQL expression, condition (both WHERE and HAVING), GROUP BY, ORDER BY etc. are allowed.
 
-JOINs are supported and Subqueries are supported in the WHERE clause, but unfortunately not in the FROM clause for now. Use table aliases when performing JOINs.
+JOINs are supported, and subqueries are supported both in the WHERE clause and in the FROM clause. Use table aliases when performing JOINs.
 
 The SQL syntax itself is sqlite's syntax. For details look at https://www.sqlite.org/lang.html or search the net for examples.
 

@@ -776,6 +776,10 @@ class FileNotFoundException(Exception):
 
     def __init__(self, msg):
         self.msg = msg
+        # Position of the source in the original sql. Filled in when the error can be traced back
+        # to a specific table reference.
+        self.position = None
+        self.qtable_name = None
 
     def __str(self):
         return repr(self.msg)
@@ -845,9 +849,191 @@ class MaximumSourceFilesExceededException(Exception):
 
 
 
-# Simplistic Sql "parsing" class... We'll eventually require a real SQL parser which will provide us with a parse tree
-#
-# A "qtable" is a filename which behaves like an SQL table...
+SQL_TOKEN_IDENTIFIER = 'identifier'
+SQL_TOKEN_STRING = 'string'
+SQL_TOKEN_PUNCTUATION = 'punctuation'
+SQL_TOKEN_WHITESPACE = 'whitespace'
+SQL_TOKEN_COMMENT = 'comment'
+
+# Keywords after which the next token is a table reference (or the start of a subquery)
+SQL_TABLE_REFERENCE_KEYWORDS = ('FROM', 'JOIN')
+# Keywords which start a query. Used for identifying parenthesized subqueries
+SQL_QUERY_START_KEYWORDS = ('SELECT', 'WITH', 'VALUES')
+# Keywords which may be part of a cte definition, between the cte name and its body
+SQL_CTE_HINT_KEYWORDS = ('NOT', 'MATERIALIZED')
+# Keywords which end the FROM clause of a query
+SQL_FROM_CLAUSE_TERMINATOR_KEYWORDS = ('WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'UNION',
+                                       'INTERSECT', 'EXCEPT', 'WINDOW', 'RETURNING')
+# Bare sqlite identifiers. Anything else needs to be quoted when embedded into the query
+SQL_BARE_IDENTIFIER_REGEXP = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+class SqlToken(object):
+    def __init__(self, token_type, value, start, end, quoted=False):
+        self.token_type = token_type
+        # The effective value - unquoted for quoted identifiers and strings
+        self.value = value
+        # Position of the token in the original SQL
+        self.start = start
+        self.end = end
+        self.quoted = quoted
+
+    def is_identifier(self):
+        return self.token_type in [SQL_TOKEN_IDENTIFIER, SQL_TOKEN_STRING]
+
+    def is_keyword(self, keyword):
+        # Quoted identifiers and strings are never keywords
+        return self.token_type == SQL_TOKEN_IDENTIFIER and not self.quoted and self.value.upper() == keyword
+
+    def __str__(self):
+        return "SqlToken<%s,%s,%s:%s>" % (self.token_type, self.value, self.start, self.end)
+    __repr__ = __str__
+
+
+def tokenize_sql(sql):
+    # A lenient SQL tokenizer. Strings, quoted identifiers and comments are single tokens, so a FROM
+    # which appears inside them is never treated as a table reference. Unterminated quoting is not an
+    # error here - the rest of the sql is consumed as part of the token, and sqlite itself will provide
+    # the proper error message.
+
+    tokens = []
+    idx = 0
+    sql_length = len(sql)
+
+    while idx < sql_length:
+        c = sql[idx]
+
+        # Whitespace
+        if c in ' \t\r\n\f\v':
+            start = idx
+            while idx < sql_length and sql[idx] in ' \t\r\n\f\v':
+                idx += 1
+            tokens.append(SqlToken(SQL_TOKEN_WHITESPACE, sql[start:idx], start, idx))
+            continue
+
+        # -- single line comment
+        if c == '-' and sql.startswith('--', idx):
+            start = idx
+            end_of_line = sql.find('\n', idx)
+            idx = sql_length if end_of_line == -1 else end_of_line
+            tokens.append(SqlToken(SQL_TOKEN_COMMENT, sql[start:idx], start, idx))
+            continue
+
+        # /* multi line comment */
+        if c == '/' and sql.startswith('/*', idx):
+            start = idx
+            end_of_comment = sql.find('*/', idx + 2)
+            idx = sql_length if end_of_comment == -1 else end_of_comment + 2
+            tokens.append(SqlToken(SQL_TOKEN_COMMENT, sql[start:idx], start, idx))
+            continue
+
+        # Single quoted string. sqlite also allows using it as a quoted identifier.
+        if c == "'":
+            start = idx
+            idx += 1
+            value_chars = []
+            while idx < sql_length:
+                if sql[idx] == "'":
+                    if idx + 1 < sql_length and sql[idx + 1] == "'":
+                        value_chars.append("'")
+                        idx += 2
+                        continue
+                    idx += 1
+                    break
+                value_chars.append(sql[idx])
+                idx += 1
+            tokens.append(SqlToken(SQL_TOKEN_STRING, ''.join(value_chars), start, idx, quoted=True))
+            continue
+
+        # Double-quoted, backtick-quoted and square-bracket quoted identifiers
+        if c in '"\x60[':
+            closing_char = {'"': '"', '\x60': '\x60', '[': ']'}[c]
+            start = idx
+            idx += 1
+            value_chars = []
+            while idx < sql_length:
+                if sql[idx] == closing_char:
+                    if closing_char != ']' and idx + 1 < sql_length and sql[idx + 1] == closing_char:
+                        # Escaped quote by duplication, e.g. "" inside a "quoted" identifier
+                        value_chars.append(closing_char)
+                        idx += 2
+                        continue
+                    idx += 1
+                    break
+                value_chars.append(sql[idx])
+                idx += 1
+            tokens.append(SqlToken(SQL_TOKEN_IDENTIFIER, ''.join(value_chars), start, idx, quoted=True))
+            continue
+
+        # Punctuation
+        if c in '(),;':
+            tokens.append(SqlToken(SQL_TOKEN_PUNCTUATION, c, idx, idx + 1))
+            idx += 1
+            continue
+
+        # Identifiers (including keywords). Dots and colons are part of the identifier, since
+        # filenames may contain them (e.g. data.csv, db.sqlite:::table).
+        start = idx
+        while idx < sql_length:
+            c = sql[idx]
+            if c in ' \t\r\n\f\v(),;\'"\x60[':
+                break
+            if c == '-' and sql.startswith('--', idx):
+                break
+            if c == '/' and sql.startswith('/*', idx):
+                break
+            idx += 1
+        tokens.append(SqlToken(SQL_TOKEN_IDENTIFIER, sql[start:idx], start, idx))
+
+    return tokens
+
+
+class SqlScope(object):
+    # A lexical scope of a query. CTE names are the temporary names of the scope. A table reference is
+    # a real input only if its name is not defined in this scope or in any enclosing scope.
+
+    def __init__(self, parent=None):
+        self.parent = parent
+        self.cte_names = []
+        # Nesting depth of this scope, used for pointing at the right reference when a source is
+        # referenced in more than one place
+        self.depth = 0 if parent is None else parent.depth + 1
+
+    def add_cte_name(self, name):
+        self.cte_names.append(name)
+
+    def _is_defined_here(self, name):
+        lower_name = name.lower()
+        return lower_name in [x.lower() for x in self.cte_names]
+
+    def is_defined(self, name):
+        scope = self
+        while scope is not None:
+            if scope._is_defined_here(name):
+                return True
+            scope = scope.parent
+        return False
+
+    def __str__(self):
+        return "SqlScope<cte_names=%s,parent=%s>" % (self.cte_names, self.parent)
+    __repr__ = __str__
+
+
+class SqlTableReference(object):
+    def __init__(self, qtable_name, start, end, scope_depth=0):
+        self.qtable_name = qtable_name
+        # Position of the table reference in the original sql
+        self.start = start
+        self.end = end
+        # Nesting depth of the query scope that contains this reference
+        self.scope_depth = scope_depth
+        self.normalized_qtable_name = None
+
+    def __str__(self):
+        return "SqlTableReference<%s,%s:%s>" % (self.qtable_name, self.start, self.end)
+    __repr__ = __str__
+
+
 class Sql(object):
 
     def __init__(self, sql, data_streams):
@@ -855,66 +1041,250 @@ class Sql(object):
 
         # Holds original SQL
         self.sql = sql
-        # Holds sql parts
-        self.sql_parts = sql.split()
         self.data_streams = data_streams
 
         self.qtable_metadata_dict = OrderedDict()
 
         # Set of qtable names
         self.qtable_names = []
-        # Dict from qtable names to their positions in sql_parts. Value here is a *list* of positions,
-        # since it is possible that the same qtable_name (file) is referenced in multiple positions
-        # and we don't want the database table to be recreated for each
-        # reference
+        # Dict from qtable names to their references. The same qtable name may be referenced in
+        # multiple positions, and the database table shouldn't be recreated for each reference
         self.qtable_name_positions = {}
-        # Dict from qtable names to their effective (actual database) table
-        # names
+        # Dict from qtable names to their effective (actual database) table names
         self.qtable_name_effective_table_names = {}
+
+        # The real input references, in the order they appear in the original sql
+        self.qtable_references = []
 
         self.query_column_names = None
 
-        # Go over all sql parts
-        idx = 0
-        while idx < len(self.sql_parts):
-            # Get the part string
-            part = self.sql_parts[idx]
-            # If it's a FROM or a JOIN
-            if part.upper() in ['FROM', 'JOIN']:
-                # and there is nothing after it,
-                if idx == len(self.sql_parts) - 1:
-                    # Just fail
-                    raise InvalidQueryException(
-                        'FROM/JOIN is missing a table name after it')
+        self.sql_tokens = tokenize_sql(sql)
+        # Significant tokens are the ones used for the structural parsing. Whitespace and comments are
+        # kept in self.sql_tokens, since get_effective_sql reconstructs the query out of the original sql.
+        self.significant_tokens = [t for t in self.sql_tokens
+                                   if t.token_type not in [SQL_TOKEN_WHITESPACE, SQL_TOKEN_COMMENT]]
+        self._retrieve_qtable_names()
 
-                qtable_name = self.sql_parts[idx + 1]
-                # Otherwise, the next part contains the qtable name. In most cases the next part will be only the qtable name.
-                # We handle one special case here, where this is a subquery as a column: "SELECT (SELECT ... FROM qtable),100 FROM ...".
-                # In that case, there will be an ending paranthesis as part of the name, and we want to handle this case gracefully.
-                # This is obviously a hack of a hack :) Just until we have
-                # complete parsing capabilities
-                if ')' in qtable_name:
-                    leftover = qtable_name[qtable_name.index(')'):]
-                    self.sql_parts.insert(idx + 2, leftover)
-                    qtable_name = qtable_name[:qtable_name.index(')')]
-                    self.sql_parts[idx + 1] = qtable_name
+        xprint("Qtable references: %s" % self.qtable_references)
 
-                if qtable_name[0] != '(':
-                    normalized_qtable_name = self.normalize_qtable_name(qtable_name)
-                    xprint("Normalized qtable name for %s is %s" % (qtable_name,normalized_qtable_name))
-                    self.qtable_names += [normalized_qtable_name]
+    def _retrieve_qtable_names(self):
+        self._scan_range(self.significant_tokens, 0, len(self.significant_tokens), SqlScope())
 
-                    if normalized_qtable_name not in self.qtable_name_positions.keys():
-                        self.qtable_name_positions[normalized_qtable_name] = []
+    def _scan_range(self, tokens, start, end, scope, in_from_clause=False):
+        idx = start
 
-                    self.qtable_name_positions[normalized_qtable_name].append(idx + 1)
-                    self.sql_parts[idx + 1] = normalized_qtable_name
-                    idx += 2
-                else:
-                    idx += 1
-            else:
+        while idx < end:
+            token = tokens[idx]
+
+            if token.token_type == SQL_TOKEN_PUNCTUATION and token.value == '(':
+                idx = self._handle_parenthesis(tokens, idx, end, scope, in_from_clause)
+                continue
+
+            if idx == start and token.is_keyword('WITH'):
+                # A WITH clause defines temporary names, which are visible only in its own scope. In
+                # sqlite, WITH can only appear at the beginning of a query, so only the first token of
+                # a scanned range can be a WITH clause (and not, for example, a file named "with").
+                self._handle_with(tokens, idx, end, scope)
+                return
+
+            if any(token.is_keyword(k) for k in SQL_TABLE_REFERENCE_KEYWORDS):
+                # JOIN is part of the FROM clause, so a comma which follows it introduces another
+                # table factor of the same clause
+                in_from_clause = True
+                self._record_table_factor(tokens, idx, end, scope)
                 idx += 1
-        xprint("Final sql parts: %s" % self.sql_parts)
+                continue
+
+            if in_from_clause:
+                if token.token_type == SQL_TOKEN_PUNCTUATION and token.value == ',':
+                    # Another table factor in the same FROM clause
+                    self._record_table_factor(tokens, idx, end, scope)
+                    idx += 1
+                    continue
+                if any(token.is_keyword(k) for k in SQL_FROM_CLAUSE_TERMINATOR_KEYWORDS):
+                    in_from_clause = False
+
+            idx += 1
+
+    def _handle_parenthesis(self, tokens, paren_idx, end, scope, in_from_clause=False):
+        close_idx = self._find_matching_parenthesis(tokens, paren_idx, end)
+
+        if self._is_query_parenthesis(tokens, paren_idx, close_idx):
+            # A subquery - it has its own scope, which inherits the names of the enclosing scopes
+            self._scan_range(tokens, paren_idx + 1, close_idx, SqlScope(scope))
+        elif in_from_clause and not self._is_function_call_parenthesis(tokens, paren_idx):
+            # A parenthesized join, e.g. FROM (a JOIN b ON ...). Its contents are a from clause, and
+            # the first table factor is the first token inside the parenthesis.
+            self._record_table_factor_at(tokens, paren_idx + 1, end, scope)
+            self._scan_range(tokens, paren_idx + 1, close_idx, scope, in_from_clause=True)
+        else:
+            # A regular parenthesis (function call, expression) - its contents belong to the current
+            # scope, and are not a from clause.
+            self._scan_range(tokens, paren_idx + 1, close_idx, scope, in_from_clause=False)
+
+        return close_idx + 1
+
+    def _is_function_call_parenthesis(self, tokens, paren_idx):
+        # A parenthesis which directly follows a name is a function call (e.g. FROM json_each(...)),
+        # even when it appears in a from clause. CTE definitions are handled separately, so they're
+        # not affected by this.
+        if paren_idx == 0:
+            return False
+        return tokens[paren_idx - 1].is_identifier()
+
+    def _is_query_parenthesis(self, tokens, paren_idx, close_idx):
+        if paren_idx + 1 >= close_idx:
+            return False
+        next_token = tokens[paren_idx + 1]
+        return any(next_token.is_keyword(k) for k in SQL_QUERY_START_KEYWORDS)
+
+    def _find_matching_parenthesis(self, tokens, paren_idx, end):
+        depth = 0
+        idx = paren_idx
+        while idx < end:
+            token = tokens[idx]
+            if token.token_type == SQL_TOKEN_PUNCTUATION:
+                if token.value == '(':
+                    depth += 1
+                elif token.value == ')':
+                    depth -= 1
+                    if depth == 0:
+                        return idx
+            idx += 1
+        # Unbalanced - treat the rest of the sql as the parenthesized part
+        return end
+
+    def _collect_cte_definitions(self, tokens, with_idx, end):
+        # Collect all the cte names of a WITH clause first, since sqlite allows a cte body to reference
+        # ctes which are defined after it in the same WITH clause.
+        definitions = []
+        idx = with_idx + 1
+
+        if idx < end and tokens[idx].is_keyword('RECURSIVE'):
+            idx += 1
+
+        while idx < end:
+            if not tokens[idx].is_identifier():
+                break
+
+            cte_name_token = tokens[idx]
+            idx += 1
+
+            # Optional column name list, e.g. WITH cte(a,b) AS (...)
+            if idx < end and tokens[idx].token_type == SQL_TOKEN_PUNCTUATION and tokens[idx].value == '(':
+                idx = self._find_matching_parenthesis(tokens, idx, end) + 1
+
+            if not (idx < end and tokens[idx].is_keyword('AS')):
+                break
+            idx += 1
+
+            # Optional NOT MATERIALIZED / MATERIALIZED
+            while idx < end and any(tokens[idx].is_keyword(k) for k in SQL_CTE_HINT_KEYWORDS):
+                idx += 1
+
+            if not (idx < end and tokens[idx].token_type == SQL_TOKEN_PUNCTUATION and tokens[idx].value == '('):
+                break
+
+            close_idx = self._find_matching_parenthesis(tokens, idx, end)
+            definitions.append((cte_name_token, idx, close_idx))
+            idx = close_idx + 1
+
+            if idx < end and tokens[idx].token_type == SQL_TOKEN_PUNCTUATION and tokens[idx].value == ',':
+                idx += 1
+                continue
+            break
+
+        return definitions, idx
+
+    def _handle_with(self, tokens, with_idx, end, scope):
+        definitions, statement_idx = self._collect_cte_definitions(tokens, with_idx, end)
+
+        # All cte names are visible inside all the cte bodies (including each cte's own body, which
+        # sqlite treats as a circular reference), and in the statement following the WITH clause.
+        with_scope = SqlScope(scope)
+        for cte_name_token, body_open_idx, body_close_idx in definitions:
+            with_scope.add_cte_name(cte_name_token.value)
+
+        for cte_name_token, body_open_idx, body_close_idx in definitions:
+            self._scan_range(tokens, body_open_idx + 1, body_close_idx, with_scope)
+
+        self._scan_range(tokens, statement_idx, end, with_scope)
+
+    def _record_table_factor(self, tokens, from_or_join_idx, end, scope):
+        idx = from_or_join_idx + 1
+        self._record_table_factor_at(tokens, idx, end, scope)
+
+    def _record_table_factor_at(self, tokens, idx, end, scope):
+        if idx >= end:
+            raise InvalidQueryException(
+                'FROM/JOIN is missing a table name after it')
+
+        token = tokens[idx]
+
+        # A subquery as a table reference is scanned by the parenthesis handling logic
+        if token.token_type == SQL_TOKEN_PUNCTUATION:
+            return
+
+        if not token.is_identifier():
+            return
+
+        # A table-valued function (e.g. FROM json_each('...')), and not a filename
+        if idx + 1 < end and tokens[idx + 1].token_type == SQL_TOKEN_PUNCTUATION and tokens[idx + 1].value == '(':
+            return
+
+        qtable_name = token.value
+
+        # A cte name is a temporary name, not a real input
+        if scope.is_defined(qtable_name):
+            xprint("Table name %s is a temporary name in the query scope" % qtable_name)
+            return
+
+        normalized_qtable_name = self.normalize_qtable_name(qtable_name)
+        xprint("Normalized qtable name for %s is %s" % (qtable_name, normalized_qtable_name))
+
+        reference = SqlTableReference(qtable_name, token.start, token.end, scope.depth)
+        reference.normalized_qtable_name = normalized_qtable_name
+        self.qtable_references.append(reference)
+
+        self.qtable_names += [normalized_qtable_name]
+        if normalized_qtable_name not in self.qtable_name_positions:
+            self.qtable_name_positions[normalized_qtable_name] = []
+        self.qtable_name_positions[normalized_qtable_name].append(idx)
+
+    def get_position_of_offset(self, offset):
+        # Returns a 1-based (line, column) of an offset in the original sql
+        if offset is None:
+            return None, None
+        prefix = self.sql[:offset]
+        line = prefix.count('\n') + 1
+        last_newline_idx = prefix.rfind('\n')
+        column = offset - last_newline_idx
+        return line, column
+
+    def get_references_of_qtable_name(self, qtable_name):
+        if qtable_name is None:
+            return []
+        try:
+            normalized_qtable_name = self.normalize_qtable_name(qtable_name)
+        except Exception:
+            normalized_qtable_name = qtable_name
+        return [reference for reference in self.qtable_references
+                if reference.normalized_qtable_name == normalized_qtable_name]
+
+    @staticmethod
+    def format_effective_table_name(table_name):
+        # Quote the parts of the table name that can't be used as bare sqlite identifiers. A
+        # db_id.table_name string is split on the first dot, since db ids never contain dots.
+        if '.' in table_name:
+            db_part, table_part = table_name.split('.', 1)
+            return '%s.%s' % (Sql._quote_identifier_if_needed(db_part), Sql._quote_identifier_if_needed(table_part))
+        return Sql._quote_identifier_if_needed(table_name)
+
+    @staticmethod
+    def _quote_identifier_if_needed(identifier):
+        if SQL_BARE_IDENTIFIER_REGEXP.match(identifier):
+            return identifier
+        return '"%s"' % identifier.replace('"', '""')
 
     def normalize_qtable_name(self,qtable_name):
         if self.data_streams.is_data_stream(qtable_name):
@@ -941,19 +1311,32 @@ class Sql(object):
         if len(list(filter(lambda x: x is None, self.qtable_name_effective_table_names))) != 0:
             assert False, 'There are qtables without effective tables'
 
-        effective_sql = [x for x in self.sql_parts]
-
+        # Replace only the spans that were identified as real inputs, leaving the rest of the original
+        # query byte-for-byte intact. This keeps strings, comments, blob literals, whitespace and
+        # temporary names (ctes, aliases) exactly as the user wrote them.
+        replacements = []
         xprint("Effective table names",self.qtable_name_effective_table_names)
-        for qtable_name, positions in six.iteritems(self.qtable_name_positions):
-            xprint("Positions for qtable name %s are %s" % (qtable_name,positions))
-            for pos in positions:
-                if table_name_mapping is not None:
-                    x = self.qtable_name_effective_table_names[qtable_name]
-                    effective_sql[pos] = table_name_mapping[x]
-                else:
-                    effective_sql[pos] = self.qtable_name_effective_table_names[qtable_name]
+        for reference in self.qtable_references:
+            qtable_name = reference.normalized_qtable_name
+            xprint("Replacing reference %s of qtable name %s" % (reference,qtable_name))
+            if table_name_mapping is not None:
+                x = self.qtable_name_effective_table_names[qtable_name]
+                effective_table_name = table_name_mapping[x]
+            else:
+                effective_table_name = self.qtable_name_effective_table_names[qtable_name]
+            replacements.append((reference.start, reference.end,
+                                  self.format_effective_table_name(effective_table_name)))
 
-        return " ".join(effective_sql)
+        replacements.sort()
+        effective_sql = []
+        last_idx = 0
+        for start, end, replacement in replacements:
+            effective_sql.append(self.sql[last_idx:start])
+            effective_sql.append(replacement)
+            last_idx = end
+        effective_sql.append(self.sql[last_idx:])
+
+        return ''.join(effective_sql)
 
     def get_qtable_name_effective_table_names(self):
         return self.qtable_name_effective_table_names
@@ -2761,13 +3144,37 @@ class QTextAsData(object):
 
         # For each "table name"
         for qtable_name in sql_object.qtable_names:
-            tss = self._load_data(qtable_name,input_params,stop_after_analysis=stop_after_analysis)
+            try:
+                tss = self._load_data(qtable_name,input_params,stop_after_analysis=stop_after_analysis)
+            except FileNotFoundException as e:
+                self._add_position_to_file_not_found_error(e,sql_object,qtable_name)
+                raise
             if tss is not None:
                 xprint("New Table Structures:",new_table_structures)
                 assert qtable_name not in new_table_structures, "new_table_structures was changed not to contain a list as a value"
                 new_table_structures[qtable_name] = tss
 
         return new_table_structures
+
+    def _add_position_to_file_not_found_error(self,e,sql_object,qtable_name):
+        references = sql_object.get_references_of_qtable_name(qtable_name)
+        if not references:
+            return
+
+        # When the same source is referenced more than once, the outermost reference is the one
+        # which defines the "entry point" of the source into the query.
+        reference = min(references, key=lambda r: (r.scope_depth, r.start))
+
+        # The position is needed in order to locate the source when the query contains nested scopes
+        # or multiple lines. Simple single-line queries keep their original message.
+        is_ambiguous = len(references) > 1 or any(r.scope_depth > 0 for r in references)
+        is_multiline = '\n' in sql_object.sql
+
+        e.qtable_name = reference.qtable_name
+        if is_ambiguous or is_multiline:
+            line, column = sql_object.get_position_of_offset(reference.start)
+            e.position = (line, column)
+            xprint("Missing source %s is referenced at line %s column %s" % (reference.qtable_name,line,column))
 
     def materialize_query_level_db(self,save_db_to_disk_filename,sql_object):
         # TODO More robust creation - Create the file in a separate folder and move it to the target location only after success
@@ -2921,7 +3328,12 @@ class QTextAsData(object):
         except MissingHeaderException as e:
             error = QError(e,e.msg,117)
         except FileNotFoundException as e:
-            error = QError(e,e.msg,30)
+            if e.position is not None:
+                line, column = e.position
+                msg = "%s (source '%s' referenced at line %s, column %s)" % (e.msg, e.qtable_name, line, column)
+            else:
+                msg = e.msg
+            error = QError(e,msg,30)
         except SqliteOperationalErrorException as e:
             xprint("Sqlite Operational error: %s" % e)
             msg = str(e.original_error)

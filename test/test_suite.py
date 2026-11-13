@@ -4960,6 +4960,139 @@ class SqlTests(AbstractQTestCase):
 
         self.cleanup(tmpfile)
 
+    def _create_scope_test_files(self):
+        header = [six.b('id'), six.b('val')]
+        contents = OrderedDict([
+            ('orders', self.arrays_to_csv_file_content(six.b(','), header, [[six.b('1'), six.b('outer')]])),
+            ('inner-file', self.arrays_to_csv_file_content(six.b(','), header, [[six.b('2'), six.b('inner')]])),
+            ('file with spaces.csv', self.arrays_to_csv_file_content(six.b(','), header, [[six.b('3'), six.b('spaces')]])),
+        ])
+        folder = os.path.dirname(self.create_file_with_data(six.b('')).name)
+        created = []
+        for filename, content in six.iteritems(contents):
+            f = open(os.path.join(folder, filename), 'wb')
+            f.write(content)
+            f.close()
+            created.append(os.path.join(folder, filename))
+        return folder, created
+
+    def _cleanup_scope_test_files(self, created):
+        for filename in created:
+            if os.path.exists(filename):
+                os.remove(filename)
+
+    def test_cte_name_is_not_a_source(self):
+        tmpfolder, created = self._create_scope_test_files()
+        query = 'WITH orders AS (SELECT * FROM inner-file) SELECT * FROM orders'
+        cmd = 'cd %s && %s -H -d , "%s"' % (tmpfolder, Q_EXECUTABLE, query)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('2,inner')])
+
+        self._cleanup_scope_test_files(created)
+
+    def test_quoted_filename_with_spaces(self):
+        tmpfolder, created = self._create_scope_test_files()
+        query = 'select * from "file with spaces.csv"'
+        cmd = 'cd %s && %s -H -d , \'%s\'' % (tmpfolder, Q_EXECUTABLE, query)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('3,spaces')])
+
+        self._cleanup_scope_test_files(created)
+
+    def test_cte_and_source_with_the_same_name(self):
+        tmpfolder, created = self._create_scope_test_files()
+        query = 'WITH orders AS (SELECT * FROM inner-file) SELECT * FROM orders'
+        cmd = 'cd %s && %s -H -d , "%s"' % (tmpfolder, Q_EXECUTABLE, query)
+        retcode, o, e = run_command(cmd)
+
+        # The cte hides the real "orders" file, so the inner file data must be returned
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('2,inner')])
+
+        self._cleanup_scope_test_files(created)
+
+    def test_nested_scopes_with_the_same_source_name(self):
+        tmpfolder, created = self._create_scope_test_files()
+        query = 'WITH orders AS (SELECT * FROM orders) SELECT * FROM (WITH orders AS (SELECT * FROM inner-file) SELECT * FROM orders) nested'
+        cmd = 'cd %s && %s -H -d , "%s"' % (tmpfolder, Q_EXECUTABLE, query)
+        retcode, o, e = run_command(cmd)
+
+        # The outer cte sees the real orders file, while the inner cte hides it
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('2,inner')])
+
+        self._cleanup_scope_test_files(created)
+
+    def test_outer_and_inner_scope_with_the_same_source_name(self):
+        tmpfolder, created = self._create_scope_test_files()
+
+        # The outer query references the real orders source
+        outer_query = 'SELECT val FROM orders'
+        cmd = 'cd %s && %s -H -d , "%s"' % (tmpfolder, Q_EXECUTABLE, outer_query)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('outer')])
+
+        # The inner subquery defines a cte with the same name, over a different file
+        inner_query = 'SELECT * FROM (WITH orders AS (SELECT * FROM inner-file) SELECT val FROM orders) nested'
+        cmd = 'cd %s && %s -H -d , "%s"' % (tmpfolder, Q_EXECUTABLE, inner_query)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('inner')])
+
+        self._cleanup_scope_test_files(created)
+
+    def test_from_inside_string_is_not_a_source(self):
+        tmpfolder, created = self._create_scope_test_files()
+        query = "select 'from non-existent-file' as x from orders"
+        cmd = 'cd %s && %s -H -d , "%s"' % (tmpfolder, Q_EXECUTABLE, query)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('from non-existent-file')])
+
+        self._cleanup_scope_test_files(created)
+
+    def test_from_inside_comment_is_not_a_source(self):
+        cmd = Q_EXECUTABLE + ' "select 1 /* from non-existent-file */"'
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        self.assertEqual(len(e), 0)
+        self.assertEqual(o, [six.b('1')])
+
+    def test_missing_source_error_points_at_original_query_position(self):
+        nested_query = 'select * from (select * from non-existent-file) x'
+        cmd = Q_EXECUTABLE + ' -d , "%s"' % nested_query
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 30)
+        self.assertEqual(len(o), 0)
+        self.assertEqual(len(e), 1)
+        self.assertTrue(e[0].startswith(six.b("No files matching")))
+        self.assertIn(six.b("referenced at line 1, column 30"), e[0])
+
+        multiline_query = 'select *\nfrom non-existent-file'
+        cmd = Q_EXECUTABLE + ' -d , "%s"' % multiline_query
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 30)
+        self.assertEqual(len(e), 1)
+        self.assertIn(six.b("referenced at line 2, column 6"), e[0])
+
     def test_self_join2(self):
         tmpfile1 = self.create_file_with_data(six.b("\n").join([six.b("{} 9000".format(i)) for i in range(0,10)]))
         cmd = Q_EXECUTABLE + ' "select * from %s a1 join %s a2 on (a1.c2 = a2.c2)"' % (tmpfile1.name,tmpfile1.name)
