@@ -15,7 +15,11 @@ from sqlalchemy.dialects.postgresql import INTERVAL as POSTGRES_INTERVAL
 from sqlalchemy.engine import Connection
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.sql import select
+from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.types import BOOLEAN, DATE, DATETIME, DECIMAL, FLOAT, TEXT, TIMESTAMP, VARCHAR, Interval
+
+from agatesql.columns import attach_origins, build_origins, get_origins
+from agatesql.columns import columns_by_label as _columns_by_label
 
 SQL_TYPE_MAP = {
     agate.Boolean: None,  # See below
@@ -125,26 +129,59 @@ def from_sql(cls, connection_or_string, table_name):
             engine.dispose()
 
 
-def from_sql_query(self, query):
+def _execute_query(connection, query):
+    """
+    Execute a query, returning the result and enough context to describe its
+    result columns.
+
+    Raw SQL is executed with ``exec_driver_sql`` so that literal percent signs
+    are passed through unchanged.  SQLAlchemy statements are executed as-is.
+    """
+    if isinstance(query, str):
+        return connection.exec_driver_sql(query), query, None
+
+    if isinstance(query, TextClause):
+        return connection.execute(query), str(query), None
+
+    result = connection.execute(query)
+    return result, None, query
+
+
+def _query_table(connection, query):
+    result, sql, statement = _execute_query(connection, query)
+
+    if not result.returns_rows:
+        return agate.Table([])
+
+    return _table_from_result(connection, result, sql, statement)
+
+
+def from_sql_query(self, query, connection_or_string=None):
     """
     Create an agate table from the results of a SQL query. Note that column
     data types will be inferred from the returned data, not the column types
     declared in SQL (if any). This is more flexible than :func:`.from_sql` but
     could result in unexpected typing issues.
 
+    Duplicate result labels are given unambiguous column names without
+    shadowing any other label in the result. The original label, position and
+    (where it can be determined) physical source table of every result column
+    are available through :func:`agatesql.table.sql_column_origins`.
+
     :param query:
         A SQL query to execute.
+    :param connection_or_string:
+        An existing sqlalchemy connection or connection string. If omitted,
+        an in-memory SQLite database is used.
     """
-    _, connection = get_engine_and_connection()
+    engine, connection = get_engine_and_connection(connection_or_string)
 
-    # Must escape '%'.
-    # @see https://github.com/wireservice/csvkit/issues/440
-    # @see https://bitbucket.org/zzzeek/sqlalchemy/commits/5bc1f17cb53248e7cea609693a3b2a9bb702545b
-    rows = connection.execute(query.replace('%', '%%'))
-
-    table = agate.Table(list(rows), column_names=rows._metadata.keys)
-
-    return table
+    try:
+        return _query_table(connection, query)
+    finally:
+        if engine is not None:
+            connection.close()
+            engine.dispose()
 
 
 def make_sql_column(column_name, column, sql_type_kwargs=None, sql_column_kwargs=None, sql_column_type=None):
@@ -354,21 +391,121 @@ def sql_query(self, query, table_name='agate'):
 
     # Execute the specified SQL queries
     queries = query.split(';')
-    rows = None
+    result = None
+    last_query = None
 
     self.to_sql(connection, table_name)
 
     for q in queries:
         if q:
-            rows = connection.exec_driver_sql(q)
+            result = connection.exec_driver_sql(q)
+            last_query = q
 
-    table = agate.Table(list(rows), column_names=rows._metadata.keys)
+    if result is None or not result.returns_rows:
+        return agate.Table([])
 
+    return _table_from_result(connection, result, last_query)
+
+
+def _table_from_result(connection, result, sql=None, statement=None):
+    rows = list(result)
+    labels = list(result._metadata.keys)
+    try:
+        origins = build_origins(sql, labels, connection=connection, statement=statement)
+    except Exception:
+        # Provenance is best-effort. A parser limitation must never discard
+        # otherwise valid query data; fall back to positional labels.
+        origins = build_origins(None, labels)
+
+    column_names = [origin.name for origin in origins]
+    if len(column_names) != len(labels):
+        # ``build_origins`` already fell back to positional names; this guard
+        # keeps a parser bug from ever dropping or inventing result columns.
+        column_names = labels
+
+    table = agate.Table(rows, column_names=column_names)
+    attach_origins(table, origins)
     return table
+
+
+def sql_column_origins(table):
+    """
+    Return the original SQL label, position and physical source of every
+    column in a table produced by :func:`.from_sql_query` or
+    :func:`.sql_query`.
+
+    Each item is a :class:`agatesql.columns.ColumnOrigin`, which is also a
+    mapping.  ``origin.label`` is the label returned by the database,
+    ``origin.index`` is its zero-based position, ``origin.name`` is the
+    unambiguous name used by the agate table, and ``origin.table`` /
+    ``origin.column`` identify the physical source.  ``table`` is ``None``
+    when an expression cannot be traced to exactly one physical table.
+    """
+    return get_origins(table)
+
+
+def sql_column_labels(table):
+    """Return the original SQL label for every result position."""
+    return tuple(origin.label for origin in get_origins(table))
+
+
+def sql_column_positions(table):
+    """Return a mapping of original SQL label to result positions."""
+    return get_origins(table).positions
+
+
+def column_origins(self):
+    """
+    Return the original SQL label, position and physical source table of every
+    column in a table produced by :func:`.from_sql_query` or
+    :func:`.sql_query`.
+
+    Each item is a :class:`agatesql.columns.ColumnOrigin`. ``origin.index`` is
+    the zero-based result position, ``origin.label`` is the label returned by
+    the database and ``origin.table``/``origin.column`` identify the physical
+    source. ``origin.table`` is ``None`` when the expression cannot be traced
+    to exactly one physical table.
+    """
+    return get_origins(self)
+
+
+def column_labels(self):
+    """Return the original SQL label for every result position."""
+    return get_origins(self).labels
+
+
+def column_positions(self):
+    """Return a mapping of original SQL label to every result position."""
+    return get_origins(self).positions
+
+
+def columns_by_label(self):
+    """Return a mapping of original SQL label to the matching agate columns."""
+    return _columns_by_label(self)
+
+
+def column_sources(self):
+    """Return the physical source table (or ``None``) for every result position."""
+    return get_origins(self).tables
+
+
+def sql_columns_by_label(table):
+    """Return a mapping of original SQL label to the matching agate columns."""
+    return _columns_by_label(table)
+
+
+def sql_column_sources(table):
+    """Return the physical source table (or ``None``) for every position."""
+    return tuple(origin.table for origin in get_origins(table))
 
 
 agate.Table.from_sql = classmethod(from_sql)
 agate.Table.from_sql_query = classmethod(from_sql_query)
+agate.Table.column_origins = property(column_origins)
+agate.Table.column_labels = property(column_labels)
+agate.Table.column_positions = property(column_positions)
+agate.Table.columns_by_label = property(columns_by_label)
+agate.Table.column_sources = property(column_sources)
 agate.Table.to_sql = to_sql
 agate.Table.to_sql_create_statement = to_sql_create_statement
 agate.Table.sql_query = sql_query

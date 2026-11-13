@@ -276,3 +276,143 @@ class TestSQL(agate.AgateTestCase):
         finally:
             connection.close()
             engine.dispose()
+
+
+class TestSQLColumnOrigins(agate.AgateTestCase):
+    def setUp(self):
+        self.engine = create_engine('sqlite:///:memory:')
+        self.connection = self.engine.connect()
+        self.connection.exec_driver_sql('create table contracts (id integer, name text)')
+        self.connection.exec_driver_sql(
+            'create table payments (id integer, contract_id integer, amount integer)'
+        )
+        self.connection.exec_driver_sql("insert into contracts values (1, 'c1'), (2, 'c2')")
+        self.connection.exec_driver_sql('insert into payments values (10, 1, 100)')
+
+    def tearDown(self):
+        self.connection.close()
+        self.engine.dispose()
+
+    def query(self, sql):
+        return agate.Table.from_sql_query(sql, self.connection)
+
+    def test_duplicate_label_does_not_steal_alias(self):
+        table = self.query(
+            'select c.id, p.id, p.amount as id_2 '
+            'from contracts c left join payments p on c.id = p.contract_id '
+            'order by c.id'
+        )
+
+        # ``id`` is duplicated, but ``id_2`` belongs to the third expression.
+        self.assertSequenceEqual(table.column_names, ['id', 'id_3', 'id_2'])
+        self.assertSequenceEqual(table.column_origins.labels, ['id', 'id', 'id_2'])
+        self.assertEqual(table.column_origins.positions['id'][0], 0)
+        self.assertEqual(table.column_origins.positions['id'][1], 1)
+        self.assertEqual(table.column_origins.positions['id_2'], (2,))
+
+        # A dictionary lookup of the alias returns the third column only.
+        self.assertEqual(dict(table.rows[0])['id_2'], Decimal('100'))
+        self.assertEqual(dict(table.rows[1])['id_2'], None)
+        self.assertEqual(table.columns_by_label['id_2'][0].name, 'id_2')
+    def test_left_join_null_row_keeps_column_ownership(self):
+        table = self.query(
+            'select c.id, p.id, p.amount as id_2 '
+            'from contracts c left join payments p on c.id = p.contract_id '
+            'order by c.id'
+        )
+
+        null_row = table.rows[1]
+        self.assertEqual(tuple(null_row), (Decimal('2'), None, None))
+
+        # Ownership comes from the SELECT list, not from the row values.
+        self.assertEqual(
+            [(origin.table, origin.column) for origin in table.column_origins],
+            [('contracts', 'id'), ('payments', 'id'), ('payments', 'amount')],
+        )
+        self.assertEqual(table.column_sources, ('contracts', 'payments', 'payments'))
+        self.assertEqual(table.column_positions['id'], (0, 1))
+
+    def test_empty_result_keeps_same_origins(self):
+        populated = self.query(
+            'select c.id, p.id, p.amount as id_2 '
+            'from contracts c left join payments p on c.id = p.contract_id '
+        )
+        empty = self.query(
+            'select c.id, p.id, p.amount as id_2 '
+            'from contracts c left join payments p on c.id = p.contract_id '
+            'where c.id = 999'
+        )
+
+        self.assertSequenceEqual(empty.column_names, populated.column_names)
+        self.assertSequenceEqual(empty.column_origins.labels, populated.column_origins.labels)
+        self.assertSequenceEqual(
+            [(origin.table, origin.column) for origin in empty.column_origins],
+            [(origin.table, origin.column) for origin in populated.column_origins],
+        )
+
+    def test_expression_without_single_physical_table_is_unknown(self):
+        table = self.query(
+            'select c.id, p.id, c.id + p.id as id_2 '
+            'from contracts c left join payments p on c.id = p.contract_id '
+            'order by c.id'
+        )
+
+        self.assertSequenceEqual(table.column_names, ['id', 'id_3', 'id_2'])
+        self.assertEqual(table.column_origins[2].label, 'id_2')
+        self.assertIsNone(table.column_origins[2].table)
+        self.assertIsNone(table.column_origins[2].column)
+        self.assertTrue(table.column_origins[2].unknown)
+
+    def test_literal_alias_is_unknown(self):
+        table = self.query(
+            'select c.id, p.id, 7 as id_2 '
+            'from contracts c left join payments p on c.id = p.contract_id '
+        )
+
+        self.assertSequenceEqual(table.column_names, ['id', 'id_3', 'id_2'])
+        self.assertIsNone(table.column_origins[2].table)
+        self.assertEqual(dict(table.rows[0])['id_2'], Decimal('7'))
+
+    def test_star_expansion_keeps_per_table_labels(self):
+        table = self.query(
+            'select c.*, p.* '
+            'from contracts c left join payments p on c.id = p.contract_id '
+            'order by c.id'
+        )
+
+        self.assertSequenceEqual(
+            table.column_names, ['id', 'name', 'id_2', 'contract_id', 'amount']
+        )
+        self.assertSequenceEqual(table.column_labels, ['id', 'name', 'id', 'contract_id', 'amount'])
+        self.assertSequenceEqual(table.column_positions['id'], (0, 2))
+        self.assertSequenceEqual(
+            [(origin.table, origin.column) for origin in table.column_origins[:3]],
+            [('contracts', 'id'), ('contracts', 'name'), ('payments', 'id')],
+        )
+
+    def test_reserved_labels_are_never_used_for_renames(self):
+        table = agate.Table.from_sql_query('select 1 as id, 2 as id, 3 as id_2')
+
+        self.assertSequenceEqual(table.column_names, ['id', 'id_3', 'id_2'])
+        self.assertSequenceEqual(table.column_labels, ['id', 'id', 'id_2'])
+
+        table = agate.Table.from_sql_query('select 1 as id, 2 as id, 3 as id, 4 as id_2, 5 as id_3')
+        self.assertSequenceEqual(table.column_names, ['id', 'id_4', 'id_5', 'id_2', 'id_3'])
+
+    def test_sql_query_reports_origins(self):
+        source = agate.Table([(1, 'c1'), (2, 'c2')], ['id', 'name'])
+
+        table = source.sql_query('''
+            create table payments (id integer, contract_id integer, amount integer);
+            insert into payments values (10, 1, 100);
+            select c.id, p.id, p.amount as id_2
+            from agate c left join payments p on c.id = p.contract_id
+            order by c.id
+        ''')
+
+        self.assertSequenceEqual(table.column_names, ['id', 'id_3', 'id_2'])
+        self.assertSequenceEqual(table.column_labels, ['id', 'id', 'id_2'])
+        self.assertSequenceEqual(table.column_positions['id'], (0, 1))
+        self.assertSequenceEqual(
+            [origin.table for origin in table.column_origins], ['agate', 'payments', 'payments']
+        )

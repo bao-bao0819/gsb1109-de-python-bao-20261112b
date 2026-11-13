@@ -1,6 +1,12 @@
+0.7.4 - Unreleased
+------------------
+
+* fix: Give duplicate query result labels collision-safe names, so a generated name such as ``id_2`` never shadows a real ``id_2`` alias in the same result.
+* feat: Record the original label, position and physical source table of every query result column on tables produced by :func:`.from_sql_query` and :func:`.sql_query`. Computed expressions with no single physical table keep an unknown source.
+* feat: :func:`.from_sql_query` accepts an optional SQLAlchemy connection.
+
 0.7.3 - December 15, 2025
 -------------------------
-
 * Add Python 3.13 and 3.14 support. Drop support for end-of-life versions 3.8 and 3.9.
 
 0.7.2 - January 9, 2024
