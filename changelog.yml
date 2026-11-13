@@ -6,6 +6,16 @@ releases:
     details:
     - "`#56`: fix regex error when loading multi-file CSV from a directory with special\
       \ characters (e.g. '++') in its name."
+  - action: added
+    details:
+    - "`pyexcel_io.select_plugin`: explainable plugin selection entry point. It filters\
+      \ the plugins registered for a file type against the actual input (file, stream\
+      \ or content) and the requested read/write operation, and explains why each\
+      \ skipped candidate did not qualify. Capability probes are lossless (the first\
+      \ line is never consumed), the choice does not depend on plugin installation\
+      \ order, and when a lossless probe cannot supply missing information (e.g. the\
+      \ file type of a single-pass stream), InsufficientInformationError tells the\
+      \ caller what to provide before any data is read."
   version: 0.6.8
   date: 28.06.2026
 - changes:

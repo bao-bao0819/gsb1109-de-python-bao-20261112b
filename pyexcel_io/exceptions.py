@@ -21,6 +21,19 @@ class SupportingPluginAvailableButNotInstalled(Exception):
     pass
 
 
+class InsufficientInformationError(Exception):
+    """
+    raised when plugin selection cannot proceed without more information
+
+    For example, the file type of a single-pass stream cannot be
+    probed without consuming its first bytes, so the caller is asked
+    to supply the missing piece (e.g. file_type) before any data
+    is read.
+    """
+
+    pass
+
+
 class IntegerAccuracyLossError(Exception):
     """
     When an integer is greater than 999999999999999, ods loses its accuracy.

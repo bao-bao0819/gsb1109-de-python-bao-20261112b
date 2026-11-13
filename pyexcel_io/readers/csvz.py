@@ -24,6 +24,10 @@ from pyexcel_io.plugin_api.abstract_reader import IReader
 
 
 class FileReader(IReader):
+    # zipfile needs to rewind the input, hence a single-pass
+    # stream cannot be handled by this reader
+    requires_seekable_stream = True
+
     def __init__(self, file_alike_object, file_type, **keywords):
         self.content_array = []
         try:

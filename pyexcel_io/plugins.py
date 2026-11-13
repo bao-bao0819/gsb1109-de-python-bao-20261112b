@@ -75,6 +75,7 @@ class IOPluginInfoChainV2(PluginInfoChain):
         locations=(),
         file_types=None,
         stream_type=None,
+        **properties
     ):
         """add pyexcel-io reader plugin info"""
         a_plugin_info = IOPluginInfo(
@@ -86,6 +87,7 @@ class IOPluginInfoChainV2(PluginInfoChain):
                 for location in locations
             ],
             stream_type=stream_type,
+            **properties
         )
         return self.add_a_plugin_instance(a_plugin_info)
 
@@ -95,6 +97,7 @@ class IOPluginInfoChainV2(PluginInfoChain):
         locations=(),
         file_types=(),
         stream_type=None,
+        **properties
     ):
         """add pyexcel-io writer plugin info"""
         a_plugin_info = IOPluginInfo(
@@ -106,6 +109,7 @@ class IOPluginInfoChainV2(PluginInfoChain):
                 for location in locations
             ],
             stream_type=stream_type,
+            **properties
         )
         return self.add_a_plugin_instance(a_plugin_info)
 
