@@ -50,3 +50,44 @@ class IntegerAccuracyLossError(Exception):
         )
 
         super(IntegerAccuracyLossError, self).__init__(custom_message)
+
+
+class CustomerMappingError(Exception):
+    """base class for customer number cross reference errors"""
+
+    pass
+
+
+class DuplicateCustomerMappingError(CustomerMappingError):
+    """raised when one customer number is used by more than one pair"""
+
+    def __init__(self, number, pairs):
+        self.number = number
+        self.pairs = pairs
+        custom_message = (
+            "customer number %s appears in more than one mapping "
+            "pair: %s. Chained rows such as A->B and B->C must stay "
+            "independent pairs and are never collapsed into A->C"
+            % (number, [pair.as_tuple() for pair in pairs])
+        )
+        super(DuplicateCustomerMappingError, self).__init__(
+            custom_message
+        )
+
+
+class CustomerNumberOccupiedError(CustomerMappingError):
+    """raised when a mapping target is held by an outside customer"""
+
+    def __init__(self, plan):
+        self.plan = plan
+        blocked = [
+            group.describe() for group in plan.blocked_groups
+        ]
+        custom_message = (
+            "mapping targets are occupied by customers outside the "
+            "import: %s. The independent groups in the same import "
+            "can still be committed separately" % blocked
+        )
+        super(CustomerNumberOccupiedError, self).__init__(
+            custom_message
+        )

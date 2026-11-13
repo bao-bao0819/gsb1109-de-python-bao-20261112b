@@ -2,6 +2,18 @@ name: pyexcel-io
 organisation: pyexcel
 releases:
 - changes:
+  - action: added
+    details:
+    - "customer number cross reference import in pyexcel_io.customer_remap:\
+      \ pair based old/new number swaps that keep contracts with the original customer,\
+      \ reject chained rows such as A->B and B->C instead of collapsing them into A->C,\
+      \ block only the change group whose target is held by a customer outside the mapping\
+      \ while independent groups still commit, and store fingerprinted import receipts\
+      \ with pair level replay protection so re-importing the same sheet never swaps a\
+      \ customer twice."
+  version: 0.6.9
+  date: tbd
+- changes:
   - action: updated
     details:
     - "`#56`: fix regex error when loading multi-file CSV from a directory with special\
