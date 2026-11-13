@@ -89,6 +89,44 @@ Gpxpy is a GPX parser and by using it you have access to all the data from the o
 
     moving_data = gpx.get_moving_data(raw=True)
 
+## Clock synchronisation
+
+`gpxpy.time_sync` maps a device track (for example a car logger) onto a
+reference time axis using a handover list of paired button presses. The
+handover list supplies only a matching tolerance; the clock offset and the
+clock rate are fitted per power-on session (one track segment by default, or
+explicit session keys when a segment contains a restart).
+
+The fit keeps every model allowed by all paired events, so a calibrated time
+is reported as a range. If the range crosses a minute boundary, both minute
+candidates are kept rather than an arbitrary one being chosen. A session
+whose clock rate cannot be identified (for example only one paired instant)
+is reported as skipped; points that recorded no device time are skipped too.
+A restart is never bridged by extending a previous session's slope.
+
+```python
+import gpxpy.time_sync as time_sync
+
+handover = [
+    {'id': 'press-1', 'reference': '2026-01-01T08:00:00Z', 'device': '2026-01-01T07:59:35Z'},
+    {'id': 'press-2', 'reference': '2026-01-01T08:20:00Z', 'device': '2026-01-01T08:19:35Z'},
+]
+events = time_sync.parse_sync_events(handover)
+
+calibration = time_sync.calibrate_gpx(gpx, events, tolerance_seconds=2)
+work_orders = time_sync.parse_work_orders([
+    {'id': 'wo-1', 'minute': '2026-01-01T08:05:00Z'},
+])
+candidates = time_sync.match_work_orders(calibration, work_orders)
+
+# Write the nominal calibrated times back when a single timestamp is needed:
+time_sync.apply_calibrated_times(gpx, calibration)
+```
+
+`calibration.skipped_points` lists every point that was not calibrated and
+why. `WorkOrderCandidates.work_order_ids` lists alternatives; an ambiguous
+point intentionally keeps more than one.
+
 ## Pull requests
 
 Branches:

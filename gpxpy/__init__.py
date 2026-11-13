@@ -15,6 +15,7 @@
 from typing import IO, AnyStr
 
 from . import gpx as mod_gpx
+from . import time_sync as time_sync
 
 __version__ = '1.6.2'
 
