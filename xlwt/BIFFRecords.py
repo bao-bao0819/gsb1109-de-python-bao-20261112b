@@ -8,6 +8,11 @@ import six
 from .UnicodeUtils import upack1, upack2, upack2rt
 
 
+def _is_high_surrogate(raw, offset):
+    """True if the UTF-16LE unit ending at raw[offset] is a high surrogate."""
+    return 0xD800 <= (raw[offset-2] | (raw[offset-1] << 8)) <= 0xDBFF
+
+
 class SharedStringTable(object):
     _SST_ID = 0x00FC
     _CONTINUE_ID = 0x003C
@@ -161,8 +166,22 @@ class SharedStringTable(object):
             else:
                 if is_unicode_str:
                     atom_len = free_space & 0xFFFE
+                    # A UTF-16 code unit that is the high half of a surrogate
+                    # pair must not end a CONTINUE record: readers that decode
+                    # each chunk separately would see an unpaired surrogate.
+                    if atom_len == 2 and i + 3 < str_len:
+                        if _is_high_surrogate(s, i + atom_len):
+                            atom_len = 0
+                    elif 0 < atom_len and _is_high_surrogate(s, i + atom_len):
+                        atom_len -= 2
                 else:
                     atom_len = free_space
+
+            if atom_len == 0:
+                # The only space left is too small for a whole character.
+                self._new_piece()
+                self._current_piece += b'\x01' if is_unicode_str else b'\x00'
+                continue
 
             self._current_piece += s[i:i+atom_len]
 
