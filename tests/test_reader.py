@@ -63,6 +63,77 @@ def _generate_messages(mesg_num, local_mesg_num, field_defs,
     return b''.join(mesgs)
 
 
+def _dev_definition(local_mesg_num, global_mesg_num, field_defs=None,
+                    dev_field_defs=None, endian='<'):
+    header_byte = 0x40 | local_mesg_num
+    if dev_field_defs:
+        header_byte |= 0x20
+
+    s = struct.pack('<B', header_byte)
+    s += struct.pack('<xB', int(endian == '>'))
+    s += struct.pack('%sHB' % endian, global_mesg_num, len(field_defs or []))
+    for def_num, size, base_type_num in field_defs or []:
+        s += struct.pack('<3B', def_num, size, base_type_num)
+
+    if dev_field_defs:
+        s += struct.pack('<B', len(dev_field_defs))
+        for def_num, size, dev_data_index in dev_field_defs:
+            s += struct.pack('<3B', def_num, size, dev_data_index)
+
+    return s
+
+
+def _dev_data(local_mesg_num, payload, is_dev=False):
+    return struct.pack('B', (0x20 if is_dev else 0) | local_mesg_num) + payload
+
+
+def _dev_string(value, size):
+    encoded = value.encode('utf-8')
+    return encoded + b'\x00' * (size - len(encoded))
+
+
+def _dev_data_id(local_mesg_num, dev_data_index, application_id):
+    return (
+        _dev_definition(
+            local_mesg_num, 207,
+            field_defs=[(1, 16, 0x0d), (3, 1, 0x02), (4, 4, 0x86)]) +
+        _dev_data(
+            local_mesg_num,
+            bytes(application_id) + struct.pack('<BI', dev_data_index, 1)))
+
+
+def _field_desc(local_mesg_num, dev_data_index, field_def_num, base_type_num,
+                name, units, scale=None, offset=None):
+    field_defs = [
+        (0, 1, 0x02), (1, 1, 0x02), (2, 1, 0x02), (3, 16, 0x07)]
+    payload = struct.pack('<3B', dev_data_index, field_def_num, base_type_num)
+    payload += _dev_string(name or '', 16)
+
+    if scale is not None:
+        field_defs.append((6, 1, 0x02))
+        payload += struct.pack('<B', scale)
+    if offset is not None:
+        field_defs.append((7, 1, 0x01))
+        payload += struct.pack('<b', offset)
+    if units is not None:
+        field_defs.append((8, 16, 0x07))
+        payload += _dev_string(units, 16)
+
+    return (
+        _dev_definition(local_mesg_num, 206, field_defs=field_defs) +
+        _dev_data(local_mesg_num, payload))
+
+
+def _dev_record(local_mesg_num, timestamp, dev_payload, dev_data_index):
+    return (
+        _dev_definition(
+            local_mesg_num, 20, field_defs=[(253, 4, 0x86)],
+            dev_field_defs=[(3, len(dev_payload), dev_data_index)]) +
+        _dev_data(
+            local_mesg_num, struct.pack('<I', timestamp) + dev_payload,
+            is_dev=True))
+
+
 def _generate_fitfile(data=None, endian='<'):
     fit_data = (_generate_messages(
         # local mesg 0, global mesg 0 (file_id)
@@ -492,6 +563,160 @@ class FitReaderTestCase(unittest.TestCase):
             and r.name == 'session')
 
         self.assertEqual(msg.get_value('avg_speed', fit_type='uint16'), 5.86)
+
+    def test_dev_field_description_after_values(self):
+        """Developer values keep bytes until a later description arrives"""
+        app_one = tuple(range(1, 17))
+
+        body = b''
+        body += _dev_data_id(0, 0, app_one)
+        body += _dev_record(2, 10, struct.pack('<H', 100), 0)
+        body += _dev_record(2, 11, struct.pack('<H', 101), 0)
+        body += _field_desc(1, 0, 3, 0x84, 'late field', 'm', 10)
+        body += _dev_record(2, 12, struct.pack('<H', 120), 0)
+
+        frames = list(fitdecode.FitReader(
+            _generate_fitfile(body), check_crc=fitdecode.CrcCheck.RAISE))
+        messages = [f for f in frames if isinstance(f, fitdecode.FitDataMessage)]
+
+        pending_fields = [
+            f for m in messages if m.name == 'record' for f in m.fields
+            if f.is_dev and f.field_def.def_num == 3]
+        self.assertEqual(len(pending_fields), 3)
+
+        # Values read before the description are filled in retroactively.
+        first, second, third = pending_fields[:3]
+        self.assertEqual(first.raw_value, 100)
+        self.assertEqual(first.value, 10.0)
+        self.assertEqual(first.units, 'm')
+        self.assertEqual(first.raw_bytes, struct.pack('<H', 100))
+        self.assertEqual(second.raw_value, 101)
+        self.assertEqual(third.raw_value, 120)
+        self.assertEqual(third.value, 12.0)
+
+        for field in pending_fields:
+            self.assertEqual(field.name, 'late field')
+            self.assertEqual(field.dev_data_index, 0)
+            self.assertEqual(field.application_id, app_one)
+            self.assertFalse(field.is_unresolved_dev)
+
+    def test_dev_field_reading_with_or_without_late_description(self):
+        """Both reading orders must agree on fields and values"""
+        app_one = tuple(range(1, 17))
+        samples = [10, 11, 12]
+
+        def _describe_values(description_first):
+            body = _dev_data_id(0, 0, app_one)
+            if description_first:
+                body += _field_desc(1, 0, 3, 0x84, 'latched', 'm', 10)
+            body += b''.join(
+                _dev_record(2, ts, struct.pack('<H', ts * 10), 0)
+                for ts in samples)
+            if not description_first:
+                body += _field_desc(1, 0, 3, 0x84, 'latched', 'm', 10)
+            return body
+
+        def _look(description_first):
+            frames = tuple(fitdecode.FitReader(
+                _generate_fitfile(_describe_values(description_first)),
+                check_crc=fitdecode.CrcCheck.RAISE))
+            return [
+                (field.name, field.units, field.application_id,
+                 field.raw_value, field.value)
+                for message in frames
+                if isinstance(message, fitdecode.FitDataMessage)
+                and message.name == 'record'
+                for field in message.fields if field.is_dev]
+
+        after = _look(description_first=False)
+        before = _look(description_first=True)
+        self.assertEqual(len(after), len(samples))
+        self.assertEqual(before, after)
+        self.assertEqual(
+            after,
+            [('latched', 'm', app_one, ts * 10, float(ts))
+             for ts in samples])
+
+    def test_dev_field_same_number_two_applications(self):
+        """Field 3 of one application must never resolve field 3 of another"""
+        app_one = tuple(range(1, 17))
+        app_two = tuple(range(101, 117))
+
+        body = b''
+        body += _dev_data_id(0, 0, app_one)
+        body += _field_desc(1, 0, 3, 0x84, 'first app field', 'm', 10)
+        body += _dev_record(2, 10, struct.pack('<H', 100), 0)
+        body += _dev_data_id(3, 1, app_two)
+        body += _field_desc(4, 1, 3, 0x84, 'second app field', 'cm', 2)
+        body += _dev_record(5, 11, struct.pack('<H', 50), 1)
+
+        frames = tuple(fitdecode.FitReader(
+            _generate_fitfile(body), check_crc=fitdecode.CrcCheck.RAISE))
+        records = [
+            f for f in frames
+            if isinstance(f, fitdecode.FitDataMessage) and f.name == 'record']
+
+        first = [f for f in records[0].fields if f.is_dev][0]
+        second = [f for f in records[1].fields if f.is_dev][0]
+        for field in (first, second):
+            self.assertNotEqual(field.name, 'unknown_dev_0_3')
+            self.assertNotEqual(field.name, 'unknown_dev_1_3')
+        self.assertEqual(first.name, 'first app field')
+        self.assertEqual(first.units, 'm')
+        self.assertEqual(first.value, 10.0)
+        self.assertEqual(first.application_id, app_one)
+        self.assertEqual(second.name, 'second app field')
+        self.assertEqual(second.units, 'cm')
+        self.assertEqual(second.value, 25.0)
+        self.assertEqual(second.application_id, app_two)
+
+    def test_dev_field_chained_file_reassigns_application_slot(self):
+        """A chained file may reuse developer_data_index for another app"""
+        app_one = tuple(range(1, 17))
+        app_two = tuple(range(101, 117))
+
+        first_file = _generate_fitfile(
+            _dev_data_id(0, 0, app_one) +
+            _field_desc(1, 0, 3, 0x84, 'first app field', 'm') +
+            _dev_record(2, 10, struct.pack('<H', 100), 0))
+        second_file = _generate_fitfile(
+            _dev_data_id(0, 0, app_two) +
+            _field_desc(1, 0, 3, 0x84, 'second app field', 'cm') +
+            _dev_record(2, 10, struct.pack('<H', 50), 0))
+
+        frames = tuple(fitdecode.FitReader(
+            first_file + second_file, check_crc=fitdecode.CrcCheck.RAISE))
+        records = [
+            f for f in frames
+            if isinstance(f, fitdecode.FitDataMessage) and f.name == 'record']
+
+        first = [f for f in records[0].fields if f.is_dev][0]
+        second = [f for f in records[1].fields if f.is_dev][0]
+        self.assertEqual(first.name, 'first app field')
+        self.assertEqual(second.name, 'second app field')
+        self.assertEqual(first.application_id, app_one)
+        self.assertEqual(second.application_id, app_two)
+
+    def test_dev_field_without_description_keeps_raw_bytes(self):
+        """No units/scale may be invented when no description was received"""
+        body = _dev_record(2, 10, b'\x2a\x00\x00\x00', 7)
+
+        frames = tuple(fitdecode.FitReader(
+            _generate_fitfile(body), check_crc=fitdecode.CrcCheck.RAISE,
+            error_handling=fitdecode.ErrorHandling.IGNORE))
+        record = [
+            f for f in frames
+            if isinstance(f, fitdecode.FitDataMessage) and f.name == 'record'][0]
+        field = [f for f in record.fields if f.is_dev][0]
+
+        self.assertTrue(field.is_unresolved_dev)
+        self.assertIsNone(field.units)
+        self.assertEqual(field.raw_value, b'\x2a\x00\x00\x00')
+        self.assertEqual(field.value, b'\x2a\x00\x00\x00')
+        self.assertEqual(field.raw_bytes, b'\x2a\x00\x00\x00')
+        self.assertEqual(field.dev_data_index, 7)
+        self.assertIsNone(field.application_id)
+        self.assertEqual(field.name, 'unknown_dev_7_3')
 
     def test_fitparse_units_processor(self):
         for x in ('2013-02-06-12-11-14.fit', '2015-10-13-08-43-15.fit',

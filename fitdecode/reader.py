@@ -197,6 +197,7 @@ class FitReader:
         self._body_bytes_left = 0  # the number of bytes that are still to read before reaching the CRC footer of the current "FIT file"  # noqa: E501
         self._local_mesg_defs = {}  # registry of every `FitDefinitionMessage` in this file so far  # noqa: E501
         self._local_dev_types = {}  # registry of developer types
+        self._pending_dev_fields = {}  # developer field values awaiting a description  # noqa: E501
         self._compressed_ts_accumulator = 0  # state value for the so-called "Compressed Timestamp Header"  # noqa: E501
         self._accumulators = {}
         self._last_timestamp = 0
@@ -325,6 +326,7 @@ class FitReader:
         self._body_bytes_left = 0
         self._local_mesg_defs = {}
         self._local_dev_types = {}
+        self._pending_dev_fields = {}
         self._compressed_ts_accumulator = 0
         self._accumulators = {}
         self._last_timestamp = 0
@@ -402,6 +404,7 @@ class FitReader:
         self._body_bytes_left = 0
         self._local_mesg_defs = {}
         self._local_dev_types = {}
+        self._pending_dev_fields = {}
         self._compressed_ts_accumulator = 0
         self._accumulators = {}
         self._last_timestamp = 0
@@ -651,10 +654,14 @@ class FitReader:
         record_chunks.extend(extra_chunks)
         message_fields = []
 
-        for field_def, raw_value in zip(def_mesg.all_field_defs, raw_values):
+        for field_idx, (field_def, raw_value) in enumerate(
+                zip(def_mesg.all_field_defs, raw_values)):
 
             field, parent_field = field_def.field, None
-            if field:
+            if field_def.is_dev and not field_def.is_resolved:
+                decoded_value = extra_chunks[field_idx]
+                raw_value = decoded_value
+            elif field:
                 field, parent_field = self._resolve_subfield(
                     field, def_mesg, raw_values)
 
@@ -729,12 +736,21 @@ class FitReader:
                 # assert self._last_timestamp > 0
                 self._hr_start_timestamp = self._last_timestamp
 
-            message_fields.append(types.FieldData(
+            field_data = types.FieldData(
                 field_def,      # field_def
                 field,          # field
                 parent_field,   # parent_field
                 decoded_value,  # value
-                raw_value))     # raw_value
+                raw_value)      # raw_value
+            message_fields.append(field_data)
+
+            if field_data.is_unresolved_dev:
+                # Keep the exact source bytes and where they came from until a
+                # matching field_description is read (possibly later on).
+                field_data.raw_bytes = extra_chunks[field_idx]
+                self._remember_pending_dev_field(
+                    field_data, field_def, extra_chunks[field_idx],
+                    def_mesg.endian)
 
         # apply timestamp field if we got a header
         if record_header.time_offset is not None:
@@ -753,6 +769,10 @@ class FitReader:
         # apply data processors
         if self._processor:
             for field_data in message_fields:
+                if field_data.is_unresolved_dev:
+                    # Bytes are not decoded yet, and there is no name or unit to
+                    # dispatch on. Processors run when the description arrives.
+                    continue
                 self._processor.on_process_type(self, field_data)
                 self._processor.on_process_field(self, field_data)
                 self._processor.on_process_unit(self, field_data)
@@ -808,6 +828,12 @@ class FitReader:
             raw_values.append(raw_value)
 
         return record_chunks, raw_values
+
+    def _remember_pending_dev_field(
+            self, field_data, field_def, raw_bytes, endian):
+        pending = self._pending_dev_fields.setdefault(
+            (field_def.dev_data_index, field_def.def_num), [])
+        pending.append((field_data, field_def, raw_bytes, endian))
 
     def _read_struct(self, fmt, *, endian=None):
         assert fmt
@@ -882,10 +908,30 @@ class FitReader:
         self._add_dev_data_id_impl(dev_data_index, application_id)
 
     def _add_dev_data_id_impl(self, dev_data_index, application_id=None):
-        self._local_dev_types[dev_data_index] = {
-            'dev_data_index': dev_data_index,
-            'application_id': application_id,
-            'fields': {}}
+        dev_type = self._local_dev_types.get(dev_data_index)
+        if dev_type is None:
+            dev_type = {
+                'dev_data_index': dev_data_index,
+                'application_id': application_id,
+                'fields': {}}
+            self._local_dev_types[dev_data_index] = dev_type
+            return
+
+        previous_application_id = dev_type['application_id']
+        if (previous_application_id is not None and
+                application_id is not None and
+                previous_application_id != application_id):
+            # This slot used to belong to another application. Its field
+            # declarations and already-streamed values must not be reused.
+            dev_type['fields'] = {}
+            for pending_key in list(self._pending_dev_fields):
+                if pending_key[0] == dev_data_index:
+                    del self._pending_dev_fields[pending_key]
+
+        if application_id is not None:
+            dev_type['application_id'] = application_id
+        for field in dev_type['fields'].values():
+            field.application_id = dev_type['application_id']
 
     def _add_dev_field_description(self, message):
         adfdi_args = []
@@ -893,7 +939,8 @@ class FitReader:
         # CAUTION: order of args matters, check out below how adfdi_args is used
         for raw_value_name in (
                 'developer_data_index', 'field_definition_number',
-                'fit_base_type_id', 'field_name', 'units', 'native_field_num'):
+                'fit_base_type_id', 'field_name', 'units', 'native_field_num',
+                'scale', 'offset'):
             try:
                 raw_value = message.get_raw_value(raw_value_name)
             except KeyError as exc:
@@ -922,9 +969,7 @@ class FitReader:
                         self._chunk_offset,
                         f'developer_data_index {raw_value} not defined')
             elif raw_value_name == 'fit_base_type_id':
-                if raw_value is None:
-                    raw_value = types.BASE_TYPE_BYTE
-                else:
+                if raw_value is not None:
                     raw_value = types.BASE_TYPES[raw_value]
 
             adfdi_args.append(raw_value)
@@ -933,12 +978,45 @@ class FitReader:
         self._add_dev_field_description_impl(*adfdi_args)
 
     def _add_dev_field_description_impl(
-            self, dev_data_index, field_def_num, base_type=types.BASE_TYPE_BYTE,
-            name=None, units=None, native_field_num=None):
-        self._local_dev_types[dev_data_index]['fields'][field_def_num] = \
-            types.DevField(
-                dev_data_index, name, field_def_num, base_type, units,
-                native_field_num)
+            self, dev_data_index, field_def_num, base_type=None,
+            name=None, units=None, native_field_num=None, scale=None,
+            offset=None):
+        dev_type = self._local_dev_types[dev_data_index]
+        field = dev_type['fields'].get(field_def_num)
+
+        if field is None:
+            field = types.DevField(
+                dev_data_index,
+                name,
+                field_def_num,
+                base_type or types.BASE_TYPE_BYTE,
+                units,
+                native_field_num,
+                scale=scale,
+                offset=offset,
+                application_id=dev_type['application_id'],
+                resolved=base_type is not None)
+            dev_type['fields'][field_def_num] = field
+        else:
+            # Update the existing object in place: definition messages that were
+            # read before this description already point to it.
+            if base_type is not None:
+                field.type = base_type
+            if name is not None:
+                field.name = name
+            if units is not None:
+                field.units = units
+            if native_field_num is not None:
+                field.native_field_num = native_field_num
+            if scale is not None:
+                field.scale = scale
+            if offset is not None:
+                field.offset = offset
+            field.application_id = dev_type['application_id']
+            field.resolved = field.resolved or base_type is not None
+
+        if field.resolved:
+            self._complete_pending_dev_fields(dev_data_index, field_def_num)
 
     def _get_dev_type(
             self, local_mesg_num, global_mesg_num, dev_data_index,
@@ -946,44 +1024,59 @@ class FitReader:
         try:
             dev_type = self._local_dev_types[dev_data_index]
         except KeyError:
-            msg = (
-                f'dev_data_index {dev_data_index} not defined (looking up for '
-                f'field {field_def_num}; local_mesg_num: {local_mesg_num}; '
-                f'global_mesg_num: {global_mesg_num}; chunk_offset: '
-                f'{self._chunk_offset})')
-
-            if self.error_handling is ErrorHandling.RAISE:
-                raise FitParseError(self._chunk_offset, msg)
-            elif self.error_handling is ErrorHandling.WARN:
-                msg += '; adding dummy type...'
-                warnings.warn(msg)
-            else:
-                assert self.error_handling is ErrorHandling.IGNORE
-
+            # The matching developer_data_id may be logged later in the file.
             self._add_dev_data_id_impl(dev_data_index)
             dev_type = self._local_dev_types[dev_data_index]
 
         try:
             return dev_type['fields'][field_def_num]
         except KeyError:
-            msg = (
-                f'no such field {field_def_num} for dev_data_index '
-                f'{dev_data_index} (local_mesg_num: {local_mesg_num}; '
-                f'global_mesg_num: {global_mesg_num}; chunk_offset: '
-                f'{self._chunk_offset})')
-
-            if self.error_handling is ErrorHandling.RAISE:
-                raise FitParseError(self._chunk_offset, msg)
-            elif self.error_handling is ErrorHandling.WARN:
-                msg += '; defaulting to BYTE field type...'
-                warnings.warn(msg)
-            else:
-                assert self.error_handling is ErrorHandling.IGNORE
-
+            # The matching field_description may be logged later in the file.
+            # Preserve the raw bytes until it shows up.
             self._add_dev_field_description_impl(
                 dev_data_index, field_def_num)
 
             return self._local_dev_types[dev_data_index]['fields'][field_def_num]
+
+    def _complete_pending_dev_fields(self, dev_data_index, field_def_num):
+        pending = self._pending_dev_fields.pop(
+            (dev_data_index, field_def_num), None)
+        if not pending:
+            return
+
+        for field_data, field_def, raw_bytes, endian in pending:
+            raw_value = self._decode_dev_field_raw_value(
+                field_def, raw_bytes, endian)
+            value = self._apply_scale_offset(
+                field_data.field, field_data.field.render(raw_value))
+
+            field_data.raw_value = raw_value
+            field_data.value = value
+            field_data.units = field_data.field.units
+
+            if self._processor:
+                self._processor.on_process_type(self, field_data)
+                self._processor.on_process_field(self, field_data)
+                self._processor.on_process_unit(self, field_data)
+
+    @staticmethod
+    def _decode_dev_field_raw_value(field_def, raw_bytes, endian):
+        base_type = field_def.base_type
+        if (base_type.size <= 0 or
+                field_def.size <= 0 or
+                field_def.size % base_type.size != 0):
+            return raw_bytes
+
+        count = field_def.size // base_type.size
+        unpacker = struct.Struct(f'{endian}{count}{base_type.fmt}')
+        unpacked = unpacker.unpack(raw_bytes)
+
+        if base_type.identifier == types.BASE_TYPE_BYTE.identifier:
+            return base_type.parse(unpacked)
+        elif len(unpacked) > 1:
+            return tuple(base_type.parse(v) for v in unpacked)
+        else:
+            return base_type.parse(unpacked[0])
 
     @staticmethod
     def _resolve_subfield(field, def_mesg, raw_values):

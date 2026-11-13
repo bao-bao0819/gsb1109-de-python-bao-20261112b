@@ -93,16 +93,19 @@ class SubField(_FieldAndSubFieldBase):
 class DevField(_FieldAndSubFieldBase):
     __slots__ = (
         'dev_data_index', 'name', 'def_num', 'type', 'units',
-        'native_field_num',
+        'native_field_num', 'application_id', 'resolved',
 
         # "Inherited" from FitField only to maintain interface compatibility.
         # They are always None.
-        'scale', 'offset', 'components', 'subfields')
+        'components', 'subfields',
+
+        'scale', 'offset')
 
     field_type = 'devfield'
 
     def __init__(self, dev_data_index, name, def_num, type, units,
-                 native_field_num):
+                 native_field_num, scale=None, offset=None,
+                 application_id=None, resolved=True):
         super().__init__()
 
         self.dev_data_index = dev_data_index
@@ -111,9 +114,11 @@ class DevField(_FieldAndSubFieldBase):
         self.type = type
         self.units = units
         self.native_field_num = native_field_num
+        self.application_id = application_id
+        self.resolved = resolved
 
-        self.scale = None
-        self.offset = None
+        self.scale = scale
+        self.offset = offset
         self.components = None
         self.subfields = None
 
@@ -208,7 +213,7 @@ class FieldDefinition:
 
 
 class DevFieldDefinition:
-    __slots__ = ('field', 'dev_data_index', 'base_type', 'def_num', 'size')
+    __slots__ = ('field', 'dev_data_index', 'def_num', 'size')
 
     def __init__(self, field, dev_data_index, def_num, size):
         self.field = field
@@ -216,37 +221,54 @@ class DevFieldDefinition:
         self.def_num = def_num
         self.size = size
 
-        # for dev fields, the base_type and type are always the same
-        self.base_type = self.type
-
     @property
     def is_dev(self):
         return True
 
     @property
+    def is_resolved(self):
+        return bool(self.field and self.field.resolved)
+
+    @property
     def name(self):
-        if self.field:
+        if self.field and self.field.name:
             return self.field.name
         else:
             return f'unknown_dev_{self.dev_data_index}_{self.def_num}'
 
     @property
+    def application_id(self):
+        return self.field.application_id if self.field else None
+
+    @property
     def type(self):
-        return self.field.type
+        if self.field and self.field.resolved:
+            return self.field.type
+        return self.base_type
+
+    @property
+    def base_type(self):
+        # An unresolved developer field has no declared base type yet, so its
+        # bytes must be kept as-is instead of being guessed.
+        if self.field and self.field.resolved:
+            return self.field.base_type
+        return BASE_TYPE_BYTE
 
 
 class FieldData:
     __slots__ = (
-        'field_def', 'field', 'parent_field', 'value', 'raw_value', 'units')
+        'field_def', 'field', 'parent_field', 'value', 'raw_value', 'units',
+        'raw_bytes')
 
     def __init__(self, field_def, field, parent_field, value, raw_value,
-                 units=None):
+                 units=None, raw_bytes=None):
         self.field_def = field_def  #: `FieldDefinition` object
         self.field = field
         self.parent_field = parent_field
         self.value = value
         self.raw_value = raw_value
         self.units = units
+        self.raw_bytes = raw_bytes
 
         if not self.units and self.field:
             # Default to units on field, otherwise None.
@@ -261,13 +283,18 @@ class FieldData:
 
         If name was not found in global profile, a string is created with the
         form: ``unknown_{def_num}`` where ``def_num`` is the field's definition
-        number.
+        number. Developer fields whose description has not been read yet use
+        ``unknown_dev_{dev_data_index}_{def_num}`` instead.
 
         This value is **NOT** compatible with `is_named`.
 
         .. seealso:: `name_or_num`
         """
-        return self.field.name if self.field else 'unknown_%d' % self.def_num
+        if self.field and self.field.name:
+            return self.field.name
+        if self.field_def:
+            return self.field_def.name
+        return 'unknown_%d' % self.def_num
 
     @property
     def name_or_num(self):
@@ -281,7 +308,9 @@ class FieldData:
 
         .. seealso:: `name`
         """
-        return self.field.name if self.field else self.def_num
+        if self.field and self.field.name:
+            return self.field.name
+        return self.def_num
 
     @property
     def def_num(self):
@@ -320,6 +349,38 @@ class FieldData:
         """
         return not self.field_def
 
+    @property
+    def dev_data_index(self):
+        """Developer application slot (`int`), or `None` for native fields"""
+        if self.field_def and self.field_def.is_dev:
+            return self.field_def.dev_data_index
+        return None
+
+    @property
+    def application_id(self):
+        """`application_id` of the declaring `developer_data_id`, if known"""
+        if self.field_def and self.field_def.is_dev:
+            return self.field_def.application_id
+        return None
+
+    @property
+    def is_dev(self):
+        return bool(self.field_def and self.field_def.is_dev)
+
+    @property
+    def is_unresolved_dev(self):
+        """True until this developer field's description has been read"""
+        return bool(
+            self.field_def and self.field_def.is_dev and
+            not self.field_def.is_resolved)
+
+    @property
+    def is_resolved(self):
+        """False only for developer fields still awaiting a description"""
+        if not self.is_dev:
+            return True
+        return self.field_def.is_resolved
+
     def is_named(self, name_or_num):
         """
         Check if this field has the specified name (`str`) or definition number
@@ -338,6 +399,12 @@ class FieldData:
                 return True
 
         return False
+
+    def is_dev_field(self, dev_data_index=None):
+        """Is this a developer field, optionally from a given application?"""
+        if not self.is_dev:
+            return False
+        return dev_data_index is None or self.dev_data_index == dev_data_index
 
 
 def parse_string(byteslike):

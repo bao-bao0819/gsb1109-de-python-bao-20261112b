@@ -25,6 +25,9 @@ class RecordJSONEncoder(json.JSONEncoder):
         if isinstance(obj, datetime.datetime):
             return obj.isoformat()
 
+        if isinstance(obj, (bytes, bytearray)):
+            return obj.hex()
+
         if isinstance(obj, fitdecode.FitChunk):
             return OrderedDict((
                 ('index', obj.index),

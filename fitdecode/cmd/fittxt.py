@@ -43,6 +43,9 @@ def txt_encode(obj):
     if isinstance(obj, datetime.datetime):
         return obj.isoformat()
 
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.hex()
+
     if isinstance(obj, fitdecode.FitChunk):
         return PrintableObject(
             index=obj.index,
