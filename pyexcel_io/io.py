@@ -14,6 +14,7 @@ from types import GeneratorType
 
 from pyexcel_io import constants
 from pyexcel_io.reader import Reader
+from pyexcel_io.tee import DEFAULT_MAX_BUFFERED_ROWS, TeeBook
 from pyexcel_io.writer import Writer
 from pyexcel_io.plugins import OLD_READERS, OLD_WRITERS
 from pyexcel_io._compact import isstream
@@ -54,6 +55,40 @@ def iget_data(afile, file_type=None, **keywords):
         afile, file_type=file_type, streaming=True, **keywords
     )
     return data, reader
+
+
+def iget_data_tee(
+    afile, file_type=None, max_buffered_rows=DEFAULT_MAX_BUFFERED_ROWS,
+    **keywords
+):
+    """Get data from an excel file source for interleaved sheet reads
+
+    Like iget_data, but the sheets come back as a
+    :class:`pyexcel_io.tee.TeeBook`, from which one reader per sheet
+    can be obtained via its `get_reader()` method. The readers may be
+    consumed in any interleaving, even though the underlying stream is
+    forward-only. Rows read ahead for a slower reader are buffered up
+    to `max_buffered_rows` per sheet; beyond that,
+    :class:`pyexcel_io.exceptions.BufferLimitExceeded` names the
+    blocking reader instead of hoarding rows without bound. A sheet
+    may be abandoned early via its reader's `close()`, without losing
+    rows in the other sheets.
+
+    The incoming stream and the returned reader remain the caller's
+    property: they are not closed here, not even after the last sheet
+    reader exits.
+
+    :param afile: a file name, a file stream or actual content
+    :param file_type: used only when filename is not a physical file name
+    :param max_buffered_rows: the agreed per-sheet buffer limit,
+                              defaults to 1000 rows
+    :param keywords: any other parameters accepted by iget_data
+    :returns: a tuple of the TeeBook and the reader
+    """
+    data, reader = _get_data(
+        afile, file_type=file_type, streaming=True, **keywords
+    )
+    return TeeBook(data, max_buffered_rows=max_buffered_rows), reader
 
 
 def get_data(afile, file_type=None, streaming=None, **keywords):

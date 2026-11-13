@@ -215,6 +215,7 @@ API
    :toctree: api/
 
    iget_data
+   iget_data_tee
    get_data
    save_data
 

@@ -21,6 +21,25 @@ class SupportingPluginAvailableButNotInstalled(Exception):
     pass
 
 
+class BufferLimitExceeded(Exception):
+    """
+    raised when a slow sheet reader lets the tee buffer reach its limit
+
+    The sheet whose reader is blocking progress is carried in
+    `sheet_name`, so the caller knows whom to speed up or abandon
+    instead of buffering rows without bound.
+    """
+
+    def __init__(self, sheet_name, limit):
+        self.sheet_name = sheet_name
+        self.limit = limit
+        message = (
+            "Sheet reader '%s' is blocking progress: its buffer "
+            "reached the agreed limit of %d rows" % (sheet_name, limit)
+        )
+        super(BufferLimitExceeded, self).__init__(message)
+
+
 class IntegerAccuracyLossError(Exception):
     """
     When an integer is greater than 999999999999999, ods loses its accuracy.

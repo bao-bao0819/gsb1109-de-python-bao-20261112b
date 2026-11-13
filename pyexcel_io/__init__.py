@@ -12,7 +12,7 @@ import logging
 
 import pyexcel_io.plugins as plugins
 
-from .io import get_data, iget_data, save_data  # noqa
+from .io import get_data, iget_data, iget_data_tee, save_data  # noqa
 from ._compact import NullHandler
 
 logging.getLogger(__name__).addHandler(NullHandler())  # noqa

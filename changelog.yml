@@ -2,6 +2,13 @@ name: pyexcel-io
 organisation: pyexcel
 releases:
 - changes:
+  - action: added
+    details:
+    - "iget_data_tee: bounded multi-sheet consumption over a forward-only stream.\
+      \ Sheet readers may be interleaved, a sheet may be abandoned early without\
+      \ losing rows in the others, and BufferLimitExceeded names the slow reader\
+      \ whose buffer reached the agreed limit. The caller's stream is left open\
+      \ after the last reader exits."
   - action: updated
     details:
     - "`#56`: fix regex error when loading multi-file CSV from a directory with special\
