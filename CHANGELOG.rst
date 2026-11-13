@@ -1,3 +1,8 @@
+Unreleased
+----------
+
+* feat: Add bitemporal price-history support. ``Table.to_sql_price_history`` imports an agate table of price changes into an append-only landing table, arbitrates revisions by business date and revision number, merges consecutive equal-price periods while retaining their revision provenance, and rebuilds non-overlapping segments that guarantee at most one effective price per product and date. Re-importing a batch is idempotent. ``Table.from_sql_price`` performs point-in-time lookups and ``Table.from_sql_price_history`` reads the adjudicated segments back.
+
 0.7.3 - December 15, 2025
 -------------------------
 

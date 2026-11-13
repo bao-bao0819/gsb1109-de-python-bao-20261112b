@@ -47,6 +47,33 @@ The first argument to either function can be any valid `sqlalchemy connection st
 
 That's all there is to it.
 
+Price-history tables
+====================
+
+A price-dimension table records which price applies to a product starting on a
+given business date. Price changes arrive in change batches, and a batch may
+contain a late correction for a business date that is already in the past.
+:meth:`Table.to_sql_price_history` imports such a batch into an append-only
+landing table (``<table_name>_revisions``), keeps every revision for audit,
+arbitrates revisions by business date and revision number, merges consecutive
+periods with the same price while retaining the revision provenance, and
+materializes non-overlapping segments in the target table. Re-importing the
+same batch is idempotent.
+
+.. code-block:: python
+
+    table = agate.Table.from_csv('price_changes.csv')
+    table.to_sql_price_history('sqlite:///prices.db', 'product_price')
+
+    # At most one effective price is returned for any product and date.
+    agate.Table.from_sql_price('sqlite:///prices.db', 'product_price', 'SKU1',
+                               datetime.date(2026, 10, 15))
+
+The source table must contain product identifier, effective date, price,
+revision number and source reference columns (the column names are
+configurable). Use :meth:`Table.from_sql_price_history` to read the
+adjudicated segments back as an agate table.
+
 ===
 API
 ===
@@ -60,6 +87,14 @@ API
 .. autofunction:: agatesql.table.to_sql_create_statement
 
 .. autofunction:: agatesql.table.sql_query
+
+.. autofunction:: agatesql.price.adjudicate_price_history
+
+.. autofunction:: agatesql.price.to_sql_price_history
+
+.. autofunction:: agatesql.price.from_sql_price
+
+.. autofunction:: agatesql.price.from_sql_price_history
 
 Authors
 =======
