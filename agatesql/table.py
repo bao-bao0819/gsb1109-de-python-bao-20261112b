@@ -5,15 +5,16 @@ This module contains the agatesql extensions to
 
 import datetime
 import decimal
+import hashlib
 from urllib.parse import urlsplit
 
 import agate
-from sqlalchemy import Column, MetaData, Table, UniqueConstraint, create_engine, dialects
+from sqlalchemy import Column, Index, MetaData, Table, UniqueConstraint, create_engine, dialects, text
 from sqlalchemy.dialects.mssql import BIT
 from sqlalchemy.dialects.oracle import INTERVAL as ORACLE_INTERVAL
 from sqlalchemy.dialects.postgresql import INTERVAL as POSTGRES_INTERVAL
 from sqlalchemy.engine import Connection
-from sqlalchemy.schema import CreateTable
+from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.sql import select
 from sqlalchemy.types import BOOLEAN, DATE, DATETIME, DECIMAL, FLOAT, TEXT, TIMESTAMP, VARCHAR, Interval
 
@@ -43,6 +44,64 @@ INTERVAL_MAP = {
     'postgresql': POSTGRES_INTERVAL,
     'oracle': ORACLE_INTERVAL,
 }
+
+# Dialect-specific SQLAlchemy ``Index`` keyword arguments that attach a filter
+# predicate to a partial (filtered) index. Dialects without partial index
+# support, such as MySQL, have no entry and emit an ordinary index.
+PARTIAL_INDEX_DIALECT_KWARGS = {
+    'sqlite': 'sqlite_where',
+    'postgresql': 'postgresql_where',
+    'mssql': 'mssql_where',
+}
+
+
+def make_sql_index(table_name, index_spec, dialect=None):
+    """
+    Creates a SQLAlchemy unique :class:`Index` from an index specification.
+
+    A specification is a dict with these keys:
+
+    ``columns``
+        A non-empty list of indexed column names (required).
+    ``where``
+        An optional raw SQL predicate, without the ``WHERE`` keyword, that
+        restricts the index to matching rows. Use this to declare a partial
+        unique index, so SQL NULL can serve as a genuine missing-value marker
+        without colliding with real values such as the text ``"未知"`` or an
+        empty string.
+    ``name``
+        An optional explicit index name. When omitted, a deterministic name is
+        derived from the table name, columns and predicate.
+
+    On dialects without partial index support the predicate is ignored and a
+    regular unique index is created.
+
+    :param table_name:
+        The name of the table the index belongs to.
+    :param index_spec:
+        The index specification dict described above.
+    :param dialect:
+        The target dialect name.
+    """
+    columns = index_spec.get('columns')
+    if not columns:
+        raise ValueError('Each unique index spec must define a non-empty "columns" list: %s' % index_spec)
+
+    where_sql = index_spec.get('where')
+    index_name = index_spec.get('name')
+    if index_name is None:
+        digest = hashlib.sha1(
+            '|'.join([table_name, where_sql or '', *columns]).encode('utf-8')
+        ).hexdigest()[:10]
+        index_name = 'uq_%s_%s' % (table_name, digest)
+
+    index_kwargs = {'unique': True}
+    if where_sql is not None:
+        dialect_kwarg = PARTIAL_INDEX_DIALECT_KWARGS.get(dialect)
+        if dialect_kwarg is not None:
+            index_kwargs[dialect_kwarg] = text(where_sql)
+
+    return Index(index_name, *columns, **index_kwargs)
 
 
 def get_engine_and_connection(connection_or_string=None):
@@ -178,7 +237,7 @@ def make_sql_column(column_name, column, sql_type_kwargs=None, sql_column_kwargs
 
 
 def make_sql_table(table, table_name, dialect=None, db_schema=None, constraints=True, unique_constraint=[],
-                   connection=None, min_col_len=1, col_len_multiplier=1):
+                   unique_indexes=[], connection=None, min_col_len=1, col_len_multiplier=1):
     """
     Generates a SQL alchemy table from an agate table.
     """
@@ -235,12 +294,15 @@ def make_sql_table(table, table_name, dialect=None, db_schema=None, constraints=
     if unique_constraint:
         sql_table.append_constraint(UniqueConstraint(*unique_constraint))
 
+    for index_spec in unique_indexes:
+        sql_table.append_constraint(make_sql_index(table_name, index_spec, dialect))
+
     return sql_table
 
 
 def to_sql(self, connection_or_string, table_name, overwrite=False,
            create=True, create_if_not_exists=False, insert=True, prefixes=[],
-           db_schema=None, constraints=True, unique_constraint=[], chunk_size=None,
+           db_schema=None, constraints=True, unique_constraint=[], unique_indexes=[], chunk_size=None,
            min_col_len=1, col_len_multiplier=1):
     """
     Write this table to the given SQL database.
@@ -267,6 +329,13 @@ def to_sql(self, connection_or_string, table_name, overwrite=False,
         Generate constraints such as ``nullable`` for table columns.
     :param unique_constraint:
         The names of the columns to include in a UNIQUE constraint.
+    :param unique_indexes:
+        A list of unique index specifications. Each is a dict with a
+        ``columns`` list, an optional ``where`` predicate (without the
+        ``WHERE`` keyword) that creates a partial unique index, and an
+        optional explicit ``name``. Partial indexes let SQL NULL represent a
+        genuinely missing value while real values such as ``"未知"`` and
+        empty strings remain fully constrained.
     :param chunk_size:
         Write rows in batches of this size. If not set, rows will be written at once.
     :param col_min_len:
@@ -278,7 +347,8 @@ def to_sql(self, connection_or_string, table_name, overwrite=False,
 
     dialect = connection.engine.dialect.name
     sql_table = make_sql_table(self, table_name, dialect=dialect, db_schema=db_schema, constraints=constraints,
-                               unique_constraint=unique_constraint, connection=connection,
+                               unique_constraint=unique_constraint, unique_indexes=unique_indexes,
+                               connection=connection,
                                min_col_len=min_col_len, col_len_multiplier=col_len_multiplier)
 
     if create:
@@ -310,10 +380,12 @@ def to_sql(self, connection_or_string, table_name, overwrite=False,
             engine.dispose()
 
 
-def to_sql_create_statement(self, table_name, dialect=None, db_schema=None, constraints=True, unique_constraint=[]):
+def to_sql_create_statement(self, table_name, dialect=None, db_schema=None, constraints=True, unique_constraint=[],
+                            unique_indexes=[]):
     """
     Generates a CREATE TABLE statement for this SQL table, but does not execute
-    it.
+    it. Any unique indexes are emitted as separate CREATE UNIQUE INDEX
+    statements after the CREATE TABLE statement.
 
     :param table_name:
         The name of the SQL table to create.
@@ -325,16 +397,23 @@ def to_sql_create_statement(self, table_name, dialect=None, db_schema=None, cons
         Generate constraints such as ``nullable`` for table columns.
     :param unique_constraint:
         The names of the columns to include in a UNIQUE constraint.
+    :param unique_indexes:
+        A list of unique index specifications. See :meth:`.to_sql` for the
+        dict format, including partial indexes with a ``where`` predicate.
     """
     sql_table = make_sql_table(self, table_name, dialect=dialect, db_schema=db_schema, constraints=constraints,
-                               unique_constraint=unique_constraint)
+                               unique_constraint=unique_constraint, unique_indexes=unique_indexes)
 
     if dialect:
         sql_dialect = dialects.registry.load(dialect)()
     else:
         sql_dialect = None
 
-    return str(CreateTable(sql_table).compile(dialect=sql_dialect)).strip() + ';'
+    statements = [str(CreateTable(sql_table).compile(dialect=sql_dialect)).strip() + ';']
+    for index in sorted(sql_table.indexes, key=lambda sql_index: sql_index.name):
+        statements.append(str(CreateIndex(index).compile(dialect=sql_dialect)).strip() + ';')
+
+    return '\n'.join(statements)
 
 
 def sql_query(self, query, table_name='agate'):

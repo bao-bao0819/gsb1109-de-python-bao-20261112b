@@ -1,3 +1,8 @@
+Unreleased
+----------
+
+* feat: Add a ``unique_indexes`` option to ``to_sql``, ``to_sql_create_statement`` and ``make_sql_table``. Index specs may include a ``where`` predicate to emit partial unique indexes (SQLite, PostgreSQL and SQL Server), allowing SQL NULL to act as a genuine missing-value marker while ordinary values such as ``"未知"`` and empty strings remain fully constrained.
+
 0.7.3 - December 15, 2025
 -------------------------
 

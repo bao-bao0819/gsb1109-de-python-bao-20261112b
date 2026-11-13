@@ -1,11 +1,38 @@
 from decimal import Decimal
 from textwrap import dedent
+import os
+import sqlite3
+import tempfile
 
 import agate
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 import agatesql
+
+# Per-table uniqueness conventions for the warehouse inventory tables.
+# SQL NULL is the only missing-batch marker: the literal "未知" and an empty
+# string are ordinary batch values and must stay fully constrained.
+RECEIVING_UNIQUE_INDEXES = [
+    {
+        'name': 'uq_receiving_known_batch',
+        'columns': ['warehouse', 'sku', 'batch'],
+        'where': 'batch IS NOT NULL',
+    },
+    {
+        'name': 'uq_receiving_unknown_batch',
+        'columns': ['warehouse', 'sku'],
+        'where': 'batch IS NULL',
+    },
+]
+
+TRANSFER_UNIQUE_INDEXES = [
+    {
+        'name': 'uq_transfer_known_batch',
+        'columns': ['warehouse', 'sku', 'batch'],
+        'where': 'batch IS NOT NULL',
+    },
+]
 
 
 class TestSQL(agate.AgateTestCase):
@@ -276,3 +303,162 @@ class TestSQL(agate.AgateTestCase):
         finally:
             connection.close()
             engine.dispose()
+
+    def _batch_table(self, rows):
+        return agate.Table(
+            rows,
+            ['warehouse', 'sku', 'batch'],
+            [agate.Text(), agate.Text(), agate.Text()],
+        )
+
+    def test_create_statement_partial_unique_indexes(self):
+        table = self._batch_table((
+            ('W1', 'S1', 'B1'),
+            (None, None, None),
+        ))
+
+        statement = table.to_sql_create_statement(
+            'receiving', dialect='sqlite', unique_indexes=RECEIVING_UNIQUE_INDEXES,
+        )
+
+        normalized = '\n'.join(
+            line.rstrip() for line in statement.replace('\t', '  ').splitlines()
+        )
+        self.assertEqual(normalized, dedent('''\
+            CREATE TABLE receiving (
+              warehouse VARCHAR,
+              sku VARCHAR,
+              batch VARCHAR
+            );
+            CREATE UNIQUE INDEX uq_receiving_known_batch ON receiving (warehouse, sku, batch) WHERE batch IS NOT NULL;
+            CREATE UNIQUE INDEX uq_receiving_unknown_batch ON receiving (warehouse, sku) WHERE batch IS NULL;'''))  # noqa: E501
+
+    def test_receiving_table_enforces_single_unknown_batch(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            self._batch_table((('W1', 'S1', 'B1'), (None, None, None))).to_sql(
+                connection, 'receiving', unique_indexes=RECEIVING_UNIQUE_INDEXES, insert=False,
+            )
+
+            def insert(warehouse, sku, batch):
+                connection.execute(
+                    text('INSERT INTO receiving (warehouse, sku, batch) VALUES (:w, :s, :b)'),
+                    {'w': warehouse, 's': sku, 'b': batch},
+                )
+
+            insert('W1', 'S1', 'B1')
+            # Same warehouse, sku and known batch: only one row.
+            with self.assertRaises(IntegrityError):
+                insert('W1', 'S1', 'B1')
+            # "未知" is an ordinary batch value, not a missing marker.
+            insert('W1', 'S2', '未知')
+            with self.assertRaises(IntegrityError):
+                insert('W1', 'S2', '未知')
+            # An empty string is likewise an ordinary batch value.
+            insert('W1', 'S3', '')
+            with self.assertRaises(IntegrityError):
+                insert('W1', 'S3', '')
+            # NULL means "batch unknown": a single placeholder row per warehouse and sku.
+            insert('W1', 'S4', None)
+            with self.assertRaises(IntegrityError):
+                insert('W1', 'S4', None)
+            # Different sku may carry its own unknown-batch row.
+            insert('W1', 'S5', None)
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_transfer_table_allows_multiple_unknown_batches(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            self._batch_table((('W1', 'S1', 'B1'), (None, None, None))).to_sql(
+                connection, 'transfer', unique_indexes=TRANSFER_UNIQUE_INDEXES, insert=False,
+            )
+
+            def insert(warehouse, sku, batch):
+                connection.execute(
+                    text('INSERT INTO transfer (warehouse, sku, batch) VALUES (:w, :s, :b)'),
+                    {'w': warehouse, 's': sku, 'b': batch},
+                )
+
+            insert('W1', 'S1', 'B1')
+            with self.assertRaises(IntegrityError):
+                insert('W1', 'S1', 'B1')
+            insert('W1', 'S2', '未知')
+            with self.assertRaises(IntegrityError):
+                insert('W1', 'S2', '未知')
+            insert('W1', 'S3', '')
+            with self.assertRaises(IntegrityError):
+                insert('W1', 'S3', '')
+            # The transfer table permits several unknown-batch rows per warehouse and sku.
+            insert('W1', 'S4', None)
+            insert('W1', 'S4', None)
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_indexes_enforced_by_raw_sqlite3(self):
+        # The convention must hold for writers that bypass agate/SQLAlchemy
+        # entirely and talk to the SQLite file with the stdlib driver.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, 'inventory.db')
+            self._batch_table((('W1', 'S1', 'B1'), (None, None, None))).to_sql(
+                'sqlite:///%s' % db_path, 'receiving',
+                unique_indexes=RECEIVING_UNIQUE_INDEXES, insert=False,
+            )
+
+            raw = sqlite3.connect(db_path)
+            try:
+                index_sql = {
+                    row[0]: row[1]
+                    for row in raw.execute(
+                        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+                    )
+                }
+                self.assertIn('uq_receiving_known_batch', index_sql)
+                self.assertIn('WHERE batch IS NOT NULL', index_sql['uq_receiving_known_batch'])
+                self.assertIn('WHERE batch IS NULL', index_sql['uq_receiving_unknown_batch'])
+
+                raw.execute("INSERT INTO receiving VALUES ('W1', 'S1', 'B1')")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    raw.execute("INSERT INTO receiving VALUES ('W1', 'S1', 'B1')")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    raw.execute("INSERT INTO receiving VALUES ('W1', 'S2', '未知')")
+                    raw.execute("INSERT INTO receiving VALUES ('W1', 'S2', '未知')")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    raw.execute("INSERT INTO receiving VALUES ('W1', 'S3', '')")
+                    raw.execute("INSERT INTO receiving VALUES ('W1', 'S3', '')")
+                raw.execute("INSERT INTO receiving VALUES ('W1', 'S4', NULL)")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    raw.execute("INSERT INTO receiving VALUES ('W1', 'S4', NULL)")
+            finally:
+                raw.close()
+
+    def test_partial_index_predicate_ignored_without_dialect_support(self):
+        table = self._batch_table((('W1', 'S1', 'B1'),))
+
+        statement = table.to_sql_create_statement(
+            'receiving', dialect='mysql', unique_indexes=RECEIVING_UNIQUE_INDEXES,
+        )
+
+        self.assertIn('CREATE UNIQUE INDEX uq_receiving_known_batch ON receiving (warehouse, sku, batch);',
+                      statement.replace('\t', '  '))
+        self.assertNotIn('WHERE', statement)
+
+    def test_make_sql_index_requires_columns(self):
+        with self.assertRaises(ValueError):
+            agatesql.table.make_sql_index('receiving', {'where': 'batch IS NULL'}, dialect='sqlite')
+
+    def test_make_sql_index_name_is_deterministic(self):
+        spec = {'columns': ['warehouse', 'sku', 'batch'], 'where': 'batch IS NOT NULL'}
+
+        first = agatesql.table.make_sql_index('receiving', spec, dialect='sqlite')
+        second = agatesql.table.make_sql_index('receiving', spec, dialect='sqlite')
+
+        self.assertEqual(first.name, second.name)
+        self.assertTrue(first.unique)
+        self.assertTrue(first.name.startswith('uq_receiving_'))

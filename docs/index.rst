@@ -47,6 +47,63 @@ The first argument to either function can be any valid `sqlalchemy connection st
 
 That's all there is to it.
 
+Declaring per-table uniqueness conventions
+------------------------------------------
+
+Pass ``unique_indexes`` to :meth:`.to_sql` or :meth:`.to_sql_create_statement`
+to declare unique indexes as part of the table schema, so the convention is
+enforced by the database itself for every writer, including code that writes
+to the SQLite file without agate or SQLAlchemy.
+
+Each index spec is a dict with a ``columns`` list, an optional ``where``
+predicate that creates a partial unique index, and an optional ``name``.
+The predicate is expressed in raw SQL and must not include the ``WHERE``
+keyword. Partial indexes are supported on SQLite, PostgreSQL and SQL Server;
+on dialects without support, such as MySQL, the predicate is omitted and an
+ordinary unique index is created.
+
+Use SQL ``NULL`` as the only missing-batch marker. Because the marker is
+``NULL`` rather than a sentinel string, real batch values such as the text
+``"未知"`` and empty strings stay fully constrained and never collide with a
+missing batch.
+
+A receiving table that keeps one row per warehouse, sku and known batch, and
+at most a single "batch unknown" placeholder per warehouse and sku, declares
+two partial unique indexes:
+
+.. code-block:: python
+
+    receiving_indexes = [
+        {'columns': ['warehouse', 'sku', 'batch'], 'where': 'batch IS NOT NULL'},
+        {'columns': ['warehouse', 'sku'], 'where': 'batch IS NULL'},
+    ]
+
+    table.to_sql(
+        'sqlite:///inventory.db', 'receiving',
+        unique_indexes=receiving_indexes,
+    )
+
+This emits:
+
+.. code-block:: sql
+
+    CREATE UNIQUE INDEX ... ON receiving (warehouse, sku, batch) WHERE batch IS NOT NULL;
+    CREATE UNIQUE INDEX ... ON receiving (warehouse, sku) WHERE batch IS NULL;
+
+A transfer table that follows the same known-batch rule but permits several
+unknown-batch rows omits the second, ``batch IS NULL`` index:
+
+.. code-block:: python
+
+    transfer_indexes = [
+        {'columns': ['warehouse', 'sku', 'batch'], 'where': 'batch IS NOT NULL'},
+    ]
+
+    table.to_sql(
+        'sqlite:///inventory.db', 'transfer',
+        unique_indexes=transfer_indexes,
+    )
+
 ===
 API
 ===
