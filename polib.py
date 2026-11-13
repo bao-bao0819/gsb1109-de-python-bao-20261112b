@@ -14,6 +14,7 @@ modify entries, comments or metadata, etc. or create new po files from scratch.
 
 import array
 import codecs
+import json
 import os
 import re
 import struct
@@ -25,7 +26,11 @@ import io
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'default_encoding', 'escape', 'unescape', 'detect_encoding',
+           'PluralRule', 'PluralRuleError', 'TranslationCatalog',
+           'TranslationResolution', 'TranslationResolver', 'SkippedLayer',
+           'CatalogSet', 'load_catalog_config', 'resolve_translation',
+           'resolve_tickets', ]
 
 
 # the default encoding to use when encoding cannot be detected
@@ -47,6 +52,7 @@ if sys.version_info < (3,):
 else:
     PY3 = True
     text_type = str
+    long = int
 
     def b(s):
         return s.encode("latin-1")
@@ -1830,3 +1836,1207 @@ class _MOFileParser(object):
             return tup[0]
         return tup
 # }}}
+# layered catalog translation {{{
+
+
+class PluralRuleError(ValueError):
+    """
+    Raised when a ``Plural-Forms`` header cannot be parsed or evaluated.
+
+    The ``code`` attribute is one of ``missing``, ``invalid`` or ``index``.
+    """
+
+    def __init__(self, message, code='invalid'):
+        ValueError.__init__(self, message)
+        self.code = code
+
+
+class _CatalogUnavailable(Exception):
+    """
+    Internal exception used to turn a missing or broken catalog into a
+    fallback reason instead of aborting the whole resolution.
+    """
+
+    def __init__(self, reason, detail):
+        Exception.__init__(self, detail)
+        self.reason = reason
+        self.detail = detail
+
+
+class _PluralExpressionParser(object):
+    """
+    Small recursive-descent parser for the C-like expressions used by
+    gettext's ``Plural-Forms`` header.
+
+    Only the operators and operands permitted by gettext are accepted, and
+    the expression is interpreted by this module instead of by ``eval()``.
+    """
+
+    _TOKEN_RE = re.compile(
+        r'\s*(?:(\d+)|(n)|(\|\||&&|==|!=|<=|>=|[<>+\-*/%!?:()]))'
+    )
+
+    def __init__(self, expression):
+        self.expression = expression
+        self.tokens = self._tokenize(expression)
+        self.position = 0
+
+    def _tokenize(self, expression):
+        tokens = []
+        position = 0
+        length = len(expression)
+        while position < length:
+            match = self._TOKEN_RE.match(expression, position)
+            if match is None:
+                rest = expression[position:]
+                if rest.strip() == '':
+                    break
+                raise PluralRuleError(
+                    'unsupported token in plural expression: %r' % rest,
+                    'invalid'
+                )
+            position = match.end()
+            number, name, operator = match.groups()
+            if number is not None:
+                tokens.append(('int', int(number)))
+            elif name is not None:
+                tokens.append(('n', name))
+            else:
+                tokens.append(('op', operator))
+        return tokens
+
+    def _peek(self):
+        if self.position < len(self.tokens):
+            return self.tokens[self.position]
+        return (None, None)
+
+    def _take(self):
+        token = self._peek()
+        self.position += 1
+        return token
+
+    def _expect(self, value):
+        kind, token = self._take()
+        if kind != 'op' or token != value:
+            raise PluralRuleError(
+                'expected %r in plural expression: %s' % (
+                    value, self.expression
+                ),
+                'invalid'
+            )
+
+    def parse(self):
+        node = self._ternary()
+        if self.position != len(self.tokens):
+            raise PluralRuleError(
+                'unexpected token in plural expression: %s' % self.expression,
+                'invalid'
+            )
+        return node
+
+    def _ternary(self):
+        condition = self._logical_or()
+        kind, token = self._peek()
+        if kind == 'op' and token == '?':
+            self._take()
+            when_true = self._ternary()
+            self._expect(':')
+            when_false = self._ternary()
+            return ('conditional', condition, when_true, when_false)
+        return condition
+
+    def _logical_or(self):
+        node = self._logical_and()
+        while self._peek() == ('op', '||'):
+            self._take()
+            node = ('or', node, self._logical_and())
+        return node
+
+    def _logical_and(self):
+        node = self._equality()
+        while self._peek() == ('op', '&&'):
+            self._take()
+            node = ('and', node, self._equality())
+        return node
+
+    def _equality(self):
+        node = self._relational()
+        while self._peek()[0] == 'op' and self._peek()[1] in ('==', '!='):
+            operator = self._take()[1]
+            node = ('compare', operator, node, self._relational())
+        return node
+
+    def _relational(self):
+        node = self._additive()
+        while self._peek()[0] == 'op' and self._peek()[1] in (
+                '<', '>', '<=', '>='):
+            operator = self._take()[1]
+            node = ('compare', operator, node, self._additive())
+        return node
+
+    def _additive(self):
+        node = self._multiplicative()
+        while self._peek()[0] == 'op' and self._peek()[1] in ('+', '-'):
+            operator = self._take()[1]
+            node = ('arithmetic', operator, node, self._multiplicative())
+        return node
+
+    def _multiplicative(self):
+        node = self._unary()
+        while self._peek()[0] == 'op' and self._peek()[1] in ('*', '/', '%'):
+            operator = self._take()[1]
+            node = ('arithmetic', operator, node, self._unary())
+        return node
+
+    def _unary(self):
+        kind, token = self._peek()
+        if kind == 'op' and token in ('!', '-', '+'):
+            self._take()
+            return ('unary', token, self._unary())
+        return self._primary()
+
+    def _primary(self):
+        kind, token = self._take()
+        if kind == 'int':
+            return ('int', token)
+        if kind == 'n':
+            return ('n', token)
+        if kind == 'op' and token == '(':
+            node = self._ternary()
+            self._expect(')')
+            return node
+        raise PluralRuleError(
+            'unexpected token in plural expression: %s' % self.expression,
+            'invalid'
+        )
+
+
+def _plural_evaluate(node, count):
+    kind = node[0]
+    if kind == 'int':
+        return node[1]
+    if kind == 'n':
+        return count
+    if kind == 'unary':
+        value = _plural_evaluate(node[2], count)
+        if node[1] == '!':
+            return 0 if value else 1
+        if node[1] == '-':
+            return -value
+        return value
+    if kind == 'conditional':
+        condition = _plural_evaluate(node[1], count)
+        return _plural_evaluate(
+            node[2] if condition else node[3], count
+        )
+    if kind == 'or':
+        left = _plural_evaluate(node[1], count)
+        if left:
+            return 1
+        return 1 if _plural_evaluate(node[2], count) else 0
+    if kind == 'and':
+        left = _plural_evaluate(node[1], count)
+        if not left:
+            return 0
+        return 1 if _plural_evaluate(node[2], count) else 0
+    left = _plural_evaluate(node[2], count)
+    right = _plural_evaluate(node[3], count)
+    if kind == 'compare':
+        operator = node[1]
+        if operator == '==':
+            return 1 if left == right else 0
+        if operator == '!=':
+            return 1 if left != right else 0
+        if operator == '<':
+            return 1 if left < right else 0
+        if operator == '>':
+            return 1 if left > right else 0
+        if operator == '<=':
+            return 1 if left <= right else 0
+        if operator == '>=':
+            return 1 if left >= right else 0
+    if kind == 'arithmetic':
+        operator = node[1]
+        if operator == '+':
+            return left + right
+        if operator == '-':
+            return left - right
+        if operator == '*':
+            return left * right
+        if right == 0:
+            raise PluralRuleError(
+                'division by zero in plural expression', 'invalid'
+            )
+        if operator == '/':
+            return int(left / float(right))
+        if operator == '%':
+            return left % right
+    raise PluralRuleError('invalid plural expression node', 'invalid')
+
+
+class PluralRule(object):
+    """
+    A parsed gettext plural rule.
+
+    The rule is made of a ``nplurals`` count and a ``plural`` expression
+    (for example ``nplurals=2; plural=(n != 1);``).  Each catalog carries
+    its own rule, which is important when a region catalog and the common
+    language catalog do not use the same number or ordering of plural
+    forms.
+    """
+
+    def __init__(self, nplurals, expression, raw=None):
+        try:
+            nplurals = int(nplurals)
+        except (TypeError, ValueError):
+            raise PluralRuleError('nplurals must be an integer', 'invalid')
+        if nplurals < 1:
+            raise PluralRuleError('nplurals must be positive', 'invalid')
+        if not expression or not text_type(expression).strip():
+            raise PluralRuleError('plural expression is empty', 'invalid')
+        self.nplurals = nplurals
+        self.expression = text_type(expression).strip()
+        self.raw = raw if raw is not None else self.expression
+        self._tree = _PluralExpressionParser(self.expression).parse()
+
+    @classmethod
+    def from_metadata(cls, metadata):
+        """
+        Build a rule from a PO/MO metadata dictionary.
+
+        ``Plural-Forms`` is the header written by gettext tools.  Catalogs
+        without it cannot be used to resolve plural messages.
+        """
+        raw = None
+        if metadata:
+            raw = metadata.get('Plural-Forms')
+        if not raw:
+            raise PluralRuleError(
+                'catalog has no Plural-Forms metadata', 'missing'
+            )
+        raw = text_type(raw).strip()
+        nplurals_match = re.search(r'nplurals\s*=\s*(\d+)', raw, re.I)
+        plural_match = re.search(
+            r'plural\s*=\s*(.*?)\s*(?:;\s*)?$', raw, re.I | re.S
+        )
+        if nplurals_match is None or plural_match is None:
+            raise PluralRuleError(
+                'invalid Plural-Forms metadata: %s' % raw, 'invalid'
+            )
+        return cls(
+            int(nplurals_match.group(1)),
+            plural_match.group(1).replace(';', '').strip(),
+            raw
+        )
+
+    def index(self, count):
+        """
+        Return the plural form index for ``count`` according to this rule.
+
+        An ``PluralRuleError`` is raised when the expression evaluates
+        outside of ``0 .. nplurals - 1``.
+        """
+        if isinstance(count, bool) or not isinstance(count, (int, long)):
+            raise TypeError('count must be an integer')
+        if count < 0:
+            raise ValueError('count must be greater than or equal to zero')
+        index = _plural_evaluate(self._tree, int(count))
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            raise PluralRuleError(
+                'plural expression did not return an integer', 'invalid'
+            )
+        if index < 0 or index >= self.nplurals:
+            raise PluralRuleError(
+                'plural index %s is outside 0..%s' % (
+                    index, self.nplurals - 1
+                ),
+                'index'
+            )
+        return index
+
+    def __repr__(self):
+        return 'PluralRule(nplurals=%r, expression=%r)' % (
+            self.nplurals, self.expression
+        )
+
+
+class TranslationCatalog(object):
+    """
+    One catalog layer (a region, a common language or the product default).
+
+    ``path`` is a PO or MO file and may be ``None`` when the layer is not
+    configured for the selected region.  Catalogs are loaded lazily so that
+    a missing nearer layer can be reported as a fallback reason.
+    """
+
+    def __init__(self, name, path, role=None, locale=None):
+        self.name = text_type(name)
+        self.role = role
+        self.locale = locale
+        self.path = None
+        if path:
+            self.path = os.path.abspath(os.path.expanduser(text_type(path)))
+        self._file = None
+        self._load_error = None
+        self._plural_rule = None
+        self._plural_rule_error = None
+
+    @property
+    def source_directory(self):
+        if self.path is None:
+            return None
+        return os.path.dirname(self.path)
+
+    def load(self):
+        """
+        Load and return the underlying POFile/MOFile instance.
+        """
+        if self._file is not None:
+            return self._file
+        if self._load_error is not None:
+            raise self._load_error
+        if self.path is None:
+            self._load_error = _CatalogUnavailable(
+                'catalog_not_configured',
+                'no catalog is configured for this layer'
+            )
+            raise self._load_error
+        if not os.path.isfile(self.path):
+            self._load_error = _CatalogUnavailable(
+                'catalog_missing',
+                'catalog file does not exist: %s' % self.path
+            )
+            raise self._load_error
+        try:
+            if self.path.lower().endswith('.mo'):
+                self._file = mofile(self.path)
+            else:
+                self._file = pofile(self.path)
+        except Exception as exc:
+            self._load_error = _CatalogUnavailable(
+                'catalog_error',
+                'cannot load catalog %s: %s' % (self.path, exc)
+            )
+            raise self._load_error
+        return self._file
+
+    def find_entry(self, key, msgctxt=None):
+        """
+        Return the entry for ``key`` including obsolete entries.
+
+        The caller decides whether obsolete or fuzzy entries can be used,
+        so this lookup deliberately does not hide them.  When the same
+        msgid exists both live and obsolete, the live entry is preferred.
+        A ``msgctxt`` of ``None`` selects the entry without context.
+        """
+        catalog = self.load()
+        if msgctxt is None:
+            matches = [
+                entry for entry in catalog
+                if entry.msgid == key and not entry.msgctxt
+            ]
+        else:
+            matches = [
+                entry for entry in catalog
+                if entry.msgid == key and entry.msgctxt == msgctxt
+            ]
+        if not matches:
+            return None
+        active = [
+            entry for entry in matches
+            if not getattr(entry, 'obsolete', False)
+        ]
+        if active:
+            matches = active
+        return matches[0]
+
+    @property
+    def plural_rule(self):
+        """
+        The catalog's own :class:`PluralRule`, parsed from its metadata.
+        """
+        if self._plural_rule is not None:
+            return self._plural_rule
+        if self._plural_rule_error is not None:
+            raise self._plural_rule_error
+        try:
+            metadata = self.load().metadata
+            self._plural_rule = PluralRule.from_metadata(metadata)
+        except _CatalogUnavailable:
+            raise
+        except PluralRuleError as exc:
+            self._plural_rule_error = exc
+            raise
+        return self._plural_rule
+
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'role': self.role,
+            'locale': self.locale,
+            'path': self.path,
+            'source_directory': self.source_directory,
+        }
+
+    def __repr__(self):
+        return 'TranslationCatalog(%r, %r)' % (self.name, self.path)
+
+
+class SkippedLayer(object):
+    """
+    Why a layer was not used for a resolution.
+
+    ``reason`` is a stable ASCII identifier (for example ``fuzzy`` or
+    ``incomplete_plural_set``) and ``detail`` is a human-readable
+    explanation suitable for a ticket.
+    """
+
+    def __init__(self, layer, reason, detail, plural_index=None):
+        self.layer = layer
+        self.reason = reason
+        self.detail = detail
+        self.plural_index = plural_index
+
+    @property
+    def name(self):
+        return self.layer.name
+
+    @property
+    def path(self):
+        return self.layer.path
+
+    @property
+    def source_directory(self):
+        return self.layer.source_directory
+
+    def to_dict(self):
+        return {
+            'layer': self.name,
+            'role': self.layer.role,
+            'locale': self.layer.locale,
+            'path': self.path,
+            'source_directory': self.source_directory,
+            'reason': self.reason,
+            'detail': self.detail,
+            'plural_index': self.plural_index,
+        }
+
+    def __repr__(self):
+        return 'SkippedLayer(%r, %r)' % (self.name, self.reason)
+
+
+class TranslationResolution(object):
+    """
+    The result of resolving one key for one region and one count.
+
+    ``text`` is the final translation (``None`` when nothing resolved),
+    ``source`` is the winning layer name and ``source_directory`` is the
+    directory that contains the winning catalog.  ``skipped`` lists the
+    nearer layers that were passed over, with their reasons.
+    """
+
+    def __init__(self, region, key, count, msgctxt=None, policy=None):
+        self.region = region
+        self.key = key
+        self.count = count
+        self.msgctxt = msgctxt
+        self.policy = policy
+        self.text = None
+        self.source = None
+        self.source_directory = None
+        self.source_catalog = None
+        self.plural_index = None
+        self.nplurals = None
+        self.skipped = []
+
+    @property
+    def resolved(self):
+        return self.text is not None
+
+    def to_dict(self):
+        return {
+            'region': self.region,
+            'key': self.key,
+            'msgctxt': self.msgctxt,
+            'count': self.count,
+            'policy': self.policy,
+            'resolved': self.resolved,
+            'text': self.text,
+            'source': self.source,
+            'source_directory': self.source_directory,
+            'source_catalog': self.source_catalog,
+            'plural_index': self.plural_index,
+            'nplurals': self.nplurals,
+            'skipped': [item.to_dict() for item in self.skipped],
+        }
+
+    def __repr__(self):
+        return 'TranslationResolution(key=%r, region=%r, source=%r)' % (
+            self.key, self.region, self.source
+        )
+
+
+_POLICY_ALIASES = {
+    'branch': 'branch',
+    'per_branch': 'branch',
+    'per-branch': 'branch',
+    'branchwise': 'branch',
+    'branch_wise': 'branch',
+    'branch-fallback': 'branch',
+    'branch_fallback': 'branch',
+    'atomic': 'atomic',
+    'same_layer': 'atomic',
+    'same-layer': 'atomic',
+    'whole_layer': 'atomic',
+    'whole-layer': 'atomic',
+    'atomic-fallback': 'atomic',
+    'atomic_fallback': 'atomic',
+}
+
+
+def _normalize_policy(policy):
+    if policy is None:
+        return None
+    key = text_type(policy).strip().lower().replace(' ', '_')
+    if key not in _POLICY_ALIASES:
+        raise ValueError(
+            'unknown fallback policy %r (expected branch or atomic)' % policy
+        )
+    return _POLICY_ALIASES[key]
+
+
+def _declared_policy(entry):
+    for flag in entry.flags:
+        policy = _POLICY_ALIASES.get(flag.strip().lower())
+        if policy:
+            return policy
+    texts = [entry.comment or '', entry.tcomment or '']
+    for text_value in texts:
+        match = re.search(
+            r'fallback\s*[:=]\s*(branch|per[_-]?branch|atomic|'
+            r'same[_-]?layer|whole[_-]?layer)', text_value, re.I
+        )
+        if match:
+            return _normalize_policy(match.group(1))
+    return None
+
+
+def _coerce_catalog_layer(value, index):
+    if isinstance(value, TranslationCatalog):
+        return value
+    if isinstance(value, dict):
+        name = value.get('name') or value.get('layer') or (
+            value.get('role') or 'layer%d' % (index + 1)
+        )
+        path = value.get('path') or value.get('catalog') or value.get('file')
+        return TranslationCatalog(
+            name, path,
+            role=value.get('role'),
+            locale=value.get('locale')
+        )
+    if isinstance(value, (text_type, bytes)):
+        return TranslationCatalog('layer%d' % (index + 1), value)
+    raise TypeError('invalid catalog layer: %r' % (value,))
+
+
+def _json_config(config):
+    if isinstance(config, dict):
+        return config
+    if not isinstance(config, (text_type, bytes)):
+        raise TypeError('config must be a path or a dictionary')
+    with io.open(config, 'r', encoding='utf-8') as fhandle:
+        return json.load(fhandle)
+
+
+def _config_base_dir(config_path, explicit):
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    if isinstance(config_path, (text_type, bytes)):
+        return os.path.dirname(os.path.abspath(config_path))
+    return os.getcwd()
+
+
+def _resolve_config_path(path, base_dir):
+    if not path:
+        return None
+    path = os.path.expanduser(text_type(path))
+    if not os.path.isabs(path):
+        path = os.path.join(base_dir, path)
+    return os.path.abspath(path)
+
+
+def _normalized_locale(value):
+    return text_type(value).replace('_', '-').lower()
+
+
+class TranslationResolver(object):
+    """
+    Resolve keys against an ordered list of catalog layers.
+
+    ``layers`` are ordered from nearest to farthest (typically region,
+    common language, product default).  The first layer that supplies a
+    usable translation wins.
+
+    ``policies`` maps message keys to ``branch`` or ``atomic``.  With
+    ``branch`` the requested plural branch may fall back on its own; with
+    ``atomic`` every plural branch of the message must be present and
+    translated in the same layer.  A message can override the configured
+    policy through a ``fallback:branch``/``fallback:atomic`` extracted or
+    translator comment, or through a ``branch-fallback``/``atomic-fallback``
+    PO flag.
+    """
+
+    def __init__(self, layers, policies=None, default_policy='branch'):
+        self.layers = [
+            _coerce_catalog_layer(layer, index)
+            for index, layer in enumerate(layers)
+        ]
+        self.policies = dict(policies or {})
+        self.default_policy = _normalize_policy(default_policy) or 'branch'
+
+    @classmethod
+    def from_config(cls, config, base_dir=None):
+        """
+        Build a resolver from a configuration dictionary or JSON file.
+
+        The ``layers`` form is ordered and region independent::
+
+            {
+              "layers": [
+                {"name": "region", "path": "de-DE/app.po"},
+                {"name": "language", "path": "de/app.po"},
+                {"name": "default", "path": "en/app.po"}
+              ],
+              "policies": {"checkout.items": "atomic"}
+            }
+
+        Relative paths are resolved against the configuration file's
+        directory (or ``base_dir`` when one is supplied).
+        """
+        config_source = config
+        config = _json_config(config)
+        base = _config_base_dir(config_source, base_dir)
+        layers = []
+        for index, layer in enumerate(config.get('layers') or []):
+            if isinstance(layer, dict):
+                layer = dict(layer)
+                path = layer.get('path') or layer.get('catalog')
+                if path:
+                    layer['path'] = _resolve_config_path(path, base)
+            layers.append(_coerce_catalog_layer(layer, index))
+        return cls(
+            layers,
+            policies=config.get('policies') or config.get('messages'),
+            default_policy=config.get('default_policy') or 'branch'
+        )
+
+    def _configured_policy(self, key, msgctxt):
+        candidates = []
+        if msgctxt:
+            candidates.append('%s\x04%s' % (msgctxt, key))
+        candidates.append(key)
+        for candidate in candidates:
+            if candidate not in self.policies:
+                continue
+            value = self.policies[candidate]
+            if isinstance(value, dict):
+                value = value.get('fallback') or value.get('policy')
+            return _normalize_policy(value)
+        return None
+
+    def _policy_for(self, key, msgctxt, explicit):
+        policy = _normalize_policy(explicit)
+        if policy is not None:
+            return policy
+        policy = self._configured_policy(key, msgctxt)
+        if policy is not None:
+            return policy
+        for layer in self.layers:
+            try:
+                entry = layer.find_entry(key, msgctxt)
+            except _CatalogUnavailable:
+                continue
+            if entry is None:
+                continue
+            declared = _declared_policy(entry)
+            if declared is not None:
+                return declared
+        return self.default_policy
+
+    def _skip(self, result, layer, reason, detail, plural_index=None):
+        result.skipped.append(
+            SkippedLayer(layer, reason, detail, plural_index)
+        )
+
+    def _winner(self, result, layer, text, plural_index, nplurals):
+        result.text = text
+        result.source = layer.name
+        result.source_directory = layer.source_directory
+        result.source_catalog = layer.path
+        result.plural_index = plural_index
+        result.nplurals = nplurals
+        return result
+
+    def _incomplete_plural_branches(self, entry, rule):
+        missing = []
+        for index in range(rule.nplurals):
+            value = entry.msgstr_plural.get(index)
+            if value is None or value == '':
+                missing.append(index)
+        return missing
+
+    def resolve(self, key, count=1, msgctxt=None, policy=None, region=None):
+        """
+        Resolve ``key`` for ``count``.
+
+        ``count`` is used by every candidate layer's own plural rule; the
+        selected slot is never copied from the nearer layer's index.
+        """
+        if not isinstance(key, (text_type, bytes)) or key == '':
+            raise ValueError('key must be a non-empty string')
+        key = text_type(key)
+        if isinstance(count, bool) or not isinstance(count, (int, long)):
+            raise TypeError('count must be an integer')
+        if count < 0:
+            raise ValueError('count must be greater than or equal to zero')
+        policy = self._policy_for(key, msgctxt, policy)
+        result = TranslationResolution(
+            region=region,
+            key=key,
+            count=int(count),
+            msgctxt=msgctxt,
+            policy=policy
+        )
+        for layer in self.layers:
+            try:
+                layer.load()
+            except _CatalogUnavailable as exc:
+                self._skip(result, layer, exc.reason, exc.detail)
+                continue
+            entry = layer.find_entry(key, msgctxt)
+            if entry is None:
+                self._skip(result, layer, 'no_entry', 'key not found')
+                continue
+            if getattr(entry, 'obsolete', False):
+                self._skip(result, layer, 'obsolete', 'entry is obsolete')
+                continue
+            if getattr(entry, 'fuzzy', False):
+                self._skip(result, layer, 'fuzzy', 'entry is marked fuzzy')
+                continue
+            if not entry.msgid_plural:
+                if entry.msgstr == '':
+                    self._skip(
+                        result, layer, 'untranslated', 'msgstr is empty'
+                    )
+                    continue
+                return self._winner(
+                    result, layer, entry.msgstr, None, None
+                )
+            try:
+                rule = layer.plural_rule
+            except _CatalogUnavailable as exc:
+                self._skip(result, layer, exc.reason, exc.detail)
+                continue
+            except PluralRuleError as exc:
+                reason = (
+                    'plural_rule_missing'
+                    if exc.code == 'missing' else 'plural_rule_invalid'
+                )
+                self._skip(result, layer, reason, text_type(exc))
+                continue
+            try:
+                index = rule.index(count)
+            except PluralRuleError as exc:
+                reason = (
+                    'plural_index_out_of_range'
+                    if exc.code == 'index' else 'plural_rule_invalid'
+                )
+                self._skip(
+                    result, layer, reason, text_type(exc),
+                    plural_index=None
+                )
+                continue
+            if policy == 'atomic':
+                missing = self._incomplete_plural_branches(entry, rule)
+                if missing:
+                    detail = 'missing or empty plural branches: %s' % (
+                        ', '.join([text_type(item) for item in missing])
+                    )
+                    self._skip(
+                        result, layer, 'incomplete_plural_set', detail,
+                        plural_index=index
+                    )
+                    continue
+            value = entry.msgstr_plural.get(index)
+            if value is None:
+                self._skip(
+                    result, layer, 'plural_slot_missing',
+                    'msgstr[%s] is not present for count %s' % (
+                        index, count
+                    ),
+                    plural_index=index
+                )
+                continue
+            if value == '':
+                self._skip(
+                    result, layer, 'untranslated',
+                    'msgstr[%s] is empty' % index,
+                    plural_index=index
+                )
+                continue
+            return self._winner(
+                result, layer, value, index, rule.nplurals
+            )
+        return result
+
+    def resolve_tickets(self, tickets, region=None):
+        return [
+            self.resolve(
+                ticket.get('key') or ticket.get('msgid'),
+                count=ticket.get('count', 1),
+                msgctxt=ticket.get('msgctxt'),
+                policy=ticket.get('policy'),
+                region=ticket.get('region', region)
+            )
+            for ticket in tickets
+        ]
+
+
+class CatalogSet(object):
+    """
+    The three-tier region/language/product-default catalog configuration.
+
+    The configuration describes shared catalog locations and per-region
+    overrides::
+
+        {
+          "product_default": "locales/en/LC_MESSAGES/app.po",
+          "languages": {"de": "locales/de/LC_MESSAGES/app.po"},
+          "regions": {"de-DE": "locales/de-DE/LC_MESSAGES/app.po"},
+          "policies": {"checkout.items": "atomic"},
+          "default_policy": "branch"
+        }
+
+    A region value may also be an object with ``catalog`` and ``language``
+    keys, which is useful when the region tag does not map directly to a
+    language.  A missing region or language catalog is not fatal: it
+    becomes a skipped layer with an explanatory reason.
+    """
+
+    def __init__(self, product_default, languages=None, regions=None,
+                 policies=None, default_policy='branch', base_dir=None):
+        self.base_dir = base_dir or os.getcwd()
+        self.product_default = self._path_spec(product_default)
+        self.languages = self._spec_map(languages)
+        self.regions = self._spec_map(regions)
+        self.policies = dict(policies or {})
+        self.default_policy = _normalize_policy(default_policy) or 'branch'
+        self._resolver_cache = {}
+
+    def _path_spec(self, value):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            value = dict(value)
+            path = value.get('path') or value.get('catalog')
+            if path:
+                value['path'] = _resolve_config_path(path, self.base_dir)
+            return value
+        return _resolve_config_path(value, self.base_dir)
+
+    def _spec_map(self, values):
+        result = {}
+        for name, spec in (values or {}).items():
+            result[_normalized_locale(name)] = (name, self._path_spec(spec))
+        return result
+
+    @classmethod
+    def from_config(cls, config, base_dir=None):
+        config_source = config
+        config = _json_config(config)
+        base = _config_base_dir(config_source, base_dir)
+        product_default = (
+            config.get('product_default') or
+            config.get('default') or
+            config.get('product_default_catalog')
+        )
+        return cls(
+            product_default,
+            languages=config.get('languages'),
+            regions=config.get('regions'),
+            policies=config.get('policies') or config.get('messages'),
+            default_policy=config.get('default_policy') or 'branch',
+            base_dir=base
+        )
+
+    def _lookup(self, mapping, locale):
+        normalized = _normalized_locale(locale)
+        if normalized in mapping:
+            return mapping[normalized]
+        for key, value in mapping.items():
+            if key.lower() == normalized:
+                return value
+        return None, None
+
+    def _lookup_language(self, region):
+        parts = _normalized_locale(region).split('-')
+        for size in range(len(parts) - 1, 0, -1):
+            candidate = '-'.join(parts[:size])
+            name, spec = self._lookup(self.languages, candidate)
+            if name:
+                return name, spec
+        return None, None
+
+    def layers_for_region(self, region):
+        """
+        Build the ordered layer list for ``region``.
+
+        The order is always region, common language, product default.  The
+        common language is the longest configured prefix of the region tag
+        (``de`` for ``de-DE``, ``zh-Hant`` for ``zh-Hant-TW``).
+        """
+        if not region:
+            raise ValueError('region must be a non-empty string')
+        region = text_type(region)
+        configured_name, region_spec = self._lookup(self.regions, region)
+        if isinstance(region_spec, dict):
+            region_path = region_spec.get('path') or region_spec.get(
+                'catalog'
+            )
+            language = region_spec.get('language')
+        else:
+            region_path = region_spec
+            language = None
+        if not configured_name:
+            region_path = None
+        language_name, language_spec = self._lookup_language(
+            language or region
+        )
+        if isinstance(language_spec, dict):
+            language_path = language_spec.get('path') or language_spec.get(
+                'catalog'
+            )
+        else:
+            language_path = language_spec
+        if not language_name:
+            language_name = language or region.replace(
+                '_', '-'
+            ).split('-')[0]
+        layers = [
+            TranslationCatalog(
+                'region:%s' % region, region_path, 'region', region
+            ),
+            TranslationCatalog(
+                'language:%s' % language_name, language_path,
+                'language', language_name
+            ),
+        ]
+        default_name = 'default'
+        default_path = self.product_default
+        if isinstance(default_path, dict):
+            default_name = default_path.get('name') or default_name
+            default_path = default_path.get('path') or default_path.get(
+                'catalog'
+            )
+        layers.append(
+            TranslationCatalog(default_name, default_path, 'default', None)
+        )
+        return layers
+
+    def resolver_for_region(self, region):
+        normalized = _normalized_locale(region)
+        if normalized not in self._resolver_cache:
+            self._resolver_cache[normalized] = TranslationResolver(
+                self.layers_for_region(region),
+                policies=self.policies,
+                default_policy=self.default_policy
+            )
+        return self._resolver_cache[normalized]
+
+    def resolve(self, region, key, count=1, msgctxt=None, policy=None):
+        resolver = self.resolver_for_region(region)
+        return resolver.resolve(
+            key, count=count, msgctxt=msgctxt, policy=policy, region=region
+        )
+
+
+def load_catalog_config(config, base_dir=None):
+    """
+    Load a catalog configuration from a JSON file or dictionary.
+
+    Returns a :class:`CatalogSet` for a three-tier configuration or a
+    :class:`TranslationResolver` for a configuration with an explicit
+    ``layers`` list.  Already-built objects are returned unchanged.
+    """
+    if isinstance(config, (CatalogSet, TranslationResolver)):
+        return config
+    config_source = config
+    raw = _json_config(config)
+    if 'layers' in raw:
+        return TranslationResolver.from_config(
+            raw, base_dir=_config_base_dir(config_source, base_dir)
+        )
+    return CatalogSet.from_config(
+        raw, base_dir=_config_base_dir(config_source, base_dir)
+    )
+
+
+def resolve_translation(config, region, key, count=1, msgctxt=None,
+                        policy=None):
+    """
+    Resolve one ticket (``region``, ``key``, ``count``) against ``config``.
+
+    ``config`` may be a path to a JSON file, a configuration dictionary, a
+    :class:`CatalogSet` or a :class:`TranslationResolver`.  The return value
+    is a :class:`TranslationResolution`; inspect ``text``, ``source`` and
+    ``source_directory`` for the answer and ``skipped`` for the reasons
+    nearer layers were passed over.
+    """
+    target = load_catalog_config(config)
+    if isinstance(target, CatalogSet):
+        return target.resolve(
+            region, key, count=count, msgctxt=msgctxt, policy=policy
+        )
+    return target.resolve(
+        key, count=count, msgctxt=msgctxt, policy=policy, region=region
+    )
+
+
+def resolve_tickets(config, tickets):
+    """
+    Resolve a batch of ticket dictionaries against one configuration.
+
+    Each ticket needs ``region`` and ``key``; ``count``, ``msgctxt`` and
+    ``policy`` are optional.  The configuration is loaded only once.
+    """
+    if isinstance(tickets, dict):
+        tickets = tickets.get('tickets') or []
+    target = load_catalog_config(config)
+    results = []
+    for index, ticket in enumerate(tickets):
+        if not isinstance(ticket, dict):
+            raise TypeError('ticket %d must be a dictionary' % index)
+        key = ticket.get('key') or ticket.get('msgid')
+        if not key:
+            raise ValueError('ticket %d has no key' % index)
+        region = ticket.get('region')
+        if not region:
+            raise ValueError('ticket %d has no region' % index)
+        results.append(resolve_translation(
+            target, region, key,
+            count=ticket.get('count', 1),
+            msgctxt=ticket.get('msgctxt'),
+            policy=ticket.get('policy')
+        ))
+    return results
+
+
+def _resolution_text(result):
+    lines = [
+        'key: %s' % result.key,
+        'region: %s' % result.region,
+        'count: %s' % result.count,
+        'policy: %s' % result.policy,
+        'text: %s' % (result.text if result.resolved else '<unresolved>'),
+        'source: %s' % (result.source if result.source else '<none>'),
+        'source_directory: %s' % (
+            result.source_directory if result.source_directory
+            else '<none>'
+        ),
+    ]
+    if result.plural_index is not None:
+        lines.append(
+            'plural_index: %s (nplurals=%s)' % (
+                result.plural_index, result.nplurals
+            )
+        )
+    lines.append('skipped:')
+    if not result.skipped:
+        lines.append('  (none)')
+    for item in result.skipped:
+        lines.append(
+            '  - %s [%s] %s' % (item.name, item.reason, item.detail)
+        )
+        lines.append(
+            '    path: %s' % (item.path if item.path else '<none>')
+        )
+    return '\n'.join(lines)
+
+
+def _cli_main(argv=None):
+    import argparse
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)
+    if argv and argv[0] == 'resolve':
+        argv = argv[1:]
+    parser = argparse.ArgumentParser(
+        prog='polib',
+        description='Resolve a translation from layered gettext catalogs.'
+    )
+    parser.add_argument('--config', required=True)
+    parser.add_argument('--region')
+    parser.add_argument('--key')
+    parser.add_argument('--count', type=int, default=1)
+    parser.add_argument('--msgctxt')
+    parser.add_argument('--policy')
+    parser.add_argument('--tickets')
+    parser.add_argument('--json', action='store_true', dest='as_json')
+    parser.add_argument('--out')
+    args = parser.parse_args(argv)
+
+    target = load_catalog_config(args.config)
+    if args.tickets:
+        if args.region or args.key:
+            parser.error('--tickets cannot be combined with --region/--key')
+        with io.open(args.tickets, 'r', encoding='utf-8') as fhandle:
+            tickets = json.load(fhandle)
+        results = resolve_tickets(target, tickets)
+    else:
+        if not args.region or not args.key:
+            parser.error('--region and --key are required without --tickets')
+        results = [resolve_translation(
+            target, args.region, args.key,
+            count=args.count,
+            msgctxt=args.msgctxt,
+            policy=args.policy
+        )]
+
+    if args.as_json:
+        payload = [item.to_dict() for item in results]
+        output = json.dumps(
+            payload if args.tickets else payload[0],
+            ensure_ascii=False, indent=2, sort_keys=True
+        ) + '\n'
+    else:
+        output = '\n\n'.join([_resolution_text(item) for item in results])
+        output += '\n'
+    if args.out:
+        with io.open(args.out, 'w', encoding='utf-8') as fhandle:
+            fhandle.write(output)
+    else:
+        sys.stdout.write(output)
+    if any(not item.resolved for item in results):
+        return 1
+    return 0
+
+
+def main(argv=None):
+    """
+    Command-line entry point for layered catalog resolution.
+
+    Returns the process exit status: ``0`` when every ticket resolved and
+    ``1`` when at least one ticket had no translation in any layer.
+    """
+    return _cli_main(argv)
+
+
+def _translation_cli():
+    sys.exit(main())
+# }}}
+
+
+if __name__ == '__main__':
+    _translation_cli()

@@ -15,6 +15,58 @@ The ``mofile`` function
 .. autofunction:: polib.mofile
 
 
+The layered catalog functions
+-----------------------------
+
+.. autofunction:: polib.load_catalog_config
+
+.. autofunction:: polib.resolve_translation
+
+.. autofunction:: polib.resolve_tickets
+
+
+The ``PluralRule`` class
+------------------------
+
+.. autoclass:: polib.PluralRule
+    :members:
+
+
+The ``TranslationCatalog`` class
+--------------------------------
+
+.. autoclass:: polib.TranslationCatalog
+    :members:
+
+
+The ``TranslationResolver`` class
+---------------------------------
+
+.. autoclass:: polib.TranslationResolver
+    :members:
+
+
+The ``CatalogSet`` class
+------------------------
+
+.. autoclass:: polib.CatalogSet
+    :members:
+
+
+The ``TranslationResolution`` class
+-----------------------------------
+
+.. autoclass:: polib.TranslationResolution
+    :members:
+
+
+The ``SkippedLayer`` class
+--------------------------
+
+.. autoclass:: polib.SkippedLayer
+    :members:
+
+
 The ``detect_encoding`` function
 --------------------------------
 

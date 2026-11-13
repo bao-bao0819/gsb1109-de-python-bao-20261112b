@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import codecs
+import io
 import os
 import subprocess
 import sys
@@ -875,6 +876,366 @@ msgid "foo"
 msgstr "oof"
 ''')
         self.assertEqual(mo.__unicode__(), expected)
+
+
+class TestPluralRule(unittest.TestCase):
+
+    def test_english_rule(self):
+        rule = polib.PluralRule.from_metadata({
+            'Plural-Forms': 'nplurals=2; plural=(n != 1);'
+        })
+        self.assertEqual(rule.nplurals, 2)
+        self.assertEqual(rule.index(1), 0)
+        self.assertEqual(rule.index(0), 1)
+        self.assertEqual(rule.index(2), 1)
+
+    def test_polish_rule(self):
+        p = 'nplurals=3; plural=(n==1 ? 0 : (n%10>=2 && n%10<=4 && ' \
+            '(n%100<10 || n%100>=20) ? 1 : 2));'
+        rule = polib.PluralRule.from_metadata({'Plural-Forms': p})
+        self.assertEqual(rule.index(1), 0)
+        self.assertEqual(rule.index(2), 1)
+        self.assertEqual(rule.index(5), 2)
+        self.assertEqual(rule.index(22), 1)
+        self.assertEqual(rule.index(25), 2)
+
+    def test_missing_metadata(self):
+        with self.assertRaises(polib.PluralRuleError) as ctx:
+            polib.PluralRule.from_metadata({})
+        self.assertEqual(ctx.exception.code, 'missing')
+
+    def test_invalid_expression(self):
+        with self.assertRaises(polib.PluralRuleError) as ctx:
+            polib.PluralRule.from_metadata({
+                'Plural-Forms': 'nplurals=2; plural=n ? 0 : __import__("os");'
+            })
+        self.assertEqual(ctx.exception.code, 'invalid')
+
+    def test_out_of_range_index(self):
+        rule = polib.PluralRule.from_metadata({
+            'Plural-Forms': 'nplurals=2; plural=(n == 0 ? 3 : 0);'
+        })
+        with self.assertRaises(polib.PluralRuleError) as ctx:
+            rule.index(0)
+        self.assertEqual(ctx.exception.code, 'index')
+
+
+class TestTranslationResolver(unittest.TestCase):
+
+    REGION = u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
+
+msgid "cart.items"
+msgid_plural "cart.items.plural"
+msgstr[0] "Artikel"
+msgstr[1] "Artikel"
+
+msgid "nav.home"
+msgstr "Start"
+''')
+
+    LANGUAGE = u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+"Plural-Forms: nplurals=3; plural=(n==1 ? 0 : (n%10>=2 && n%10<=4 && "
+"(n%100<10 || n%100>=20) ? 1 : 2));\\n"
+
+msgid "cart.items"
+msgid_plural "cart.items.plural"
+msgstr[0] "Ein Artikel"
+msgstr[1] "Artikel"
+msgstr[2] "Artikel"
+
+msgid "checkout.items"
+msgid_plural "checkout.items.plural"
+msgstr[0] "Ein Artikel"
+msgstr[1] ""
+msgstr[2] "Viele Artikel"
+
+msgid "nav.home"
+msgstr "Startseite"
+''')
+
+    DEFAULT = u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
+
+msgid "cart.items"
+msgid_plural "cart.items.plural"
+msgstr[0] "One item"
+msgstr[1] "Many items"
+
+msgid "checkout.items"
+msgid_plural "checkout.items.plural"
+msgstr[0] "One checkout item"
+msgstr[1] "Many checkout items"
+
+msgid "nav.home"
+msgstr "Home"
+''')
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.region = os.path.join(self.tmpdir, 'region.po')
+        self.language = os.path.join(self.tmpdir, 'language.po')
+        self.default = os.path.join(self.tmpdir, 'default.po')
+        for path, data in (
+            (self.region, self.REGION),
+            (self.language, self.LANGUAGE),
+            (self.default, self.DEFAULT),
+        ):
+            with codecs.open(path, 'w', encoding='utf-8') as fhandle:
+                fhandle.write(data)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def _resolver(self, **kwargs):
+        return polib.TranslationResolver([
+            {'name': 'region:de-DE', 'role': 'region', 'path': self.region},
+            {'name': 'language:de', 'role': 'language',
+             'path': self.language},
+            {'name': 'default', 'role': 'default', 'path': self.default},
+        ], **kwargs)
+
+    def test_key_returns_region_layer(self):
+        result = self._resolver().resolve('nav.home')
+        self.assertEqual(result.text, u('Start'))
+        self.assertEqual(result.source, 'region:de-DE')
+        self.assertEqual(result.source_directory, self.tmpdir)
+        self.assertEqual(result.skipped, [])
+
+    def test_count_uses_each_layers_plural_rule(self):
+        result = self._resolver().resolve('cart.items', count=3)
+        self.assertEqual(result.text, u('Artikel'))
+        self.assertEqual(result.source, 'region:de-DE')
+        self.assertEqual(result.plural_index, 1)
+        self.assertEqual(result.nplurals, 2)
+        language = polib.pofile(self.language)
+        self.assertIsNotNone(language.find('cart.items').msgstr_plural[1])
+
+    def test_branch_falls_back_per_index(self):
+        result = self._resolver(default_policy='branch').resolve(
+            'checkout.items', count=7
+        )
+        self.assertEqual(result.text, u('Viele Artikel'))
+        self.assertEqual(result.source, 'language:de')
+        self.assertEqual(result.plural_index, 2)
+        self.assertEqual(result.nplurals, 3)
+
+    def test_branch_falls_back_when_slot_empty(self):
+        result = self._resolver(default_policy='branch').resolve(
+            'checkout.items', count=2
+        )
+        self.assertEqual(result.text, u('Many checkout items'))
+        self.assertEqual(result.source, 'default')
+        self.assertEqual(result.plural_index, 1)
+        self.assertEqual(
+            result.skipped[1].reason, 'untranslated'
+        )
+
+    def test_atomic_requires_same_layer(self):
+        result = self._resolver(default_policy='atomic').resolve(
+            'checkout.items', count=2
+        )
+        self.assertEqual(result.text, u('Many checkout items'))
+        self.assertEqual(result.source, 'default')
+        self.assertEqual(result.plural_index, 1)
+        self.assertEqual(result.nplurals, 2)
+        reasons = [(item.name, item.reason) for item in result.skipped]
+        self.assertEqual(
+            reasons,
+            [('region:de-DE', 'no_entry'),
+             ('language:de', 'incomplete_plural_set')]
+        )
+        self.assertIn('1', result.skipped[1].detail)
+
+    def test_atomic_from_nearest_complete_layer(self):
+        result = self._resolver(default_policy='atomic').resolve(
+            'cart.items', count=2
+        )
+        self.assertEqual(result.text, u('Artikel'))
+        self.assertEqual(result.source, 'region:de-DE')
+        self.assertEqual(result.plural_index, 1)
+
+    def test_per_message_policy_override(self):
+        result = self._resolver(
+            policies={'checkout.items': 'atomic'}
+        ).resolve('checkout.items', count=2)
+        self.assertEqual(result.source, 'default')
+        self.assertEqual(result.policy, 'atomic')
+
+    def test_ticket_policy_argument_wins(self):
+        result = self._resolver(
+            policies={'checkout.items': 'atomic'}
+        ).resolve('checkout.items', count=7, policy='branch')
+        self.assertEqual(result.source, 'language:de')
+        self.assertEqual(result.policy, 'branch')
+
+    def test_fuzzy_and_obsolete_are_reported(self):
+        po = polib.pofile(self.region)
+        po.find('nav.home').flags.append('fuzzy')
+        po.save()
+        resolver = polib.TranslationResolver([
+            {'name': 'region', 'path': self.region},
+        ])
+        result = resolver.resolve('nav.home')
+        self.assertFalse(result.resolved)
+        self.assertEqual(result.skipped[0].reason, 'fuzzy')
+        po = polib.pofile(self.region)
+        entry = po.find('nav.home')
+        entry.flags.remove('fuzzy')
+        entry.obsolete = True
+        po.save()
+        resolver = polib.TranslationResolver([
+            {'name': 'region', 'path': self.region},
+        ])
+        result = resolver.resolve('nav.home')
+        self.assertEqual(result.skipped[0].reason, 'obsolete')
+
+    def test_missing_catalog_is_a_reason(self):
+        resolver = polib.TranslationResolver([
+            {'name': 'region', 'path': os.path.join(self.tmpdir, 'gone.po')},
+            {'name': 'default', 'path': self.default},
+        ])
+        result = resolver.resolve('nav.home')
+        self.assertEqual(result.text, u('Home'))
+        self.assertEqual(result.skipped[0].reason, 'catalog_missing')
+        self.assertIn('gone.po', result.skipped[0].detail)
+
+    def test_catalog_plural_rule_missing(self):
+        broken = os.path.join(self.tmpdir, 'broken.po')
+        with codecs.open(broken, 'w', encoding='utf-8') as fhandle:
+            fhandle.write(u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+
+msgid "cart.items"
+msgid_plural "cart.items.plural"
+msgstr[0] "Artikel"
+msgstr[1] "Artikel"
+'''))
+        try:
+            resolver = polib.TranslationResolver([
+                {'name': 'broken', 'path': broken},
+                {'name': 'default', 'path': self.default},
+            ])
+            result = resolver.resolve('cart.items', count=2)
+            self.assertEqual(result.text, u('Many items'))
+            self.assertEqual(result.source, 'default')
+            self.assertEqual(
+                result.skipped[0].reason, 'plural_rule_missing'
+            )
+        finally:
+            os.remove(broken)
+
+    def test_region_config_loader(self):
+        config = {
+            'product_default': self.default,
+            'languages': {'de': self.language},
+            'regions': {'de-DE': self.region},
+            'policies': {'checkout.items': 'atomic'},
+        }
+        result = polib.resolve_translation(
+            config, 'de-DE', 'checkout.items', count=2
+        )
+        self.assertEqual(result.source, 'default')
+        self.assertEqual(result.policy, 'atomic')
+
+    def test_script_region_uses_common_language(self):
+        config = {
+            'product_default': self.default,
+            'languages': {'zh-Hant': self.language},
+            'regions': {'zh-Hant-TW': self.region},
+        }
+        layers = polib.load_catalog_config(
+            config
+        ).layers_for_region('zh-Hant-TW')
+        self.assertEqual(
+            [layer.name for layer in layers],
+            ['region:zh-Hant-TW', 'language:zh-Hant', 'default']
+        )
+
+    def test_obsolete_duplicate_prefers_live_entry(self):
+        unexpected = os.path.join(self.tmpdir, 'unexpected.po')
+        with codecs.open(unexpected, 'w', encoding='utf-8') as fhandle:
+            fhandle.write(u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+
+msgid "nav.home"
+msgstr "Start"
+
+#~ msgid "nav.home"
+#~ msgstr "Alt"
+'''))
+        resolver = polib.TranslationResolver([
+            {'name': 'region', 'path': unexpected},
+        ])
+        result = resolver.resolve('nav.home')
+        self.assertEqual(result.text, u('Start'))
+
+    def test_mo_catalog_uses_its_own_rule(self):
+        mo_path = os.path.join(self.tmpdir, 'language.mo')
+        po = polib.pofile(self.language)
+        po.save_as_mofile(mo_path)
+        resolver = polib.TranslationResolver([
+            {'name': 'language:de', 'path': mo_path},
+            {'name': 'default', 'path': self.default},
+        ])
+        result = resolver.resolve('cart.items', count=7)
+        self.assertEqual(result.text, u('Artikel'))
+        self.assertEqual(result.source, 'language:de')
+        self.assertEqual(result.plural_index, 2)
+
+    def test_batch_tickets(self):
+        config = {
+            'product_default': self.default,
+            'languages': {'de': self.language},
+            'regions': {'de-DE': self.region},
+        }
+        results = polib.resolve_tickets(config, [
+            {'region': 'de-DE', 'key': 'nav.home'},
+            {'region': 'fr-FR', 'key': 'nav.home', 'count': 2},
+        ])
+        self.assertEqual(results[0].text, u('Start'))
+        self.assertEqual(results[1].text, u('Home'))
+        self.assertEqual(results[1].source, 'default')
+        missing = [item.reason for item in results[1].skipped]
+        self.assertEqual(
+            missing,
+            ['catalog_not_configured', 'catalog_not_configured']
+        )
+
+    def test_cli_json_output(self):
+        config_path = os.path.join(self.tmpdir, 'config.json')
+        import json
+        with codecs.open(config_path, 'w', encoding='utf-8') as fhandle:
+            fhandle.write(json.dumps({
+                'product_default': self.default,
+                'languages': {'de': self.language},
+                'regions': {'de-DE': self.region},
+            }))
+        out_path = os.path.join(self.tmpdir, 'out.json')
+        argv = [
+            'resolve', '--config', config_path,
+            '--region', 'de-DE', '--key', 'checkout.items',
+            '--count', '7', '--json', '--out', out_path
+        ]
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = polib._cli_main(argv)
+        self.assertEqual(status, 0)
+        with codecs.open(out_path, 'r', encoding='utf-8') as fhandle:
+            payload = json.load(fhandle)
+        self.assertEqual(payload['text'], u('Viele Artikel'))
+        self.assertEqual(payload['source'], 'language:de')
+        self.assertEqual(payload['source_directory'], self.tmpdir)
+        self.assertEqual(len(payload['skipped']), 1)
 
 
 if __name__ == '__main__':

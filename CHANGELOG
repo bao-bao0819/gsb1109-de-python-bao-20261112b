@@ -2,6 +2,15 @@
 Changelog
 =========
 
+Unreleased
+----------
+ - Added layered catalog resolution for region, common-language and product
+   default catalogs
+ - Added per-catalog Plural-Forms parsing with branch-wise or same-layer
+   fallback policies, plus an explanation of every skipped nearer layer
+ - Added a ``polib resolve`` command-line entry point for single tickets and
+   batch ticket files
+
 Version 1.2.0 (2023/02/23)
 --------------------------
  - Added setter for the fuzzy property

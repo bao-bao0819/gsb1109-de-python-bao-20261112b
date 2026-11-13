@@ -231,3 +231,48 @@ Reverse a mo file to a po file::
     # or to save the mo file as an po file
     mo.save_as_pofile('path/to/catalog.po')
 
+
+
+Resolving translations across catalog layers
+--------------------------------------------
+
+Product catalogs are often shipped on three layers: a region catalog, a
+common-language catalog and the product default.  A region catalog may use a
+different ``Plural-Forms`` rule than the common language, so the slot for a
+given count must be computed with each layer's own rule.
+
+Configure the layers once::
+
+    {
+      "product_default": "locales/en/LC_MESSAGES/app.po",
+      "languages": {"de": "locales/de/LC_MESSAGES/app.po"},
+      "regions": {"de-DE": "locales/de-DE/LC_MESSAGES/app.po"},
+      "policies": {"checkout.items": "atomic"},
+      "default_policy": "branch"
+    }
+
+Then resolve a ticket with its key, count and region::
+
+    import polib
+
+    catalogs = polib.load_catalog_config('catalogs.json')
+    result = catalogs.resolve('de-DE', 'checkout.items', count=7)
+    print(result.text)              # the final translation
+    print(result.source)            # the winning layer name
+    print(result.source_directory)  # the directory of the winning catalog
+    for skipped in result.skipped:
+        print(skipped.name, skipped.reason, skipped.detail)
+
+``branch`` policy lets each plural branch fall back on its own; ``atomic``
+requires every plural branch to come from the same layer.  A message can
+override the configured policy in its PO flags (``branch-fallback`` or
+``atomic-fallback``) or with an extracted/translator comment such as
+``fallback: atomic``.
+
+The same resolution is available from the command line::
+
+    python polib.py resolve --config catalogs.json \
+        --region de-DE --key checkout.items --count 7 --json
+
+Use ``--tickets tickets.json`` to resolve a batch; each ticket needs
+``region`` and ``key`` and may set ``count``, ``msgctxt`` and ``policy``.
