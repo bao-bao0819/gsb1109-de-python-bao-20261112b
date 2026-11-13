@@ -10,6 +10,9 @@ API Reference
 .. automodule:: xlwt.Row
    :members:
 
+.. automodule:: xlwt.Revision
+   :members:
+
 .. automodule:: xlwt.Column
    :members:
 

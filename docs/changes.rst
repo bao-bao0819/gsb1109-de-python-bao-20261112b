@@ -3,6 +3,18 @@ Changes
 
 .. currentmodule:: xlwt
 
+Unreleased
+----------
+
+- Add :class:`~xlwt.Revision.RevisionRowStream` and
+  :meth:`Worksheet.get_revision_stream` for accepting rows keyed by a
+  business identifier and ordered by a revision number.  Only the newest
+  accepted revision is written, first-seen order is preserved, and an
+  equal revision carrying different values is reported as a conflict.
+  Row payloads are kept in a temporary SQLite database, so memory use does
+  not grow with the total cell contents, and corrections may arrive before
+  or after :meth:`Worksheet.flush_row_data` with the same result.
+
 1.3.0 (22 August 2017)
 ----------------------
 

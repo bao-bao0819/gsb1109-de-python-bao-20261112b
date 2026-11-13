@@ -172,6 +172,9 @@ class Row(object):
         # previously:
         # return ''.join([cell.get_biff_data() for colx, cell in cell_items])
 
+    def get_cell_objects(self):
+        return [cell for colx, cell in self.__cells.items() if cell is not None]
+
     def get_index(self):
         return self.__idx
 

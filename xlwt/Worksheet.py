@@ -32,6 +32,7 @@
 #             RANGEPROTECTION (BIFF8X only)
 #             EOF
 
+import heapq
 import tempfile
 
 from . import BIFFRecords, Bitmap, Style
@@ -200,7 +201,10 @@ class Worksheet(object):
         self.first_used_col = 255
         self.row_tempfile = None
         self.__flushed_rows = {}
+        self.__flushed_row_records = []
         self.__row_visible_levels = 0
+        self.__revision_streams = []
+        self.__revision_col_bounds = None
 
     #################################################################
     ## Properties, "getters", "setters"
@@ -1138,12 +1142,15 @@ class Worksheet(object):
         if indx not in self.__rows:
             if indx in self.__flushed_rows:
                 raise Exception("Attempt to reuse row index %d of sheet %r after flushing" % (indx, self.__name))
-            self.__rows[indx] = self.Row(indx, self)
-            if indx > self.last_used_row:
-                self.last_used_row = indx
-            if indx < self.first_used_row:
-                self.first_used_row = indx
+            self.__put_row(indx)
         return self.__rows[indx]
+
+    def __put_row(self, indx):
+        self.__rows[indx] = self.Row(indx, self)
+        if indx > self.last_used_row:
+            self.last_used_row = indx
+        if indx < self.first_used_row:
+            self.first_used_row = indx
 
     def row_height(self, row): # in pixels
         if row in self.__rows:
@@ -1304,13 +1311,6 @@ class Worksheet(object):
 
         return result
 
-    def __row_blocks_rec(self):
-        result = []
-        for row in self.__rows.values():
-            result.append(row.get_row_biff_data())
-            result.append(row.get_cells_biff_data())
-        return b''.join(result)
-
     def __merged_rec(self):
         return BIFFRecords.MergedCellsRecord(self.__merged_ranges).get()
 
@@ -1390,13 +1390,6 @@ class Worksheet(object):
             ]
         if self.row_tempfile:
             self.row_tempfile.flush()
-            self.row_tempfile.seek(0)
-            result.append(self.row_tempfile.read())
-            self.row_tempfile.seek(0, 2) # to EOF
-            # Above seek() is necessary to avoid a spurious IOError
-            # with Errno 0 if the caller continues on writing rows
-            # and flushing row data after the save().
-            # See https://bugs.python.org/issue3207
         result.extend([
             self.__row_blocks_rec(),
             self.__merged_rec(),
@@ -1407,11 +1400,148 @@ class Worksheet(object):
             ])
         return b''.join(result)
 
+    def __flushed_row_record(self, offset, length):
+        self.row_tempfile.seek(offset)
+        data = self.row_tempfile.read(length)
+        self.row_tempfile.seek(0, 2) # to EOF
+        return data
+
+    def __row_blocks_rec(self):
+        """Emit all row records in ascending row order.
+
+        Ordinary rows, rows already flushed to the sheet tempfile, and
+        revision stream rows are merged lazily: one encoded row record is
+        alive at a time, so revision payloads never accumulate in memory.
+        """
+        sources = []
+        if self.__flushed_row_records:
+            sources.append(self.__iter_flushed_rows())
+        if self.__rows:
+            sources.append(self.__iter_live_rows())
+        for stream in self.__revision_streams:
+            sources.append(stream.iter_row_biff_data())
+        return b''.join(data for _rowx, data in self.__merge_rows(sources))
+
+    def __iter_flushed_rows(self):
+        for rowx, offset, length in sorted(self.__flushed_row_records):
+            yield rowx, self.__flushed_row_record(offset, length)
+
+    def __iter_live_rows(self):
+        for rowx in sorted(self.__rows):
+            row = self.__rows[rowx]
+            data = row.get_row_biff_data() + row.get_cells_biff_data()
+            yield rowx, data
+
+    def __ordinary_row_blocks_rec(self):
+        return list(self.__iter_live_rows())
+
+    def __merge_rows(self, sources):
+        heap = []
+        for index, source in enumerate(sources):
+            iterator = iter(source)
+            try:
+                rowx, data = next(iterator)
+            except StopIteration:
+                continue
+            heap.append((rowx, index, data, iterator))
+        heapq.heapify(heap)
+        last_rowx = -1
+        while heap:
+            rowx, index, data, iterator = heapq.heappop(heap)
+            if rowx <= last_rowx:
+                raise Exception(
+                    "row %d would be written twice on sheet %r"
+                    % (rowx, self.__name))
+            last_rowx = rowx
+            yield rowx, data
+            try:
+                next_rowx, next_data = next(iterator)
+            except StopIteration:
+                continue
+            heapq.heappush(heap, (next_rowx, index, next_data, iterator))
+
+    def get_revision_stream(self, key=None, revision=None, columns=None,
+                            start_row=None, start_col=0, **kwargs):
+        """Create (and register) a revision-aware row stream for this sheet.
+
+        See :class:`xlwt.Revision.RevisionRowStream` for parameters and
+        behaviour.  Accepted rows are emitted in first-seen order at
+        serialisation time; callers can write ordinary cells elsewhere on
+        the same sheet without colliding with the stream.
+        """
+
+        from .Revision import RevisionRowStream
+        return RevisionRowStream(
+            self, key=key, revision=revision, columns=columns,
+            start_row=start_row, start_col=start_col, **kwargs)
+
+    revision_stream = get_revision_stream
+
+    def get_revision_conflicts(self, include_values=True):
+        """Return conflicts recorded by this sheet's revision streams.
+
+        Each item is a :class:`xlwt.Revision.RevisionConflict`; the first
+        accepted row for a key is kept and the rejected values are
+        available on the conflict object.
+        """
+
+        result = []
+        for stream in self.__revision_streams:
+            result.extend(stream.get_conflicts(include_values=include_values))
+        return result
+
+    revision_conflicts = property(get_revision_conflicts)
+
+    def _register_revision_stream(self, stream):
+        self.__revision_streams.append(stream)
+
+    def _unregister_revision_stream(self, stream):
+        if stream in self.__revision_streams:
+            self.__revision_streams.remove(stream)
+        self.__recompute_row_bounds()
+
+    def __recompute_row_bounds(self):
+        rowxs = set(self.__rows)
+        rowxs.update(record[0] for record in self.__flushed_row_records)
+        for other in self.__revision_streams:
+            if other.row_count:
+                rowxs.update(range(other.start_row,
+                                   other.start_row + other.row_count))
+        if rowxs:
+            self.first_used_row = min(rowxs)
+            self.last_used_row = max(rowxs)
+        else:
+            self.first_used_row = 65535
+            self.last_used_row = 0
+
+    def _note_revision_extent(self, rowx, start_col, width):
+        if rowx > self.last_used_row:
+            self.last_used_row = rowx
+        if rowx < self.first_used_row:
+            self.first_used_row = rowx
+        if width:
+            last_col = start_col + width - 1
+            if self.__revision_col_bounds is None:
+                first_rev_col = start_col
+                last_rev_col = last_col
+            else:
+                first_rev_col, last_rev_col = self.__revision_col_bounds
+                first_rev_col = min(first_rev_col, start_col)
+                last_rev_col = max(last_rev_col, last_col)
+            self.__revision_col_bounds = (first_rev_col, last_rev_col)
+            if last_rev_col > self.last_used_col:
+                self.last_used_col = last_rev_col
+            if first_rev_col < self.first_used_col:
+                self.first_used_col = first_rev_col
+
     def flush_row_data(self):
         if self.row_tempfile is None:
             self.row_tempfile = tempfile.TemporaryFile()
-        self.row_tempfile.write(self.__row_blocks_rec())
-        for rowx in self.__rows:
+        self.row_tempfile.seek(0, 2)
+        for rowx, data in self.__ordinary_row_blocks_rec():
+            offset = self.row_tempfile.tell()
+            self.row_tempfile.write(data)
+            self.__flushed_row_records.append((rowx, offset, len(data)))
             self.__flushed_rows[rowx] = 1
         self.__update_row_visible_levels()
         self.__rows = {}
