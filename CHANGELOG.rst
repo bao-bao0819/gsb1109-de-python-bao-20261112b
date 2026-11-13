@@ -3,6 +3,11 @@
 
 * Add Python 3.13 and 3.14 support. Drop support for end-of-life versions 3.8 and 3.9.
 
+Unreleased
+----------
+
+* feat: Add :func:`agatesql.table.to_sql_group` (also monkey patched as :meth:`agate.TableSet.to_sql`) to load a group of agate tables into SQLite as a single batch. Circular foreign key references are supported, rows with unresolvable references are reported, and foreign key enforcement is never disabled.
+
 0.7.2 - January 9, 2024
 -----------------------
 

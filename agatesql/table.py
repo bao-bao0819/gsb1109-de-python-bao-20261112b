@@ -8,7 +8,7 @@ import decimal
 from urllib.parse import urlsplit
 
 import agate
-from sqlalchemy import Column, MetaData, Table, UniqueConstraint, create_engine, dialects
+from sqlalchemy import Column, ForeignKeyConstraint, MetaData, Table, UniqueConstraint, column, create_engine, dialects
 from sqlalchemy.dialects.mssql import BIT
 from sqlalchemy.dialects.oracle import INTERVAL as ORACLE_INTERVAL
 from sqlalchemy.dialects.postgresql import INTERVAL as POSTGRES_INTERVAL
@@ -367,8 +367,215 @@ def sql_query(self, query, table_name='agate'):
     return table
 
 
+def _normalize_column_list(columns):
+    if isinstance(columns, str):
+        return [columns]
+    return list(columns)
+
+
+def _normalize_unique_constraint(columns_or_constraints):
+    if not columns_or_constraints:
+        return []
+    if all(isinstance(c, str) for c in columns_or_constraints):
+        return list(columns_or_constraints)
+    # A list of column lists describes several constraints; only the first
+    # one is used, matching Table.to_sql's single UNIQUE constraint support.
+    return list(columns_or_constraints[0])
+
+
+def _insert_group_rows(connection, sql_table, table, chunk_size):
+    """
+    Insert an agate table's rows and return a mapping of the SQLite ``rowid``
+    of each inserted row to its index in the agate table.
+    """
+    insert = sql_table.insert().returning(column('rowid'))
+    parameters = [dict(zip(table.column_names, row)) for row in table.rows]
+    number_of_rows = len(parameters)
+    step = chunk_size or number_of_rows or 1
+
+    rowids = {}
+    for start in range(0, number_of_rows, step):
+        result = connection.execute(insert, parameters[start:start + step])
+        for offset, (rowid,) in enumerate(result):
+            rowids[rowid] = start + offset
+
+    return rowids
+
+
+def to_sql_group(tables, connection_or_string, foreign_keys=None, unique_constraints=None,
+                 overwrite=False, constraints=True, chunk_size=None,
+                 min_col_len=1, col_len_multiplier=1):
+    """
+    Write a group of agate tables to a SQLite database as a single batch.
+
+    Tables are created if needed and all rows are inserted inside one
+    transaction with foreign key enforcement deferred until the batch has
+    been validated, so rows may reference rows in any other table of the
+    batch — including circular references — as well as rows already present
+    in the database. The order of the tables does not affect which rows are
+    committed.
+
+    Rows whose foreign keys cannot be resolved — directly or because the
+    rows they referenced were themselves rejected — are removed before
+    committing and reported to the caller. Tables without foreign keys are
+    loaded unconditionally. Foreign key enforcement is never disabled: it
+    is enabled on the connection if it was not already, and all checks are
+    performed with ``PRAGMA foreign_key_check`` before the transaction
+    commits.
+
+    SQLite only.
+
+    :param tables:
+        A mapping of SQL table names to :class:`agate.Table` instances, or
+        an :class:`agate.TableSet`.
+    :param connection_or_string:
+        An existing sqlalchemy connection or a connection string. If a
+        connection string is given, the transaction is committed and the
+        connection closed before returning. If a connection is given, the
+        caller remains responsible for committing.
+    :param foreign_keys:
+        A mapping of table name to a list of foreign key declarations, each
+        a ``(columns, referred_table, referred_columns)`` tuple. ``columns``
+        and ``referred_columns`` may be a single column name or a list of
+        names. The referred columns must be the primary key of, or have a
+        unique constraint on, the referred table (see
+        ``unique_constraints``), as SQLite requires. Referred tables that
+        are not part of the batch must already exist in the database.
+    :param unique_constraints:
+        A mapping of table name to the names of the columns to include in a
+        UNIQUE constraint when creating that table (or a list of such column
+        lists for several constraints).
+    :param overwrite:
+        Drop any existing batch tables with the same names before creating.
+    :param constraints:
+        Generate constraints such as ``nullable`` for table columns.
+    :param chunk_size:
+        Write rows in batches of this size. If not set, rows will be written
+        at once.
+    :param col_min_len:
+        The minimum length of text columns.
+    :param col_len_multiplier:
+        Multiply the maximum column length by this multiplier to accomodate
+        larger values in later runs.
+    :returns:
+        A dictionary mapping table names to :class:`agate.Table` instances
+        containing the rows that could not be committed because of
+        unresolvable foreign key references. Empty if every row was
+        committed.
+    """
+    engine, connection = get_engine_and_connection(connection_or_string)
+
+    try:
+        if connection.engine.dialect.name != 'sqlite':
+            raise ValueError('to_sql_group is only supported for SQLite databases.')
+
+        foreign_keys = foreign_keys or {}
+        unique_constraints = unique_constraints or {}
+        tables = dict(tables.items())
+
+        # Enforce foreign keys (never disable them) and defer their checks
+        # until commit, for this transaction only, so that circular
+        # references can be inserted in any order.
+        connection.exec_driver_sql('PRAGMA foreign_keys = ON')
+        connection.exec_driver_sql('PRAGMA defer_foreign_keys = ON')
+
+        metadata = MetaData()
+        sql_tables = {}
+        for name, table in tables.items():
+            sql_table = make_sql_table(table, name, dialect='sqlite', constraints=constraints,
+                                       unique_constraint=_normalize_unique_constraint(
+                                           unique_constraints.get(name)),
+                                       min_col_len=min_col_len, col_len_multiplier=col_len_multiplier)
+            sql_tables[name] = sql_table.to_metadata(metadata)
+
+        normalized_foreign_keys = {}
+        for name, declarations in foreign_keys.items():
+            if name not in sql_tables:
+                raise ValueError('Foreign keys declared for table not in this batch: %s' % name)
+            normalized = []
+            for columns, referred_table, referred_columns in declarations:
+                if referred_table not in sql_tables and referred_table not in metadata.tables:
+                    # Referred tables outside the batch must already exist.
+                    Table(referred_table, metadata, autoload_with=connection)
+                normalized.append((_normalize_column_list(columns), referred_table,
+                                   _normalize_column_list(referred_columns)))
+            normalized_foreign_keys[name] = normalized
+
+        for name, declarations in normalized_foreign_keys.items():
+            for columns, referred_table, referred_columns in declarations:
+                sql_tables[name].append_constraint(ForeignKeyConstraint(
+                    columns,
+                    ['%s.%s' % (referred_table, referred_column) for referred_column in referred_columns],
+                    deferrable=True, initially='DEFERRED'))
+
+        for sql_table in sql_tables.values():
+            if overwrite:
+                sql_table.drop(bind=connection, checkfirst=True)
+            sql_table.create(bind=connection, checkfirst=True)
+
+        # Violations that existed before this batch are not ours to fix.
+        preexisting_violations = {
+            (table_name, rowid)
+            for table_name, rowid, _, _ in connection.exec_driver_sql('PRAGMA foreign_key_check')
+        }
+
+        rowids = {}
+        for name, table in tables.items():
+            rowids[name] = _insert_group_rows(connection, sql_tables[name], table, chunk_size)
+
+        # Repeatedly remove batch rows with unresolvable references until
+        # only valid rows remain. Removing a row can orphan rows that
+        # reference it, so this runs to a fixed point, which is independent
+        # of the order the tables were given in.
+        identifier_preparer = connection.engine.dialect.identifier_preparer
+        rejected = {name: [] for name in tables}
+
+        while True:
+            unresolvable = [
+                (table_name, rowid)
+                for table_name, rowid, _, _ in connection.exec_driver_sql('PRAGMA foreign_key_check')
+                if table_name in rowids
+                and (table_name, rowid) not in preexisting_violations
+                and rowid in rowids[table_name]
+            ]
+            if not unresolvable:
+                break
+            for table_name, rowid in unresolvable:
+                index = rowids[table_name].pop(rowid)
+                rejected[table_name].append(tables[table_name].rows[index])
+                connection.exec_driver_sql(
+                    'DELETE FROM %s WHERE rowid = ?' % identifier_preparer.quote(table_name), (rowid,))
+
+        if engine is not None:
+            connection.commit()
+
+        return {
+            name: agate.Table(rows, tables[name].column_names, tables[name].column_types)
+            for name, rows in rejected.items()
+            if rows
+        }
+    finally:
+        if engine is not None:
+            connection.close()
+            engine.dispose()
+
+
+def tableset_to_sql(self, connection_or_string, **kwargs):
+    """
+    Write this table set to a SQLite database as a single batch. See
+    :func:`.to_sql_group` for details. Note that an
+    :class:`agate.TableSet` requires all tables to share the same columns;
+    use :func:`.to_sql_group` directly with a dictionary for heterogeneous
+    tables.
+
+    Monkey patched as instance method :meth:`TableSet.to_sql`.
+    """
+    return to_sql_group(self, connection_or_string, **kwargs)
+
+
 agate.Table.from_sql = classmethod(from_sql)
 agate.Table.from_sql_query = classmethod(from_sql_query)
 agate.Table.to_sql = to_sql
 agate.Table.to_sql_create_statement = to_sql_create_statement
 agate.Table.sql_query = sql_query
+agate.TableSet.to_sql = tableset_to_sql

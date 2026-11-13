@@ -61,6 +61,10 @@ API
 
 .. autofunction:: agatesql.table.sql_query
 
+.. autofunction:: agatesql.table.to_sql_group
+
+.. autofunction:: agatesql.table.tableset_to_sql
+
 Authors
 =======
 

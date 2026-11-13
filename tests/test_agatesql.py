@@ -2,10 +2,17 @@ from decimal import Decimal
 from textwrap import dedent
 
 import agate
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError
 
 import agatesql
+
+
+def enable_foreign_keys(engine):
+    @event.listens_for(engine, 'connect')
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        dbapi_connection.execute('PRAGMA foreign_keys = ON')
+
 
 
 class TestSQL(agate.AgateTestCase):
@@ -273,6 +280,271 @@ class TestSQL(agate.AgateTestCase):
             actual = sum(r[0] for r in table.rows)
             self.assertEqual(len(table.rows), len(rows))
             self.assertEqual(expected, actual)
+        finally:
+            connection.close()
+            engine.dispose()
+
+
+class TestTableSetToSQL(agate.AgateTestCase):
+    def setUp(self):
+        self.column_types = [agate.Number(), agate.Text(), agate.Number()]
+
+        self.departments = agate.Table(
+            (
+                (1, 'Engineering', 10),
+                (2, 'Sales', 20),
+                (3, 'Empty', 30),
+            ),
+            ['id', 'name', 'manager_id'],
+            self.column_types,
+        )
+        self.managers = agate.Table(
+            (
+                (10, 'Alice', 1),
+                (20, 'Bob', 2),
+                (30, 'Mallory', 99),
+            ),
+            ['id', 'name', 'department_id'],
+            self.column_types,
+        )
+        self.stores = agate.Table(
+            (
+                (100, 'Downtown', None),
+                (200, 'Airport', None),
+            ),
+            ['id', 'name', 'manager_id'],
+            self.column_types,
+        )
+
+        self.foreign_keys = {
+            'departments': [('manager_id', 'managers', 'id')],
+            'managers': [('department_id', 'departments', 'id')],
+        }
+        self.unique_constraints = {
+            'departments': ['id'],
+            'managers': ['id'],
+            'stores': ['id'],
+        }
+
+        self.connection_string = 'sqlite:///:memory:'
+
+    def make_tables(self, order=('departments', 'managers', 'stores')):
+        tables = {
+            'departments': self.departments,
+            'managers': self.managers,
+            'stores': self.stores,
+        }
+        return {name: tables[name] for name in order}
+
+    def load(self, connection, order=('departments', 'managers', 'stores')):
+        return agatesql.table.to_sql_group(
+            self.make_tables(order),
+            connection,
+            foreign_keys=self.foreign_keys,
+            unique_constraints=self.unique_constraints,
+        )
+
+    def committed_ids(self, connection, table_name):
+        rows = connection.exec_driver_sql(f'SELECT id FROM {table_name} ORDER BY id').fetchall()
+        return [row[0] for row in rows]
+
+    def test_circular_references_and_unresolvable_rows(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            rejected = self.load(connection)
+
+            # The valid circular references are committed, as are the
+            # independent stores.
+            self.assertSequenceEqual(self.committed_ids(connection, 'departments'), [1, 2])
+            self.assertSequenceEqual(self.committed_ids(connection, 'managers'), [10, 20])
+            self.assertSequenceEqual(self.committed_ids(connection, 'stores'), [100, 200])
+
+            # Manager 30 references missing department 99, and department 3
+            # references manager 30, so both are rejected and reported.
+            self.assertSequenceEqual(sorted(rejected), ['departments', 'managers'])
+            self.assertColumnNames(rejected['departments'], self.departments.column_names)
+            self.assertRows(rejected['departments'], [[3, 'Empty', 30]])
+            self.assertRows(rejected['managers'], [[30, 'Mallory', 99]])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_table_order_does_not_change_committed_rows(self):
+        orders = [
+            ('departments', 'managers', 'stores'),
+            ('stores', 'managers', 'departments'),
+            ('managers', 'stores', 'departments'),
+        ]
+
+        results = []
+        for order in orders:
+            engine = create_engine(self.connection_string)
+            connection = engine.connect()
+            try:
+                rejected = self.load(connection, order)
+                committed = tuple(
+                    self.committed_ids(connection, name)
+                    for name in ('departments', 'managers', 'stores')
+                )
+                rejected_rows = tuple(
+                    tuple(tuple(row) for row in rejected[name].rows)
+                    for name in sorted(rejected)
+                )
+                results.append((committed, rejected_rows))
+            finally:
+                connection.close()
+                engine.dispose()
+
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], results[2])
+
+    def test_existing_database_rows_can_be_referenced(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            # Department 99 already exists in the database, so manager 30's
+            # reference to it is valid.
+            existing = agate.Table(
+                ((99, 'Archive', None),),
+                ['id', 'name', 'manager_id'],
+                self.column_types,
+            )
+            existing.to_sql(connection, 'departments', unique_constraint=['id'])
+
+            managers_only = {'managers': self.managers}
+            rejected = agatesql.table.to_sql_group(
+                managers_only,
+                connection,
+                foreign_keys={'managers': [('department_id', 'departments', 'id')]},
+                unique_constraints={'managers': ['id']},
+            )
+
+            # Only manager 30's reference (to existing department 99) is
+            # valid; managers 10 and 20 reference departments that exist
+            # neither in the batch nor in the database.
+            self.assertSequenceEqual(self.committed_ids(connection, 'managers'), [30])
+            self.assertSequenceEqual(sorted(rejected), ['managers'])
+            self.assertRows(rejected['managers'], [[10, 'Alice', 1], [20, 'Bob', 2]])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_foreign_keys_remain_enforced(self):
+        engine = create_engine(self.connection_string)
+        enable_foreign_keys(engine)
+        connection = engine.connect()
+
+        try:
+            self.load(connection)
+            connection.commit()
+
+            # Foreign key enforcement was not switched off to load the batch.
+            self.assertEqual(connection.exec_driver_sql('PRAGMA foreign_keys').scalar(), 1)
+            self.assertEqual(connection.exec_driver_sql('PRAGMA defer_foreign_keys').scalar(), 0)
+
+            # The created tables really carry the constraints.
+            self.assertNotEqual(
+                connection.exec_driver_sql('PRAGMA foreign_key_list(departments)').fetchall(), [])
+
+            connection.exec_driver_sql(
+                'INSERT INTO managers (id, name, department_id) VALUES (40, \'Eve\', 42)')
+            with self.assertRaises(IntegrityError):
+                connection.commit()
+            connection.rollback()
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_connection_string_commits(self):
+        import os
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+
+        try:
+            rejected = agatesql.table.to_sql_group(
+                self.make_tables(),
+                'sqlite:///' + path,
+                foreign_keys=self.foreign_keys,
+                unique_constraints=self.unique_constraints,
+            )
+            self.assertSequenceEqual(sorted(rejected), ['departments', 'managers'])
+
+            engine = create_engine('sqlite:///' + path)
+            connection = engine.connect()
+            try:
+                self.assertSequenceEqual(self.committed_ids(connection, 'departments'), [1, 2])
+                self.assertSequenceEqual(self.committed_ids(connection, 'managers'), [10, 20])
+                self.assertSequenceEqual(self.committed_ids(connection, 'stores'), [100, 200])
+            finally:
+                connection.close()
+                engine.dispose()
+        finally:
+            os.remove(path)
+
+    def test_all_rows_valid(self):
+        managers = agate.Table(
+            (
+                (10, 'Alice', 1),
+                (20, 'Bob', 2),
+            ),
+            ['id', 'name', 'department_id'],
+            self.column_types,
+        )
+        departments = agate.Table(
+            (
+                (1, 'Engineering', 10),
+                (2, 'Sales', 20),
+            ),
+            ['id', 'name', 'manager_id'],
+            self.column_types,
+        )
+
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            rejected = agatesql.table.to_sql_group(
+                {'departments': departments, 'managers': managers},
+                connection,
+                foreign_keys=self.foreign_keys,
+                unique_constraints=self.unique_constraints,
+            )
+
+            self.assertEqual(rejected, {})
+            self.assertSequenceEqual(self.committed_ids(connection, 'departments'), [1, 2])
+            self.assertSequenceEqual(self.committed_ids(connection, 'managers'), [10, 20])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_table_set_to_sql(self):
+        column_names = ['id', 'ref_id']
+        column_types = [agate.Number(), agate.Number()]
+        table_a = agate.Table(((1, 1), (2, 2)), column_names, column_types)
+        table_b = agate.Table(((1, 2), (2, 1)), column_names, column_types)
+
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            table_set = agate.TableSet([table_a, table_b], ['a', 'b'])
+            rejected = table_set.to_sql(
+                connection,
+                foreign_keys={
+                    'a': [('ref_id', 'b', 'id')],
+                    'b': [('ref_id', 'a', 'id')],
+                },
+                unique_constraints={'a': ['id'], 'b': ['id']},
+            )
+
+            self.assertEqual(rejected, {})
+            self.assertSequenceEqual(self.committed_ids(connection, 'a'), [1, 2])
+            self.assertSequenceEqual(self.committed_ids(connection, 'b'), [1, 2])
         finally:
             connection.close()
             engine.dispose()
