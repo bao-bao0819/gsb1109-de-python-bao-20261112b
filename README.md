@@ -89,6 +89,17 @@ Gpxpy is a GPX parser and by using it you have access to all the data from the o
 
     moving_data = gpx.get_moving_data(raw=True)
 
+## Temperature by distance
+
+Temperature readings (for example Garmin's `gpxtpx:atemp`) can be aggregated by traveled distance, so a slowly driven congested part of the track does not get more weight just because it has more points:
+
+    for bucket in gpx.get_temperature_by_distance():
+        print(bucket.kilometer, bucket.average_temperature)
+
+Each returned `TemperatureBucket` contains the distance traveled in that kilometer, the part of it covered by readings (`distance_with_readings`), the temperature integral over it (degrees Celsius * meters), the distance-weighted `average_temperature` and the `unknown_distance`.
+
+Between two samples on the same track segment the temperature is interpolated linearly with distance. A gap longer than `max_missing_distance` (1000 meters by default) is reported as unknown. Bucket boundaries falling between samples split the contribution, and zero-distance (parked) points never add kilometers -- the latest reading is used for the following distance. Aggregation never interpolates across track segments. `TemperatureBucket` is also available from tracks and segments.
+
 ## Pull requests
 
 Branches:

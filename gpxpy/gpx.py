@@ -49,6 +49,19 @@ SMOOTHING_RATIO = (0.4, 0.2, 0.4)
 # if speed is less than this value -- we'll assume it is zero
 DEFAULT_STOPPED_SPEED_THRESHOLD = 1
 
+# Temperature aggregation: distance between two temperature samples longer
+# than this is considered a gap and the whole span is reported as unknown:
+DEFAULT_MAX_MISSING_DISTANCE = 1000.0
+
+# Default bucket size for temperature aggregation (one kilometer):
+DEFAULT_TEMPERATURE_BUCKET_SIZE = 1000.0
+
+# Distances shorter than this (in meters) are considered numerical noise:
+TEMPERATURE_DISTANCE_EPSILON = 1e-6
+
+# Extension tags which may contain a temperature reading:
+TEMPERATURE_EXTENSION_TAGS = ('atemp', 'temp', 'temperature', 'airtemp', 'tempc')
+
 # Fields used for all point elements (route point, track point, waypoint):
 GPX_10_POINT_FIELDS = [
         mod_gpxfield.GPXField('latitude', attribute='lat', type=mod_gpxfield.FLOAT_TYPE, mandatory=True),
@@ -138,6 +151,252 @@ class PointData(NamedTuple):
     track_no: int
     segment_no: int
     point_no: int
+class TemperatureBucket(NamedTuple):
+    kilometer: int
+    distance_from_start: float
+    distance: float
+    distance_with_readings: float
+    temperature_integral: float
+    average_temperature: Optional[float]
+    unknown_distance: float
+
+    @property
+    def km(self) -> int:
+        """ Alias for ``kilometer``. """
+        return self.kilometer
+
+    @property
+    def valid_distance(self) -> float:
+        """ Alias for ``distance_with_readings``. """
+        return self.distance_with_readings
+
+    @property
+    def integral(self) -> float:
+        """ Alias for ``temperature_integral``. """
+        return self.temperature_integral
+class TemperatureSummary(NamedTuple):
+    distance: float
+    distance_with_readings: float
+    temperature_integral: float
+    average_temperature: Optional[float]
+    unknown_distance: float
+
+
+def _temperature_summary(buckets: List[TemperatureBucket]) -> TemperatureSummary:
+    distance = sum(bucket.distance for bucket in buckets)
+    distance_with_readings = sum(bucket.distance_with_readings for bucket in buckets)
+    temperature_integral = sum(bucket.temperature_integral for bucket in buckets)
+    unknown_distance = sum(bucket.unknown_distance for bucket in buckets)
+    average = temperature_integral / distance_with_readings \
+        if distance_with_readings > 0 else None
+    return TemperatureSummary(distance, distance_with_readings,
+                              temperature_integral, average, unknown_distance)
+
+
+def _local_tag_name(tag: Any) -> str:
+    """ Return the lowercase local name of a Clark-notation or prefixed tag. """
+    if not isinstance(tag, str):
+        return ''
+    name = tag
+    if '}' in name:
+        name = name.rsplit('}', 1)[1]
+    if ':' in name:
+        name = name.rsplit(':', 1)[1]
+    return name.lower()
+
+
+def _temperature_from_element(element: Any) -> Optional[float]:
+    """
+    Extract a temperature reading from an extensions element tree.
+
+    Garmin TrackPointExtension stores it as ``gpxtpx:atemp``, but other
+    producers use different tag names, so all descendants are inspected.
+    """
+    best: Optional[float] = None
+    best_priority = len(TEMPERATURE_EXTENSION_TAGS)
+
+    def visit(node: Any) -> None:
+        nonlocal best, best_priority
+        if not hasattr(node, 'tag'):
+            return
+        tag_name = _local_tag_name(getattr(node, 'tag', None))
+        if tag_name in TEMPERATURE_EXTENSION_TAGS:
+            priority = TEMPERATURE_EXTENSION_TAGS.index(tag_name)
+            if priority < best_priority:
+                raw = node.text
+                value = None
+                if raw is not None:
+                    try:
+                        value = float(raw.strip())
+                    except (TypeError, ValueError):
+                        value = None
+                if value is not None and not mod_math.isnan(value):
+                    best = value
+                    best_priority = priority
+        for child in list(node):
+            visit(child)
+
+    visit(element)
+    return best
+
+
+def _remove_temperature_from_element(element: Any) -> bool:
+    """
+    Remove temperature subelements from one extensions element tree.
+
+    Returns true if the element itself has a temperature tag (the caller
+    should then drop it from the extensions list).
+    """
+    if not hasattr(element, 'tag'):
+        return False
+    if _local_tag_name(getattr(element, 'tag', None)) in TEMPERATURE_EXTENSION_TAGS:
+        return True
+    for child in list(element):
+        if _remove_temperature_from_element(child):
+            element.remove(child)
+    return False
+
+
+def _segment_temperature_intervals(segment: "GPXTrackSegment",
+                                   max_missing_distance: float) -> Tuple[float, List[Tuple[float, float, float, float, bool]]]:
+    """
+    Build temperature intervals for one track segment.
+
+    Each interval is (start_distance, end_distance, start_temperature,
+    end_temperature, has_readings). Distances are relative to the segment
+    start. Temperature is interpolated linearly with distance between two
+    samples. A span longer than max_missing_distance carries no readings.
+    """
+    distances: List[float] = [0.0]
+    for previous, point in zip(segment.points, segment.points[1:]):
+        distance = point.distance_2d(previous)
+        distances.append(distances[-1] + (distance or 0.0))
+
+    samples: List[Tuple[float, float]] = []
+    for point, distance in zip(segment.points, distances):
+        value = point.get_temperature()
+        if value is not None:
+            samples.append((distance, value))
+
+    length = distances[-1]
+    intervals: List[Tuple[float, float, float, float, bool]] = []
+
+    if not samples:
+        if length > 0:
+            intervals.append((0.0, length, 0.0, 0.0, False))
+        return length, intervals
+
+    first_distance = samples[0][0]
+    if first_distance > 0:
+        intervals.append((0.0, first_distance, 0.0, 0.0, False))
+
+    pending_distance, pending_temperature = samples[0]
+    for distance, temperature in samples[1:]:
+        difference = distance - pending_distance
+        if difference > 0:
+            if difference > max_missing_distance and \
+                    not mod_math.isclose(difference, max_missing_distance,
+                                         rel_tol=1e-9, abs_tol=1e-9):
+                intervals.append((pending_distance, distance, 0.0, 0.0, False))
+            else:
+                intervals.append((pending_distance, distance,
+                                  pending_temperature, temperature, True))
+            pending_distance, pending_temperature = distance, temperature
+        else:
+            pending_temperature = temperature
+
+    if pending_distance < length:
+        intervals.append((pending_distance, length, 0.0, 0.0, False))
+
+    return length, intervals
+
+
+class _TemperatureBucketAccumulator:
+    __slots__ = ('distance', 'distance_with_readings',
+                 'temperature_integral', 'unknown_distance')
+
+    def __init__(self) -> None:
+        self.distance = 0.0
+        self.distance_with_readings = 0.0
+        self.temperature_integral = 0.0
+        self.unknown_distance = 0.0
+
+
+def _add_temperature_interval(buckets: Dict[int, _TemperatureBucketAccumulator],
+                              start: float, end: float,
+                              start_temperature: float, end_temperature: float,
+                              has_readings: bool, bucket_size: float) -> None:
+    """ Split one interval at bucket boundaries and add its share to buckets. """
+    if end - start <= TEMPERATURE_DISTANCE_EPSILON or bucket_size <= 0:
+        return
+
+    position = start
+    span = end - start
+
+    while position < end:
+        index = int(position // bucket_size)
+        boundary = min((index + 1) * bucket_size, end)
+        part = boundary - position
+
+        bucket = buckets.setdefault(index, _TemperatureBucketAccumulator())
+        bucket.distance += part
+
+        if has_readings:
+            temperature_at_position = start_temperature + \
+                (end_temperature - start_temperature) * (position - start) / span
+            temperature_at_boundary = start_temperature + \
+                (end_temperature - start_temperature) * (boundary - start) / span
+            bucket.temperature_integral += \
+                (temperature_at_position + temperature_at_boundary) / 2.0 * part
+            bucket.distance_with_readings += part
+        else:
+            bucket.unknown_distance += part
+
+        if boundary <= position:
+            break
+        position = boundary
+
+
+def _temperature_data(segments: List["GPXTrackSegment"],
+                      bucket_size: float,
+                      max_missing_distance: float) -> List[TemperatureBucket]:
+    buckets: Dict[int, _TemperatureBucketAccumulator] = {}
+    offset = 0.0
+
+    for segment in segments:
+        length, intervals = _segment_temperature_intervals(
+            segment, max_missing_distance)
+        for interval_start, interval_end, start_temperature, end_temperature, has_readings in intervals:
+            _add_temperature_interval(
+                buckets,
+                offset + interval_start,
+                offset + interval_end,
+                start_temperature,
+                end_temperature,
+                has_readings,
+                bucket_size,
+            )
+        offset += length
+
+    result: List[TemperatureBucket] = []
+    for index in sorted(buckets):
+        bucket = buckets[index]
+        if bucket.distance <= TEMPERATURE_DISTANCE_EPSILON:
+            continue
+        average = None
+        if bucket.distance_with_readings > 0:
+            average = bucket.temperature_integral / bucket.distance_with_readings
+        result.append(TemperatureBucket(
+            kilometer=index,
+            distance_from_start=index * bucket_size,
+            distance=bucket.distance,
+            distance_with_readings=bucket.distance_with_readings,
+            temperature_integral=bucket.temperature_integral,
+            average_temperature=average,
+            unknown_distance=bucket.unknown_distance,
+        ))
+
+    return result
 
 
 class GPXException(Exception):
@@ -518,13 +777,13 @@ class GPXTrackPoint(mod_geo.Location):
                  'symbol', 'type', 'type_of_gpx_fix', 'satellites',
                  'horizontal_dilution', 'vertical_dilution',
                  'position_dilution', 'age_of_dgps_data', 'dgps_id',
-                 'link_type', 'extensions')
+                 'link_type', 'extensions', 'temperature')
 
     def __init__(self, latitude: Optional[float]=None, longitude: Optional[float]=None, elevation: Optional[float]=None,
                  time: Optional[mod_datetime.datetime]=None, symbol: Optional[str]=None, comment: Optional[str]=None,
                  horizontal_dilution: Optional[float]=None, vertical_dilution: Optional[float]=None,
                  position_dilution: Optional[float]=None, speed: Optional[float]=None,
-                 name: Optional[str]=None) -> None:
+                 name: Optional[str]=None, temperature: Optional[float]=None) -> None:
         mod_geo.Location.__init__(self, latitude or 0, longitude or 0, elevation)
         self.time = time
         self.course = None
@@ -548,11 +807,12 @@ class GPXTrackPoint(mod_geo.Location):
         self.age_of_dgps_data: Optional[float] = None
         self.dgps_id: Optional[int] = None
         self.extensions: List[Any] = []
+        self.temperature = temperature
 
     def __repr__(self) -> str:
         parts = [f'{self.latitude}, {self.longitude}']
         for attribute in 'elevation', 'time', 'symbol', 'comment', 'horizontal_dilution', \
-                'vertical_dilution', 'position_dilution', 'speed', 'name':
+                'vertical_dilution', 'position_dilution', 'speed', 'name', 'temperature':
             value = getattr(self, attribute)
             if value is not None:
                 parts.append(f'{attribute}={value!r}')
@@ -574,6 +834,37 @@ class GPXTrackPoint(mod_geo.Location):
     def remove_time(self) -> None:
         """ Will remove time metadata. """
         self.time = None
+
+    def get_temperature(self) -> Optional[float]:
+        """
+        Returns the temperature reading of this point.
+
+        The explicit ``temperature`` attribute wins. If it is not set, GPX
+        extensions are inspected (for example the Garmin
+        ``gpxtpx:TrackPointExtension/gpxtpx:atemp`` field).
+
+        Returns
+        -------
+        temperature : float or None
+            Temperature in degrees Celsius, or None if not available.
+        """
+        if self.temperature is not None:
+            try:
+                explicit_temperature = float(self.temperature)
+            except (TypeError, ValueError):
+                return None
+            return explicit_temperature if mod_math.isfinite(explicit_temperature) else None
+        for extension in self.extensions:
+            extension_temperature = _temperature_from_element(extension)
+            if extension_temperature is not None:
+                return extension_temperature
+        return None
+
+    def remove_temperature(self) -> None:
+        """ Removes the temperature reading of this point (attribute and extensions). """
+        self.temperature = None
+        self.extensions = [extension for extension in self.extensions
+                           if not _remove_temperature_from_element(extension)]
 
     def time_difference(self, track_point: "GPXTrackPoint") -> Optional[float]:
         """
@@ -1181,6 +1472,88 @@ class GPXTrackSegment:
             return MinimumMaximum(None, None)
         return MinimumMaximum(min(elevations), max(elevations))
 
+    def get_temperature_by_distance(self,
+                                    max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                    bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                    ) -> List[TemperatureBucket]:
+        """
+        Aggregate temperature readings per traveled distance.
+
+        Point density is ignored: a slow, congested part of the track does
+        not get more weight than a fast one. Instead the temperature is
+        integrated over actual 2D distance traveled and reported per bucket
+        (one kilometer by default).
+
+        Between two samples on the same track segment the temperature is
+        interpolated linearly with distance. A span longer than
+        ``max_missing_distance`` is reported with no readings
+        (``distance_with_readings == 0`` and ``average_temperature is None``).
+        Bucket boundaries falling between samples split the contribution.
+
+        Zero-distance (parked) points add no distance, so they never produce
+        kilometers. The reading after such a stop is used for the following
+        distance.
+
+        Parameters
+        ----------
+        max_missing_distance : float
+            Maximum distance in meters between two readings. Longer spans are
+            considered unknown.
+        bucket_size : float
+            Bucket length in meters (default: 1000, i.e. one kilometer).
+
+        Returns
+        -------
+        buckets : list of TemperatureBucket
+            ``kilometer`` is the bucket index, ``distance_from_start`` its
+            start, ``distance`` the distance traveled in it,
+            ``distance_with_readings`` the part of it covered by readings,
+            ``temperature_integral`` the integral of temperature over that
+            part (degrees Celsius * meters), ``average_temperature`` the
+            distance-weighted average over it and ``unknown_distance`` the
+            part without readings.
+        """
+        return _temperature_data([self], bucket_size, max_missing_distance)
+
+    def get_temperature_summary(self,
+                                max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                ) -> TemperatureSummary:
+        """
+        Totals of ``get_temperature_by_distance()``: distance, distance with
+        readings, temperature integral, its distance-weighted average and the
+        unknown distance.
+        """
+        return _temperature_summary(self.get_temperature_by_distance(
+            max_missing_distance, bucket_size))
+
+    def get_average_temperature(self,
+                                max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                ) -> Optional[float]:
+        """
+        Distance-weighted average temperature (not an average over points).
+
+        Returns None if there is no distance with temperature readings.
+        """
+        return self.get_temperature_summary(
+            max_missing_distance, bucket_size).average_temperature
+
+    def get_temperature_per_km(self,
+                               max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                               bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                               ) -> List[TemperatureBucket]:
+        """ Alias for ``get_temperature_by_distance()``. """
+        return self.get_temperature_by_distance(max_missing_distance, bucket_size)
+
+    def get_temperature_extremes(self) -> MinimumMaximum:
+        """ Minimum and maximum of the actual temperature readings. """
+        temperatures = [value for value in (point.get_temperature() for point in self.points)
+                        if value is not None]
+        if not temperatures:
+            return MinimumMaximum(None, None)
+        return MinimumMaximum(min(temperatures), max(temperatures))
+
     def get_location_at(self, time: mod_datetime.datetime) -> Optional[GPXTrackPoint]:
         """
         Gets approx. location at given time. Note that, at the moment this
@@ -1369,6 +1742,15 @@ class GPXTrackSegment:
                 found += 1
 
         return len(self.points) > 2 and found / len(self.points) > .75
+
+    def has_temperatures(self) -> bool:
+        """ Returns true if any point in this segment has a temperature reading. """
+        return any(point.get_temperature() is not None for point in self.points)
+
+    def remove_temperature(self) -> None:
+        """ Removes temperature data for all points in the segment. """
+        for point in self.points:
+            point.remove_temperature()
 
 
     def __repr__(self) -> str:
@@ -1837,6 +2219,52 @@ class GPXTrack:
 
         return MinimumMaximum(min(elevations), max(elevations))
 
+    def get_temperature_by_distance(self,
+                                    max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                    bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                    ) -> List[TemperatureBucket]:
+        """ See GPXTrackSegment.get_temperature_by_distance() """
+        return _temperature_data(self.segments, bucket_size, max_missing_distance)
+
+    def get_temperature_summary(self,
+                                max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                ) -> TemperatureSummary:
+        """ See GPXTrackSegment.get_temperature_summary() """
+        return _temperature_summary(self.get_temperature_by_distance(
+            max_missing_distance, bucket_size))
+
+    def get_average_temperature(self,
+                                max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                ) -> Optional[float]:
+        """
+        Distance-weighted average temperature (not an average over points).
+
+        Returns None if there is no distance with temperature readings.
+        """
+        return self.get_temperature_summary(
+            max_missing_distance, bucket_size).average_temperature
+
+    def get_temperature_per_km(self,
+                               max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                               bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                               ) -> List[TemperatureBucket]:
+        """ Alias for ``get_temperature_by_distance()``. """
+        return self.get_temperature_by_distance(max_missing_distance, bucket_size)
+
+    def get_temperature_extremes(self) -> MinimumMaximum:
+        """ See GPXTrackSegment.get_temperature_extremes() """
+        temperatures: List[float] = []
+        for track_segment in self.segments:
+            for point in track_segment.points:
+                value = point.get_temperature()
+                if value is not None:
+                    temperatures.append(value)
+        if not temperatures:
+            return MinimumMaximum(None, None)
+        return MinimumMaximum(min(temperatures), max(temperatures))
+
     def get_center(self) -> Optional[mod_geo.Location]:
         """
         Get the center of the route.
@@ -1890,6 +2318,15 @@ class GPXTrack:
             result = result and track_segment.has_elevations()
 
         return result
+
+    def has_temperatures(self) -> bool:
+        """ See GPXTrackSegment.has_temperatures() """
+        return any(track_segment.has_temperatures() for track_segment in self.segments)
+
+    def remove_temperature(self) -> None:
+        """ See GPXTrackSegment.remove_temperature() """
+        for track_segment in self.segments:
+            track_segment.remove_temperature()
 
     def get_nearest_location(self, location: mod_geo.Location) -> Optional[NearestLocationData]:
         """ Returns (location, track_segment_no, track_point_no) for nearest location on track """
@@ -2513,6 +2950,54 @@ class GPX:
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
 
+    def get_temperature_by_distance(self,
+                                    max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                    bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                    ) -> List[TemperatureBucket]:
+        """ See GPXTrackSegment.get_temperature_by_distance() """
+        return _temperature_data([segment for track in self.tracks for segment in track.segments],
+                                 bucket_size, max_missing_distance)
+
+    def get_temperature_summary(self,
+                                max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                ) -> TemperatureSummary:
+        """ See GPXTrackSegment.get_temperature_summary() """
+        return _temperature_summary(self.get_temperature_by_distance(
+            max_missing_distance, bucket_size))
+
+    def get_average_temperature(self,
+                                max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                                bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                                ) -> Optional[float]:
+        """
+        Distance-weighted average temperature (not an average over points).
+
+        Returns None if there is no distance with temperature readings.
+        """
+        return self.get_temperature_summary(
+            max_missing_distance, bucket_size).average_temperature
+
+    def get_temperature_per_km(self,
+                               max_missing_distance: float=DEFAULT_MAX_MISSING_DISTANCE,
+                               bucket_size: float=DEFAULT_TEMPERATURE_BUCKET_SIZE,
+                               ) -> List[TemperatureBucket]:
+        """ Alias for ``get_temperature_by_distance()``. """
+        return self.get_temperature_by_distance(max_missing_distance, bucket_size)
+
+    def get_temperature_extremes(self) -> MinimumMaximum:
+        """ See GPXTrackSegment.get_temperature_extremes() """
+        temperatures: List[float] = []
+        for track in self.tracks:
+            for segment in track.segments:
+                for point in segment.points:
+                    value = point.get_temperature()
+                    if value is not None:
+                        temperatures.append(value)
+        if not temperatures:
+            return MinimumMaximum(None, None)
+        return MinimumMaximum(min(temperatures), max(temperatures))
+
     def add_elevation(self, delta: float) -> None:
         """
         Adjusts elevation data of GPX data.
@@ -2725,6 +3210,15 @@ class GPX:
             result = result and track.has_elevations()
 
         return result
+
+    def has_temperatures(self) -> bool:
+        """ See GPXTrackSegment.has_temperatures() """
+        return any(track.has_temperatures() for track in self.tracks)
+
+    def remove_temperature(self) -> None:
+        """ See GPXTrackSegment.remove_temperature() """
+        for track in self.tracks:
+            track.remove_temperature()
 
     def __repr__(self) -> str:
         parts = []

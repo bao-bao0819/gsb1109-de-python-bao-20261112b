@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Distance-weighted temperature aggregation (`get_temperature_by_distance()`), reading `gpxtpx:atemp` and similar point extensions
+- `GPXTrackPoint.temperature` attribute and `get_temperature()` helper
+
 ## v1.6.1
 
 - Minor fix

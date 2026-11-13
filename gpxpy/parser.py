@@ -124,4 +124,7 @@ class GPXParser:
             version = ""
 
         mod_gpxfield.gpx_fields_from_xml(self.gpx, root, version)
+        for point in self.gpx.walk(only_points=True):
+            if point.temperature is None and point.extensions:
+                point.temperature = point.get_temperature()
         return self.gpx

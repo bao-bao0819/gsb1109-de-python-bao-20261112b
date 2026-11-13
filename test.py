@@ -3724,5 +3724,198 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
 
+    def _temperature_segment(self, *samples: Tuple[float, Optional[float]]) -> mod_gpx.GPXTrackSegment:
+        segment = mod_gpx.GPXTrackSegment()
+        for distance, temperature in samples:
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                0.0, distance / mod_geo.ONE_DEGREE, temperature=temperature))
+        return segment
+
+    def test_temperature_by_distance_linear_and_bucket_split(self) -> None:
+        segment = self._temperature_segment((0, 0), (1500, 15))
+        buckets = segment.get_temperature_by_distance(max_missing_distance=2000)
+        self.assertEqual(2, len(buckets))
+
+        first, second = buckets
+        self.assertAlmostEqual(0, first.kilometer)
+        self.assertAlmostEqual(1000, first.distance)
+        self.assertAlmostEqual(1000, first.distance_with_readings)
+        self.assertAlmostEqual(1000 * 5, first.temperature_integral)
+        self.assertAlmostEqual(5, first.average_temperature) # type: ignore
+
+        self.assertEqual(1, second.kilometer)
+        self.assertAlmostEqual(500, second.distance)
+        self.assertAlmostEqual(500, second.distance_with_readings)
+        self.assertAlmostEqual(500 * 12.5, second.temperature_integral)
+        self.assertAlmostEqual(12.5, second.average_temperature) # type: ignore
+
+        self.assertAlmostEqual(5000 + 6250, sum(bucket.temperature_integral
+                                               for bucket in buckets if bucket.temperature_integral))
+        self.assertAlmostEqual(1500, sum(bucket.distance_with_readings for bucket in buckets))
+
+    def test_temperature_by_distance_gap_marked_unknown(self) -> None:
+        segment = self._temperature_segment((0, 0), (3000, 300))
+        buckets = segment.get_temperature_by_distance(max_missing_distance=1000)
+        self.assertEqual(3, len(buckets))
+        for bucket in buckets:
+            self.assertIsNone(bucket.average_temperature)
+            self.assertAlmostEqual(0, bucket.distance_with_readings)
+            self.assertAlmostEqual(bucket.distance, bucket.unknown_distance)
+            self.assertAlmostEqual(0, bucket.temperature_integral)
+
+    def test_temperature_by_distance_parking_uses_post_stop_reading(self) -> None:
+        segment = self._temperature_segment((0, 10), (0, 20), (1000, 20))
+        buckets = segment.get_temperature_by_distance()
+        self.assertEqual(1, len(buckets))
+        self.assertAlmostEqual(1000, buckets[0].distance)
+        self.assertAlmostEqual(1000, buckets[0].distance_with_readings)
+        self.assertAlmostEqual(1000 * 20, buckets[0].temperature_integral)
+        self.assertAlmostEqual(20, buckets[0].average_temperature) # type: ignore
+
+        # The stop itself never adds kilometers, even when the following
+        # reading is the very same location:
+        segment = self._temperature_segment((0, 10), (0, 20), (0, 30))
+        self.assertEqual(0, len(segment.get_temperature_by_distance()))
+
+    def test_temperature_by_distance_does_not_cross_segments(self) -> None:
+        first_segment = self._temperature_segment((0, 0), (1000, 10))
+        second_segment = self._temperature_segment((0, 40), (1000, 40))
+
+        track = mod_gpx.GPXTrack()
+        track.segments = [first_segment, second_segment]
+        buckets = track.get_temperature_by_distance()
+
+        self.assertEqual(2, len(buckets))
+        self.assertAlmostEqual(5, buckets[0].average_temperature) # type: ignore
+        self.assertAlmostEqual(40, buckets[1].average_temperature) # type: ignore
+        self.assertAlmostEqual(0, buckets[1].unknown_distance)
+
+    def test_temperature_by_distance_many_slow_points(self) -> None:
+        # A congested part of the track has more samples, but each of them
+        # covers less distance, so it must not dominate the aggregate.
+        # Both tracks describe the same linear temperature profile:
+        congested = self._temperature_segment(
+            (0, 10), (100, 10.5), (200, 11), (300, 11.5), (400, 12),
+            (500, 12.5), (600, 13), (700, 13.5), (800, 14), (900, 14.5),
+            (1000, 15))
+        sparse = self._temperature_segment((0, 10), (250, 11.25), (500, 12.5),
+                                           (750, 13.75), (1000, 15))
+
+        congested_buckets = congested.get_temperature_by_distance()
+        sparse_buckets = sparse.get_temperature_by_distance()
+
+        self.assertEqual(len(sparse_buckets), len(congested_buckets))
+        for congested_bucket, sparse_bucket in zip(congested_buckets, sparse_buckets):
+            self.assertAlmostEqual(congested_bucket.temperature_integral,
+                                   sparse_bucket.temperature_integral)
+            self.assertAlmostEqual(congested_bucket.distance_with_readings,
+                                   sparse_bucket.distance_with_readings)
+            self.assertAlmostEqual(congested_bucket.average_temperature, # type: ignore
+                                   sparse_bucket.average_temperature)
+
+    def test_temperature_extremes_and_garmin_extension(self) -> None:
+        xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1"
+     xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">
+  <trk><trkseg>
+    <trkpt lat="0" lon="0"><extensions><gpxtpx:TrackPointExtension><gpxtpx:atemp>10</gpxtpx:atemp></gpxtpx:TrackPointExtension></extensions></trkpt>
+    <trkpt lat="0" lon="%f"><extensions><gpxtpx:TrackPointExtension><gpxtpx:atemp>20</gpxtpx:atemp></gpxtpx:TrackPointExtension></extensions></trkpt>
+  </trkseg></trk>
+</gpx>''' % (1 / mod_geo.ONE_DEGREE)
+        gpx = mod_gpxpy.parse(xml)
+        points = gpx.tracks[0].segments[0].points
+        self.assertAlmostEqual(10, points[0].get_temperature()) # type: ignore
+        self.assertAlmostEqual(20, points[1].get_temperature()) # type: ignore
+
+        extremes = gpx.get_temperature_extremes()
+        self.assertAlmostEqual(10, extremes.minimum) # type: ignore
+        self.assertAlmostEqual(20, extremes.maximum) # type: ignore
+
+    def test_temperature_summary_and_removal(self) -> None:
+        segment = self._temperature_segment((0, 10), (500, 20), (1500, 20))
+        summary = segment.get_temperature_summary(max_missing_distance=2000)
+        self.assertAlmostEqual(1500, summary.distance)
+        self.assertAlmostEqual(1500, summary.distance_with_readings)
+        self.assertAlmostEqual(0, summary.unknown_distance)
+        self.assertAlmostEqual(summary.temperature_integral / 1500, # type: ignore
+                               summary.average_temperature)
+
+        gpx = mod_gpx.GPX()
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        gpx.tracks[0].segments.append(segment)
+        self.assertTrue(gpx.has_temperatures())
+        self.assertAlmostEqual(summary.temperature_integral,
+                               gpx.get_temperature_summary(max_missing_distance=2000).temperature_integral)
+
+        gpx.remove_temperature()
+        self.assertFalse(gpx.has_temperatures())
+        for point in segment.points:
+            self.assertIsNone(point.get_temperature())
+
+    def test_remove_temperature_keeps_other_extensions(self) -> None:
+        xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1"
+     xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">
+  <trk><trkseg>
+    <trkpt lat="0" lon="0"><extensions><gpxtpx:TrackPointExtension><gpxtpx:atemp>10</gpxtpx:atemp><gpxtpx:hr>100</gpxtpx:hr></gpxtpx:TrackPointExtension></extensions></trkpt>
+  </trkseg></trk>
+</gpx>'''
+        gpx = mod_gpxpy.parse(xml)
+        point = gpx.tracks[0].segments[0].points[0]
+        point.remove_temperature()
+
+        self.assertIsNone(point.get_temperature())
+        self.assertEqual(1, len(point.extensions))
+        children = list(point.extensions[0])
+        self.assertEqual(1, len(children))
+        self.assertIn('hr', children[0].tag)
+
+    def test_temperature_by_distance_edges_unknown(self) -> None:
+        # No reading before the first sample and none after the last one:
+        segment = self._temperature_segment((0, None), (500, 10), (1500, 10), (2000, None))
+        buckets = segment.get_temperature_by_distance()
+
+        self.assertEqual(2, len(buckets))
+        self.assertAlmostEqual(500, buckets[0].unknown_distance)
+        self.assertAlmostEqual(500, buckets[0].distance_with_readings)
+        self.assertAlmostEqual(5000, buckets[0].temperature_integral)
+        self.assertAlmostEqual(buckets[0].distance,
+                               buckets[0].distance_with_readings + buckets[0].unknown_distance)
+
+        self.assertAlmostEqual(500, buckets[1].unknown_distance)
+        self.assertAlmostEqual(500, buckets[1].distance_with_readings)
+        self.assertAlmostEqual(5000, buckets[1].temperature_integral)
+        for bucket in buckets:
+            self.assertAlmostEqual(bucket.distance,
+                                   bucket.distance_with_readings + bucket.unknown_distance)
+
+    def test_temperature_by_distance_gap_at_threshold(self) -> None:
+        at_threshold = self._temperature_segment((0, 10), (1000, 20))
+        bucket = at_threshold.get_temperature_by_distance(max_missing_distance=1000)[0]
+        self.assertAlmostEqual(1000, bucket.distance_with_readings)
+        self.assertAlmostEqual(0, bucket.unknown_distance)
+
+        over_threshold = self._temperature_segment((0, 10), (1001, 20))
+        buckets = over_threshold.get_temperature_by_distance(max_missing_distance=1000)
+        self.assertAlmostEqual(1001, sum(bucket.unknown_distance for bucket in buckets))
+        self.assertAlmostEqual(0, sum(bucket.distance_with_readings for bucket in buckets))
+
+    def test_temperature_by_distance_custom_bucket_size(self) -> None:
+        segment = self._temperature_segment((0, 0), (600, 12))
+        buckets = segment.get_temperature_by_distance(bucket_size=500)
+        self.assertEqual(2, len(buckets))
+        self.assertAlmostEqual(0, buckets[0].distance_from_start)
+        self.assertAlmostEqual(500, buckets[0].distance)
+        self.assertAlmostEqual(500 * 5, buckets[0].temperature_integral)
+        self.assertAlmostEqual(500, buckets[1].distance_from_start)
+        self.assertAlmostEqual(100, buckets[1].distance)
+        self.assertAlmostEqual(100 * 11, buckets[1].temperature_integral)
+
+    def test_temperature_by_distance_exact_boundary_has_no_tail(self) -> None:
+        segment = self._temperature_segment((0, 10), (0, 20), (1000, 20))
+        buckets = segment.get_temperature_by_distance()
+        self.assertEqual(1, len(buckets))
+        self.assertAlmostEqual(1000, buckets[0].distance)
+
 if __name__ == '__main__':
     mod_unittest.main()
