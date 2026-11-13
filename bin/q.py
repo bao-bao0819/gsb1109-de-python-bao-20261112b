@@ -43,6 +43,7 @@ import os
 import sys
 import sqlite3
 import glob
+import fnmatch
 from argparse import ArgumentParser
 import codecs
 import locale
@@ -958,10 +959,10 @@ class Sql(object):
     def get_qtable_name_effective_table_names(self):
         return self.qtable_name_effective_table_names
 
-    def execute_and_fetch(self, db):
+    def execute_and_fetch(self, db, params=None):
         x = self.get_effective_sql()
         xprint("Final query: %s" % x)
-        db_results_obj = db.execute_and_fetch(x)
+        db_results_obj = db.execute_and_fetch(x, params)
         return db_results_obj
 
     def materialize_using(self,loaded_table_structures_dict):
@@ -1391,6 +1392,578 @@ def validate_content_signature(original_filename, source_signature,other_filenam
                 else:
                     raise ContentSignatureDiffersException(original_filename, other_filename, original_filename,".".join(scope + [k]),source_signature[k],content_signature[k])
 
+
+# ---------------------------------------------------------------------------
+# File partition keys and filename-based partition pruning
+#
+# A partition key declares that part of each member file's name encodes the
+# value of one of the table's columns (e.g. daily report files whose names
+# contain a region and a date). When a query constrains that column, files
+# whose encoded value provably cannot satisfy the constraint do not have to
+# be opened at all.
+#
+# The pruning is deliberately conservative: a file whose name does not conform
+# to the declared pattern can never be proven irrelevant, so it is kept. When
+# the query does not constrain a partition column, or the constraint cannot be
+# translated into a value domain, every file is read. Pruning may therefore
+# read more files than strictly needed, but it never changes the query result.
+# ---------------------------------------------------------------------------
+
+UNRESOLVED_VALUE = object()
+
+
+class PartitionColumnSpec(object):
+    def __init__(self, name, pattern, value_format='text'):
+        self.name = name
+        self.pattern = pattern
+        self.value_format = value_format
+        self._compiled_regex = re.compile(pattern)
+
+    def extract_value(self, filename):
+        # Returns the partition value encoded in the filename, or None when
+        # the filename does not conform to the declared pattern.
+        match = self._compiled_regex.search(os.path.basename(filename))
+        if match is None:
+            return None
+        try:
+            raw_value = match.group(1)
+        except IndexError:
+            return None
+        return self._coerce(raw_value)
+
+    def _coerce(self, raw_value):
+        if self.value_format == 'int':
+            try:
+                return int(raw_value)
+            except (TypeError, ValueError):
+                return None
+        if self.value_format == 'date':
+            for date_format in ('%Y-%m-%d', '%Y%m%d', '%Y/%m/%d'):
+                try:
+                    return datetime.datetime.strptime(raw_value, date_format).date().isoformat()
+                except ValueError:
+                    continue
+            return None
+        return raw_value
+
+    def __str__(self):
+        return "PartitionColumnSpec<name=%s,pattern=%s,format=%s>" % (self.name, self.pattern, self.value_format)
+    __repr__ = __str__
+
+
+class PartitionKey(object):
+    def __init__(self, specs):
+        # specs maps table names (absolute file paths or glob expressions, as
+        # they appear in the query) to a list of PartitionColumnSpec objects.
+        self._specs = OrderedDict(specs) if specs else OrderedDict()
+
+    @classmethod
+    def from_json_file(cls, partition_key_filename):
+        # Expected JSON layout (the top-level mapping form {table: [columns...]}
+        # is accepted as well):
+        # {
+        #   "tables": [
+        #     {
+        #       "table": "/path/to/report_*.csv",
+        #       "columns": [
+        #         {"name": "region", "pattern": "report_([a-z]+)_\\d{4}-\\d{2}-\\d{2}\\.csv$", "format": "text"},
+        #         {"name": "day", "pattern": "report_[a-z]+_(\\d{4}-\\d{2}-\\d{2})\\.csv$", "format": "date"}
+        #       ]
+        #     }
+        #   ]
+        # }
+        if not os.path.exists(partition_key_filename):
+            raise FileNotFoundException("Could not find partition key file %s" % partition_key_filename)
+        with io.open(partition_key_filename, 'r', encoding='utf-8') as f:
+            try:
+                loaded = json.load(f, object_pairs_hook=OrderedDict)
+            except ValueError as e:
+                raise InvalidQueryException("Partition key file %s does not contain valid JSON: %s"
+                                            % (partition_key_filename, e))
+
+        entries = []
+        if isinstance(loaded, dict) and 'tables' in loaded:
+            entries = loaded['tables']
+        elif isinstance(loaded, dict):
+            entries = [OrderedDict([('table', table_name), ('columns', columns)])
+                       for table_name, columns in loaded.items()]
+        elif isinstance(loaded, list):
+            entries = loaded
+        else:
+            raise InvalidQueryException("Partition key file %s must contain a JSON object or list" % partition_key_filename)
+
+        specs = OrderedDict()
+        for entry in entries:
+            if 'table' not in entry or 'columns' not in entry:
+                raise InvalidQueryException("Each partition key entry must contain 'table' and 'columns' fields: %s" % entry)
+            table_name = os.path.realpath(os.path.abspath(entry['table']))
+            column_specs = []
+            for column in entry['columns']:
+                if 'name' not in column or 'pattern' not in column:
+                    raise InvalidQueryException("Each partition column must contain 'name' and 'pattern' fields: %s" % column)
+                value_format = column.get('format', 'text')
+                if value_format not in ('text', 'int', 'date'):
+                    raise InvalidQueryException(
+                        "Partition column %s has unsupported format '%s' (allowed: text, int, date)"
+                        % (column['name'], value_format))
+                try:
+                    column_specs.append(PartitionColumnSpec(
+                        name=column['name'],
+                        pattern=column['pattern'],
+                        value_format=value_format))
+                except re.error as e:
+                    raise InvalidQueryException(
+                        "Partition column %s has an invalid regular expression %r: %s"
+                        % (column['name'], column['pattern'], e))
+            specs[table_name] = column_specs
+        return cls(specs)
+
+    def specs_for_qtable(self, qtable_name):
+        if qtable_name in self._specs:
+            return self._specs[qtable_name]
+        # Fall back to a declaration for the containing glob/folder, so a
+        # single declaration can cover an entire set of member files.
+        for declared_name, specs in six.iteritems(self._specs):
+            if any(char in declared_name for char in ['*', '?', '[']):
+                if fnmatch.fnmatch(qtable_name, declared_name):
+                    return specs
+        return None
+
+    def is_empty(self):
+        return len(self._specs) == 0
+
+    def __str__(self):
+        return "PartitionKey<%s>" % str(self._specs)
+    __repr__ = __str__
+
+
+PRED_TRUE = True
+PRED_FALSE = False
+PRED_UNKNOWN = None
+
+
+class PartitionPruner(object):
+    # Conservative WHERE-clause evaluation against the values encoded in member
+    # file names. Each simple comparison that references a partition column is
+    # evaluated for a specific file; anything not fully understood yields
+    # PRED_UNKNOWN. A file is skipped only when the whole clause is provably
+    # FALSE for it, so pruning never changes the query result.
+
+    def __init__(self, partition_key):
+        self.partition_key = partition_key
+
+    # -- WHERE extraction --------------------------------------------------
+
+    def extract_where_clause(self, query):
+        match = re.search(r'\bWHERE\b', query, re.IGNORECASE)
+        if match is None:
+            return None
+        start = match.end()
+        depth = 0
+        in_string = False
+        end = len(query)
+        keyword_pattern = re.compile(r'\b(GROUP|ORDER|LIMIT|HAVING|UNION|EXCEPT|INTERSECT)\b', re.IGNORECASE)
+        index = start
+        while index < len(query):
+            char = query[index]
+            if char == "'" and (index == 0 or query[index - 1] != '\\'):
+                in_string = not in_string
+            elif not in_string:
+                if char == '(':
+                    depth += 1
+                elif char == ')':
+                    depth -= 1
+                elif depth == 0:
+                    keyword_match = keyword_pattern.match(query, index)
+                    if keyword_match is not None:
+                        end = index
+                        break
+            index += 1
+        where_clause = query[start:end].strip()
+        return where_clause if where_clause else None
+
+    # -- Tokenizing --------------------------------------------------------
+
+    def _tokenize(self, expression):
+        tokens = []
+        index = 0
+        while index < len(expression):
+            char = expression[index]
+            if char.isspace():
+                index += 1
+                continue
+            if char == "'":
+                end_index = index + 1
+                value = []
+                while end_index < len(expression):
+                    current = expression[end_index]
+                    if current == "'":
+                        if end_index + 1 < len(expression) and expression[end_index + 1] == "'":
+                            value.append("'")
+                            end_index += 2
+                            continue
+                        break
+                    value.append(current)
+                    end_index += 1
+                tokens.append(('string', ''.join(value)))
+                index = end_index + 1
+                continue
+            if char in '()':
+                tokens.append(('paren', char))
+                index += 1
+                continue
+            two_char = expression[index:index + 2]
+            if two_char in ('>=', '<=', '!=', '<>', '=='):
+                tokens.append(('operator', two_char))
+                index += 2
+                continue
+            if char in '><=':
+                tokens.append(('operator', char))
+                index += 1
+                continue
+            match = re.match(r"[A-Za-z_`\"\[\]][A-Za-z0-9_`\"\[\]\.\-]*|\?|:[A-Za-z0-9_]+|@[A-Za-z0-9_]+|\$[A-Za-z0-9_]+|-?\d+(\.\d+)?",
+                             expression[index:])
+            if match is None:
+                # An unrecognized token makes the whole expression unevaluable.
+                return None
+            word = match.group(0)
+            index += len(word)
+            upper = word.upper()
+            if upper in ('AND', 'OR', 'NOT'):
+                tokens.append(('logic', upper))
+            else:
+                tokens.append(('word', word))
+        return tokens
+
+    # -- Parsing into evaluable nodes -------------------------------------
+
+    def _parse(self, tokens):
+        # Returns an evaluable node, or None when the clause cannot be parsed.
+        position = [0]
+
+        def peek():
+            return tokens[position[0]] if position[0] < len(tokens) else (None, None)
+
+        def parse_or():
+            node = parse_and()
+            if node is None:
+                return None
+            while peek() == ('logic', 'OR'):
+                position[0] += 1
+                right = parse_and()
+                if right is None:
+                    return None
+                node = ('or', node, right)
+            return node
+
+        def parse_and():
+            node = parse_not()
+            if node is None:
+                return None
+            while peek() == ('logic', 'AND'):
+                position[0] += 1
+                right = parse_not()
+                if right is None:
+                    return None
+                node = ('and', node, right)
+            return node
+
+        def parse_not():
+            if peek() == ('logic', 'NOT'):
+                position[0] += 1
+                child = parse_not()
+                if child is None:
+                    return None
+                return ('not', child)
+            return parse_predicate()
+
+        def parse_predicate():
+            token_type, token_value = peek()
+            if token_type == 'paren' and token_value == '(':
+                position[0] += 1
+                node = parse_or()
+                if node is None or peek() != ('paren', ')'):
+                    return None
+                position[0] += 1
+                return node
+            return parse_comparison()
+
+        def parse_comparison():
+            if position[0] + 2 >= len(tokens):
+                return None
+            left = tokens[position[0]]
+            operator = tokens[position[0] + 1]
+            right = tokens[position[0] + 2]
+            if left[0] not in ('word', 'string') or operator[0] != 'operator' or right[0] not in ('word', 'string'):
+                return None
+            position[0] += 3
+            return ('comparison', left, operator[1], right)
+
+        root = parse_or()
+        if root is None or position[0] != len(tokens):
+            return None
+        return root
+
+    # -- Value resolution --------------------------------------------------
+
+    def _column_name_from_ref(self, ref):
+        ref = ref.strip()
+        if ref.startswith('`') and ref.endswith('`'):
+            return ref[1:-1]
+        if ref.startswith('"') and ref.endswith('"'):
+            return ref[1:-1]
+        if ref.startswith('[') and ref.endswith(']'):
+            return ref[1:-1]
+        if '.' in ref:
+            qualifier, _, bare = ref.rpartition('.')
+            if bare.startswith('`') and bare.endswith('`'):
+                bare = bare[1:-1]
+            return qualifier, bare
+        return None, ref
+
+    def _literal_value(self, token):
+        if len(token) >= 2 and token[0] == "'" and token[-1] == "'":
+            return token[1:-1].replace("''", "'")
+        try:
+            return int(token)
+        except ValueError:
+            pass
+        try:
+            return float(token)
+        except ValueError:
+            pass
+        return UNRESOLVED_VALUE
+
+    def _make_param_resolver(self, bound_params):
+        if isinstance(bound_params, (list, tuple)):
+            positional = list(bound_params)
+
+            def resolve(operand):
+                if operand == '?':
+                    if not positional:
+                        return UNRESOLVED_VALUE
+                    return positional.pop(0)
+                return self._literal_value(operand)
+
+            return resolve
+        if isinstance(bound_params, dict):
+            named = bound_params
+
+            def resolve(operand):
+                operand = operand.strip()
+                if operand.startswith((':', '@', '$')):
+                    # Accept both prefixed (:name) and sqlite-native (name) keys.
+                    if operand in named:
+                        return named[operand]
+                    return named.get(operand[1:], UNRESOLVED_VALUE)
+                return self._literal_value(operand)
+
+            return resolve
+
+        def resolve_literals_only(operand):
+            return self._literal_value(operand)
+
+        return resolve_literals_only
+
+    def _resolve_operand(self, token, partition_row, specs_by_name,
+                         table_qualifiers, globally_ambiguous_columns, resolve_param):
+        token_type, token_value = token
+        if token_type == 'string':
+            # String literals are already unquoted by the tokenizer.
+            return token_value
+        qualifier, bare_name = self._column_name_from_ref(token_value)
+        spec = specs_by_name.get(bare_name)
+        if spec is not None:
+            if qualifier is not None and qualifier not in table_qualifiers:
+                # Qualified column belonging to another table.
+                return UNRESOLVED_VALUE
+            if qualifier is None and bare_name in globally_ambiguous_columns:
+                return UNRESOLVED_VALUE
+            return partition_row.get(bare_name, UNRESOLVED_VALUE)
+        if qualifier is not None:
+            # A qualified reference to a non-partition column cannot be evaluated.
+            return UNRESOLVED_VALUE
+        return resolve_param(token_value)
+
+    def _evaluate_node(self, node, partition_row, specs_by_name, table_qualifiers,
+                       globally_ambiguous_columns, resolve_param):
+        node_type = node[0]
+        if node_type == 'and':
+            values = [self._evaluate_node(child, partition_row, specs_by_name, table_qualifiers,
+                                          globally_ambiguous_columns, resolve_param)
+                      for child in node[1:]]
+            if PRED_FALSE in values:
+                return PRED_FALSE
+            if PRED_UNKNOWN in values:
+                return PRED_UNKNOWN
+            return PRED_TRUE
+        if node_type == 'or':
+            values = [self._evaluate_node(child, partition_row, specs_by_name, table_qualifiers,
+                                          globally_ambiguous_columns, resolve_param)
+                      for child in node[1:]]
+            if PRED_TRUE in values:
+                return PRED_TRUE
+            if PRED_UNKNOWN in values:
+                return PRED_UNKNOWN
+            return PRED_FALSE
+        if node_type == 'not':
+            value = self._evaluate_node(node[1], partition_row, specs_by_name, table_qualifiers,
+                                        globally_ambiguous_columns, resolve_param)
+            if value == PRED_UNKNOWN:
+                return PRED_UNKNOWN
+            return not value
+
+        _, left_token, operator, right_token = node
+        left_value = self._resolve_operand(left_token, partition_row, specs_by_name,
+                                           table_qualifiers, globally_ambiguous_columns, resolve_param)
+        right_value = self._resolve_operand(right_token, partition_row, specs_by_name,
+                                            table_qualifiers, globally_ambiguous_columns, resolve_param)
+        if left_value is UNRESOLVED_VALUE or right_value is UNRESOLVED_VALUE:
+            return PRED_UNKNOWN
+        left_name = self._column_name_from_ref(left_token[1])[1] if left_token[0] == 'word' else None
+        right_name = self._column_name_from_ref(right_token[1])[1] if right_token[0] == 'word' else None
+        left_is_partition = left_name in specs_by_name
+        right_is_partition = right_name in specs_by_name
+        if not left_is_partition and not right_is_partition:
+            # Predicate does not depend on any filename-encoded column.
+            return PRED_UNKNOWN
+        # Coerce the literal operand to the partition column's declared format so
+        # e.g. an integer partition matches a quoted literal '2', mirroring the
+        # comparisons sqlite performs on the actual data.
+        if left_is_partition:
+            right_value = self._coerce_to_spec(specs_by_name[left_name], right_value)
+        else:
+            left_value = self._coerce_to_spec(specs_by_name[right_name], left_value)
+        if left_value is UNRESOLVED_VALUE or right_value is UNRESOLVED_VALUE:
+            return PRED_UNKNOWN
+        return self._apply_comparison(operator, left_value, right_value)
+
+    def _coerce_to_spec(self, spec, value):
+        if spec.value_format == 'int':
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return UNRESOLVED_VALUE
+        if spec.value_format == 'date':
+            return self._coerce_date(value)
+        return value
+
+    def _coerce_date(self, value):
+        if isinstance(value, (int, float)):
+            return value
+        text = six.text_type(value)
+        for date_format in ('%Y-%m-%d', '%Y%m%d', '%Y/%m/%d'):
+            try:
+                return datetime.datetime.strptime(text, date_format).date().isoformat()
+            except ValueError:
+                continue
+        return UNRESOLVED_VALUE
+
+    def _apply_comparison(self, operator, left_value, right_value):
+        try:
+            if operator in ('=', '=='):
+                return PRED_TRUE if left_value == right_value else PRED_FALSE
+            if operator in ('!=', '<>'):
+                return PRED_TRUE if left_value != right_value else PRED_FALSE
+            if operator == '>':
+                return PRED_TRUE if left_value > right_value else PRED_FALSE
+            if operator == '>=':
+                return PRED_TRUE if left_value >= right_value else PRED_FALSE
+            if operator == '<':
+                return PRED_TRUE if left_value < right_value else PRED_FALSE
+            if operator == '<=':
+                return PRED_TRUE if left_value <= right_value else PRED_FALSE
+        except TypeError:
+            return PRED_UNKNOWN
+        return PRED_UNKNOWN
+
+    # -- Public API --------------------------------------------------------
+
+    def _has_top_level_set_operation(self, query):
+        # A top-level UNION/EXCEPT/INTERSECT combines multiple SELECT branches.
+        # Attributing each table to its branch and combining their conditions is
+        # not attempted; such queries conservatively read all member files.
+        depth = 0
+        in_string = False
+        index = 0
+        pattern = re.compile(r'\b(UNION|EXCEPT|INTERSECT)\b', re.IGNORECASE)
+        while index < len(query):
+            char = query[index]
+            if char == "'" and (index == 0 or query[index - 1] != '\\'):
+                in_string = not in_string
+            elif not in_string:
+                if char == '(':
+                    depth += 1
+                elif char == ')':
+                    depth -= 1
+                elif depth == 0:
+                    match = pattern.match(query, index)
+                    if match is not None:
+                        return True
+            index += 1
+        return False
+
+    def prune_files(self, qtable_name, query, atomic_fns, bound_params=None,
+                    table_qualifiers=None, globally_ambiguous_columns=None):
+        # Returns (files_to_read, skipped_files). A file is skipped only when
+        # the WHERE clause is provably false for its encoded partition values.
+        specs = self.partition_key.specs_for_qtable(qtable_name)
+        if not specs:
+            return list(atomic_fns), []
+
+        if self._has_top_level_set_operation(query):
+            return list(atomic_fns), []
+
+        where_clause = self.extract_where_clause(query)
+        if where_clause is None:
+            return list(atomic_fns), []
+
+        tokens = self._tokenize(where_clause)
+        if tokens is None:
+            return list(atomic_fns), []
+        root = self._parse(tokens)
+        if root is None:
+            return list(atomic_fns), []
+
+        specs_by_name = OrderedDict((spec.name, spec) for spec in specs)
+        table_qualifiers = table_qualifiers if table_qualifiers is not None else set()
+        globally_ambiguous_columns = globally_ambiguous_columns if globally_ambiguous_columns is not None else set()
+
+        files_to_read = []
+        skipped_files = []
+        for filename in atomic_fns:
+            # A fresh resolver per file keeps positional parameter consumption
+            # local to one evaluation, so every file sees the full param list.
+            resolve_param = self._make_param_resolver(bound_params)
+            partition_row = OrderedDict()
+            non_conforming = False
+            for spec in specs:
+                extracted = spec.extract_value(filename)
+                if extracted is None:
+                    # A non-conforming filename cannot be proven irrelevant,
+                    # regardless of the query conditions.
+                    non_conforming = True
+                    break
+                partition_row[spec.name] = extracted
+            if non_conforming:
+                files_to_read.append(filename)
+                continue
+            result = self._evaluate_node(root, partition_row, specs_by_name, table_qualifiers,
+                                         globally_ambiguous_columns, resolve_param)
+            if result == PRED_FALSE:
+                skipped_files.append(filename)
+            else:
+                # TRUE and UNKNOWN files are both kept: only a provably false
+                # predicate allows skipping, so non-conforming names survive.
+                files_to_read.append(filename)
+
+        # Pruning every file would change the table's shape (an empty table gets
+        # a dummy column), so keep all files to preserve the exact result schema.
+        if len(files_to_read) == 0:
+            return list(atomic_fns), []
+        return files_to_read, skipped_files
+
+
 class DelimitedFileReader(object):
     def __init__(self,atomic_fns, input_params, dialect, f = None,external_f_name = None):
         if f is not None:
@@ -1563,7 +2136,9 @@ class MaterializedState(object):
         assert False, 'not implemented'
 
 class MaterializedDelimitedFileState(MaterializedState):
-    def __init__(self, table_source_type,qtable_name, input_params, dialect_id,engine_id,target_table_name=None):
+    def __init__(self, table_source_type,qtable_name, input_params, dialect_id,engine_id,target_table_name=None,
+                 partition_key=None, query=None, bound_params=None,
+                 table_qualifiers=None, globally_ambiguous_columns=None):
         super().__init__(table_source_type,qtable_name,engine_id)
 
         self.input_params = input_params
@@ -1576,13 +2151,38 @@ class MaterializedDelimitedFileState(MaterializedState):
 
         self.can_store_as_cached = None
 
+        # Partition-pruning context. When provided, member files proven
+        # irrelevant from the query conditions are never opened.
+        self.partition_key = partition_key
+        self.query = query
+        self.bound_params = bound_params
+        self.table_qualifiers = table_qualifiers if table_qualifiers is not None else set()
+        self.globally_ambiguous_columns = globally_ambiguous_columns if globally_ambiguous_columns is not None else set()
+
+        # Files actually opened for reading, and files skipped as irrelevant.
+        self.skipped_atomic_fns = []
+
     def get_materialized_state_type(self):
         return MaterializedStateType.DELIMITED_FILE
 
     def initialize(self):
         super(MaterializedDelimitedFileState, self).initialize()
 
-        self.atomic_fns = self.materialize_file_list(self.qtable_name)
+        all_atomic_fns = self.materialize_file_list(self.qtable_name)
+
+        if self.partition_key is not None and not self.partition_key.is_empty() and self.query is not None:
+            pruner = PartitionPruner(self.partition_key)
+            pruned_fns, skipped_fns = pruner.prune_files(self.qtable_name, self.query,
+                                                         all_atomic_fns, self.bound_params,
+                                                         table_qualifiers=self.table_qualifiers,
+                                                         globally_ambiguous_columns=self.globally_ambiguous_columns)
+            xprint("Partition pruning for %s: %s files read, %s skipped" %
+                   (self.qtable_name, len(pruned_fns), len(skipped_fns)))
+            self.atomic_fns = pruned_fns
+            self.skipped_atomic_fns = skipped_fns
+        else:
+            self.atomic_fns = all_atomic_fns
+
         self.delimited_file_reader = DelimitedFileReader(self.atomic_fns,self.input_params,self.dialect_id)
 
         self.source_type = self.table_source_type
@@ -1716,7 +2316,8 @@ class MaterializedDelimitedFileState(MaterializedState):
                                                              self.target_table_name,
                                                              self.source_type,
                                                              self.source,
-                                                             self.get_planned_table_name())
+                                                             self.get_planned_table_name(),
+                                                             skipped_atomic_fns=self.skipped_atomic_fns)
 
         content_signature = table_creator.content_signature
         content_signature_key = self.db_to_use.calculate_content_signature_key(content_signature)
@@ -2080,9 +2681,10 @@ class MaterializedQsqlState(MaterializedState):
 
 
 class MaterializedStateTableStructure(object):
-    def __init__(self,qtable_name, atomic_fns, db_id, column_names, python_column_types, sqlite_column_types, table_name_for_querying,source_type,source,planned_table_name):
+    def __init__(self,qtable_name, atomic_fns, db_id, column_names, python_column_types, sqlite_column_types, table_name_for_querying,source_type,source,planned_table_name,skipped_atomic_fns=None):
         self.qtable_name = qtable_name
         self.atomic_fns = atomic_fns
+        self.skipped_atomic_fns = skipped_atomic_fns if skipped_atomic_fns is not None else []
         self.db_id = db_id
         self.column_names = column_names
         self.python_column_types = python_column_types
@@ -2541,11 +3143,26 @@ class DatabaseInfo(object):
     __repr__ = __str__
 
 class QTextAsData(object):
-    def __init__(self,default_input_params=QInputParams(),data_streams_dict=None):
+    def __init__(self,default_input_params=QInputParams(),data_streams_dict=None,partition_key=None):
         self.engine_id = str(uuid.uuid4()).replace("-","_")
 
         self.default_input_params = default_input_params
         xprint("Default input params: %s" % self.default_input_params)
+
+        # Optional declaration of filename-encoded partition columns, used for
+        # pruning member files based on the query's WHERE conditions.
+        self.partition_key = partition_key if partition_key is not None else PartitionKey(OrderedDict())
+
+        # Query context used while loading tables. Set per execution so the
+        # pruner can inspect the active query and its bound parameters.
+        self._current_query = None
+        self._current_bound_params = None
+        self._current_pruning_context = None
+
+        # Qtables materialized during the currently running execution. A table
+        # pruned for one query must be reloaded for a later query whose
+        # conditions may require the previously skipped files.
+        self._loaded_in_current_execution = set()
 
         self.loaded_table_structures_dict = OrderedDict()
         self.databases = OrderedDict()
@@ -2607,6 +3224,71 @@ class QTextAsData(object):
     def get_dialect_id(self,filename):
         return 'q_dialect_%s' % filename
 
+    PRUNING_CLAUSE_KEYWORDS = ('ON', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'HAVING',
+                               'UNION', 'EXCEPT', 'INTERSECT', 'JOIN', 'LEFT', 'RIGHT',
+                               'INNER', 'OUTER', 'CROSS', 'FULL', 'AS')
+
+    def _build_pruning_context(self, sql_object):
+        # Maps each normalized qtable name to the set of identifiers that may
+        # qualify its columns (explicit aliases), and records partition columns
+        # that exist on more than one participating table, whose unqualified
+        # references therefore cannot be attributed safely.
+        qualifiers_by_qtable = OrderedDict()
+        parts = sql_object.sql_parts
+        for positions in sql_object.qtable_name_positions.values():
+            for position in positions:
+                qtable_name = parts[position]
+                qualifiers = qualifiers_by_qtable.setdefault(qtable_name, set())
+                alias_index = position + 1
+                while alias_index < len(parts):
+                    candidate = parts[alias_index].strip('(),')
+                    if not candidate or candidate.upper() in self.PRUNING_CLAUSE_KEYWORDS:
+                        break
+                    if candidate.upper() == 'AS':
+                        alias_index += 1
+                        continue
+                    if candidate.startswith('('):
+                        break
+                    # The first plain identifier after the table is its alias.
+                    qualifiers.add(self._strip_identifier_quotes(candidate))
+                    break
+
+        partition_columns_by_qtable = OrderedDict()
+        for qtable_name in qualifiers_by_qtable:
+            specs = self.partition_key.specs_for_qtable(qtable_name)
+            if specs:
+                partition_columns_by_qtable[qtable_name] = set(spec.name for spec in specs)
+
+        column_occurrence_count = {}
+        for column_names in partition_columns_by_qtable.values():
+            for name in column_names:
+                column_occurrence_count[name] = column_occurrence_count.get(name, 0) + 1
+        ambiguous_columns = set(name for name, count in column_occurrence_count.items() if count > 1)
+
+        return OrderedDict((qtable_name, {
+            'table_qualifiers': qualifiers_by_qtable[qtable_name],
+            'globally_ambiguous_columns': ambiguous_columns,
+        }) for qtable_name in qualifiers_by_qtable)
+
+    def _strip_identifier_quotes(self, identifier):
+        if len(identifier) >= 2 and (
+                (identifier[0] == '`' and identifier[-1] == '`') or
+                (identifier[0] == '"' and identifier[-1] == '"') or
+                (identifier[0] == '[' and identifier[-1] == ']')):
+            return identifier[1:-1]
+        return identifier
+
+    def _normalize_bound_params_for_sqlite(self, bound_params):
+        # Python's sqlite3 expects named parameter keys without their leading
+        # :/@/$ prefix, while callers may provide either form.
+        if isinstance(bound_params, dict):
+            normalized = OrderedDict()
+            for key, value in bound_params.items():
+                clean_key = key[1:] if isinstance(key, str) and key[:1] in (':', '@', '$') else key
+                normalized[clean_key] = value
+            return normalized
+        return bound_params
+
     def _open_files_and_get_mfss(self,qtable_name,input_params,dialect):
         materialized_file_dict = OrderedDict()
 
@@ -2629,7 +3311,13 @@ class QTextAsData(object):
             effective_qtable_name = '%s:::%s' % (sqlite_filename, table_name)
         elif materialized_state_type == MaterializedStateType.DELIMITED_FILE:
             (source_qtable_name,_) = source_info
-            ms = MaterializedDelimitedFileState(table_source_type,source_qtable_name, input_params, dialect, self.engine_id)
+            pruning_context = (self._current_pruning_context or {}).get(qtable_name, {})
+            ms = MaterializedDelimitedFileState(table_source_type,source_qtable_name, input_params, dialect, self.engine_id,
+                                                 partition_key=self.partition_key,
+                                                 query=self._current_query,
+                                                 bound_params=self._current_bound_params,
+                                                 table_qualifiers=pruning_context.get('table_qualifiers', set()),
+                                                 globally_ambiguous_columns=pruning_context.get('globally_ambiguous_columns', set()))
             effective_qtable_name = source_qtable_name
         else:
             assert False, "Unknown file type for qtable %s should have exited with an exception" % (qtable_name)
@@ -2715,8 +3403,20 @@ class QTextAsData(object):
         xprint("MFS to load: %s" % mfs)
 
         if qtable_name in self.loaded_table_structures_dict.keys():
-            xprint("Atomic filename %s found. no need to load" % qtable_name)
-            return None
+            existing_structure = self.loaded_table_structures_dict[qtable_name]
+            was_pruned_in_previous_execution = (
+                qtable_name not in self._loaded_in_current_execution
+                and len(getattr(existing_structure, 'skipped_atomic_fns', [])) > 0)
+            if was_pruned_in_previous_execution:
+                # The table was narrowed for an earlier query. The new query may
+                # need the skipped files, so discard the old materialized table
+                # and materialize it again from scratch.
+                xprint("Reloading previously pruned qtable %s for the current query" % qtable_name)
+                self._discard_loaded_qtable(existing_structure)
+                del self.loaded_table_structures_dict[qtable_name]
+            else:
+                xprint("Atomic filename %s found. no need to load" % qtable_name)
+                return None
 
         xprint("qtable %s not found - loading" % qtable_name)
 
@@ -2726,12 +3426,27 @@ class QTextAsData(object):
 
         assert qtable_name not in self.loaded_table_structures_dict, "loaded_table_structures_dict has been changed to have a non-list value"
         self.loaded_table_structures_dict[qtable_name] = mfs.mfs_structure
+        self._loaded_in_current_execution.add(qtable_name)
 
         return mfs.mfs_structure
 
     def already_attached_to_query_level_db(self,db_to_attach):
         attached_dbs = list(map(lambda x:x[1],self.query_level_db.get_sqlite_database_list()))
         return db_to_attach.db_id in attached_dbs
+
+    def _discard_loaded_qtable(self, table_structure):
+        # Removes a previously materialized table and its qcatalog entry so the
+        # qtable can be re-materialized with a different set of member files.
+        database_info = self.databases.get(table_structure.db_id)
+        if database_info is None:
+            return
+        sqlite_db = database_info.sqlite_db
+        table_name = table_structure.table_name_for_querying
+        sqlite_db.execute_and_fetch('DROP TABLE IF EXISTS "%s"' % table_name.replace('"', '""'))
+        sqlite_db.execute_and_fetch(
+            'DELETE FROM %s WHERE temp_table_name = ?' % Sqlite3DB.QCATALOG_TABLE_NAME,
+            (table_name,))
+        sqlite_db.conn.commit()
 
     def attach_to_db(self, target_db, source_db):
         q = "attach '%s' as %s" % (target_db.sqlite_db_url,target_db.db_id)
@@ -2847,7 +3562,7 @@ class QTextAsData(object):
 
         xprint("Query validated")
 
-    def _execute(self,query_str,input_params=None,data_streams=None,stop_after_analysis=False,save_db_to_disk_filename=None):
+    def _execute(self,query_str,input_params=None,data_streams=None,stop_after_analysis=False,save_db_to_disk_filename=None,bound_params=None):
         warnings = []
         error = None
         table_structures = []
@@ -2866,13 +3581,25 @@ class QTextAsData(object):
 
 
         try:
+            # Expose the active query to the table loading phase so partition
+            # pruning can take the WHERE conditions and bound params into account.
+            self._current_query = '%s' % query_str
+            self._current_bound_params = bound_params
+            self._loaded_in_current_execution = set()
+
             # Create SQL statement
             sql_object = Sql('%s' % query_str, self.data_streams)
+            self._current_pruning_context = self._build_pruning_context(sql_object)
 
             load_start_time = time.time()
             iprint("Going to ensure data is loaded. Currently loaded tables: %s" % str(self.loaded_table_structures_dict))
             new_table_structures = self._ensure_data_is_loaded_for_sql(sql_object,effective_input_params,data_streams,stop_after_analysis=stop_after_analysis)
             iprint("Ensured data is loaded. loaded tables: %s" % self.loaded_table_structures_dict)
+
+            # The query context is only needed while materializing the tables.
+            self._current_query = None
+            self._current_bound_params = None
+            self._current_pruning_context = None
 
             self.validate_query(sql_object,self.loaded_table_structures_dict)
 
@@ -2902,7 +3629,8 @@ class QTextAsData(object):
             xprint("Query level db: databases %s" % all_databases)
 
             # Execute the query and fetch the data
-            db_results_obj = sql_object.execute_and_fetch(self.query_level_db)
+            execution_params = self._normalize_bound_params_for_sqlite(bound_params)
+            db_results_obj = sql_object.execute_and_fetch(self.query_level_db, execution_params)
             iprint("Query executed")
 
             if len(db_results_obj.results) == 0:
@@ -2989,8 +3717,8 @@ class QTextAsData(object):
 
         return QOutput(data=None,warnings = warnings,error = error , metadata=QMetadata(table_structures=self.loaded_table_structures_dict,new_table_structures=self.loaded_table_structures_dict,output_column_name_list=[]))
 
-    def execute(self,query_str,input_params=None,save_db_to_disk_filename=None):
-        r = self._execute(query_str,input_params,stop_after_analysis=False,save_db_to_disk_filename=save_db_to_disk_filename)
+    def execute(self,query_str,input_params=None,save_db_to_disk_filename=None,bound_params=None):
+        r = self._execute(query_str,input_params,stop_after_analysis=False,save_db_to_disk_filename=save_db_to_disk_filename,bound_params=bound_params)
         return r
 
     def unload(self):
@@ -3003,8 +3731,8 @@ class QTextAsData(object):
                 pass
         self.loaded_table_structures_dict = OrderedDict()
 
-    def analyze(self,query_str,input_params=None,data_streams=None):
-        q_output = self._execute(query_str,input_params,data_streams=data_streams,stop_after_analysis=True)
+    def analyze(self,query_str,input_params=None,data_streams=None,bound_params=None):
+        q_output = self._execute(query_str,input_params,data_streams=data_streams,stop_after_analysis=True,bound_params=bound_params)
 
         return q_output
 
@@ -3261,7 +3989,17 @@ def run_standalone():
 
     data_streams_dict = initialize_default_data_streams()
 
-    q_engine = QTextAsData(default_input_params=default_input_params,data_streams_dict=data_streams_dict)
+    if options.partition_key_file is not None:
+        try:
+            partition_key = PartitionKey.from_json_file(options.partition_key_file)
+        except (FileNotFoundException, InvalidQueryException) as e:
+            print("Invalid partition key file: %s" % e.msg, file=sys.stderr)
+            sys.exit(92)
+    else:
+        partition_key = PartitionKey(OrderedDict())
+
+    q_engine = QTextAsData(default_input_params=default_input_params,data_streams_dict=data_streams_dict,
+                           partition_key=partition_key)
 
     execute_queries(STDOUT, options, q_engine, q_output_printer, query_strs)
 
@@ -3282,6 +4020,23 @@ def dump_defaults_and_stop__if_needed(options, parser):
         sys.exit(0)
 
 
+def print_read_file_list(q_output, f_err):
+    # Lists the member files actually opened for each table, and the files
+    # skipped by partition pruning, so callers can audit what was touched.
+    if q_output.metadata is None or q_output.metadata.table_structures is None:
+        return
+    for qtable_name, table_structure in q_output.metadata.table_structures.items():
+        atomic_fns = getattr(table_structure, 'atomic_fns', None)
+        if atomic_fns is None:
+            continue
+        print("Table %s - read files (%s):" % (qtable_name, len(atomic_fns)), file=f_err)
+        for filename in atomic_fns:
+            print("  READ %s" % filename, file=f_err)
+        skipped = getattr(table_structure, 'skipped_atomic_fns', []) or []
+        for filename in skipped:
+            print("  SKIPPED %s" % filename, file=f_err)
+
+
 def execute_queries(STDOUT, options, q_engine, q_output_printer, query_strs):
     for query_str in query_strs:
         if options.analyze_only:
@@ -3290,6 +4045,9 @@ def execute_queries(STDOUT, options, q_engine, q_output_printer, query_strs):
         else:
             q_output = q_engine.execute(query_str, save_db_to_disk_filename=options.save_db_to_disk_filename)
             q_output_printer.print_output(STDOUT, sys.stderr, q_output)
+
+        if options.list_read_files:
+            print_read_file_list(q_output, sys.stderr)
 
         if q_output.status == 'error':
             sys.exit(q_output.error.errorcode)
@@ -3394,9 +4152,19 @@ def initialize_command_line_parser(p, qrc_filename):
     input_data_option_group.add_argument("-M", "--max-column-length-limit", 
                                        default=default_max_column_length_limit,
                                        help="Sets the maximum column length.")
-    input_data_option_group.add_argument("-U", "--with-universal-newlines", 
+    input_data_option_group.add_argument("-U", "--with-universal-newlines",
                                        default=default_with_universal_newlines, action="store_true",
                                        help="Expect universal newlines in the data. Limitation: -U works only with regular files for now, stdin or .gz files are not supported yet.")
+    # -----------------------------------------------
+    default_partition_key_file = get_option_with_default(p, 'string', 'partition_key_file', None)
+    default_list_read_files = get_option_with_default(p, 'boolean', 'list_read_files', False)
+    partition_option_group = parser.add_argument_group("Partition Pruning Options")
+    partition_option_group.add_argument("--partition-key-file", dest="partition_key_file",
+                                        default=default_partition_key_file,
+                                        help="Path to a JSON file declaring filename-encoded partition columns. Member files proven irrelevant by the query WHERE conditions are not opened. Files whose names do not match a declared pattern are always read.")
+    partition_option_group.add_argument("--list-read-files", dest="list_read_files",
+                                        default=default_list_read_files, action="store_true",
+                                        help="Print the member files actually opened for each queried table to standard error, including files skipped by partition pruning")
     # -----------------------------------------------
     output_data_option_group = parser.add_argument_group("Output Options")
     output_data_option_group.add_argument("-D", "--output-delimiter", 

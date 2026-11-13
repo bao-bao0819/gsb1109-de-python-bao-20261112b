@@ -20,6 +20,9 @@ import unittest
 import random
 import json
 import uuid
+import glob
+import shutil
+import stat
 from collections import OrderedDict
 from json import JSONEncoder
 from subprocess import PIPE, Popen, STDOUT
@@ -41,7 +44,7 @@ import re
 import collections
 
 sys.path.append(os.path.join(os.path.abspath(os.path.dirname(sys.argv[0])),'..','bin'))
-from bin.q import QTextAsData, QOutput, QOutputPrinter, QInputParams, DataStream, Sqlite3DB
+from bin.q import QTextAsData, QOutput, QOutputPrinter, QInputParams, DataStream, Sqlite3DB, PartitionKey, PartitionColumnSpec, PartitionPruner
 
 # q uses this encoding as the default output encoding. Some of the tests use it in order to 
 # make sure that the output is correctly encoded
@@ -3095,7 +3098,7 @@ with_universal_newlines=True
         retcode, o, e = run_command(cmd, env_to_inject=env_to_inject)
 
         self.assertEqual(retcode, 0)
-        self.assertEqual(len(o), 34)
+        self.assertEqual(len(o), 36)
         self.assertEqual(len(e), 0)
 
         self.assertEqual(o[0],six.b('[options]'))
@@ -3128,6 +3131,8 @@ with_universal_newlines=True
         self.assertEqual(m[six.b('output_header')],six.b('True'))
         self.assertEqual(m[six.b('output_quoting_mode')],six.b('all'))
         self.assertEqual(m[six.b('overwrite_qsql')],six.b('False'))
+        self.assertEqual(m[six.b('partition_key_file')],six.b('None'))
+        self.assertEqual(m[six.b('list_read_files')],six.b('False'))
         self.assertEqual(m[six.b('pipe_delimited')],six.b('True'))
         self.assertEqual(m[six.b('pipe_delimited_output')],six.b('True'))
         self.assertEqual(m[six.b('query_encoding')],six.b('ascii'))
@@ -5540,6 +5545,255 @@ class BasicModuleTests(AbstractQTestCase):
 
         q.done()
 
+
+class PartitionPruningTests(AbstractQTestCase):
+
+    def region_spec(self):
+        return PartitionColumnSpec('region', r'report_([a-z]+)_\d{4}-\d{2}-\d{2}\.csv$', 'text')
+
+    def day_spec(self):
+        return PartitionColumnSpec('day', r'report_[a-z]+_(\d{4}-\d{2}-\d{2})\.csv$', 'date')
+
+    def setUp(self):
+        self.tmpfolder = tempfile.mkdtemp(prefix='q-partition-')
+        self.dates = ['2026-11-09', '2026-11-10', '2026-11-11', '2026-11-12', '2026-11-13']
+        for region in ('north', 'south'):
+            for day in self.dates:
+                with open(os.path.join(self.tmpfolder, 'report_%s_%s.csv' % (region, day)), 'w') as f:
+                    f.write('region,day,amount\n%s,%s,10\n' % (region, day))
+        # A file whose name does not conform to the partition pattern.
+        with open(os.path.join(self.tmpfolder, 'report_unknown.csv'), 'w') as f:
+            f.write('region,day,amount\nmystery,?,99\n')
+        self.glob_pattern = os.path.realpath(os.path.join(self.tmpfolder, 'report_*.csv'))
+        self.input_params = QInputParams(skip_header=True, delimiter=',')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpfolder, ignore_errors=True)
+
+    def partition_key(self):
+        return PartitionKey({self.glob_pattern: [self.region_spec(), self.day_spec()]})
+
+    def engine(self):
+        return QTextAsData(self.input_params, partition_key=self.partition_key())
+
+    def table_structure(self, result):
+        return result.metadata.table_structures[self.glob_pattern]
+
+    def basenames(self, filenames):
+        return sorted(os.path.basename(filename) for filename in filenames)
+
+    def test_equality_and_range_pruning_keeps_only_matching_and_non_conforming_files(self):
+        q = self.engine()
+        query = ("select sum(amount) from %s where region = 'north' "
+                 "and day >= '2026-11-10' and day <= '2026-11-12'" % self.glob_pattern)
+        result = q.execute(query)
+        self.assertEqual(result.status, 'ok')
+        structure = self.table_structure(result)
+        self.assertEqual(
+            self.basenames(structure.atomic_fns),
+            ['report_north_2026-11-10.csv', 'report_north_2026-11-11.csv',
+             'report_north_2026-11-12.csv', 'report_unknown.csv'])
+        # All south files and the north files outside the date range are proven irrelevant.
+        self.assertEqual(len(structure.skipped_atomic_fns), 7)
+        self.assertTrue(all('south' in filename or '2026-11-09' in filename or '2026-11-13' in filename
+                            for filename in structure.skipped_atomic_fns))
+        self.assertEqual(result.data, [(30,)])
+        q.done()
+
+    def test_optimization_does_not_change_results(self):
+        query = ("select region, sum(amount) from %s where day >= '2026-11-10' and day <= '2026-11-12' "
+                 "group by region order by region" % self.glob_pattern)
+        optimized = self.engine().execute(query)
+        plain = QTextAsData(self.input_params).execute(query)
+        self.assertEqual(optimized.status, 'ok')
+        self.assertEqual(plain.status, 'ok')
+        self.assertEqual(optimized.data, plain.data)
+        # The plain engine reads every file, the optimized engine also keeps the non-conforming file.
+        self.assertEqual(len(self.table_structure(plain).skipped_atomic_fns), 0)
+        self.assertEqual(len(self.table_structure(plain).atomic_fns), 11)
+
+    def test_non_conforming_filename_is_never_skipped(self):
+        q = self.engine()
+        result = q.execute("select sum(amount) from %s where region = 'north'" % self.glob_pattern)
+        self.assertEqual(result.status, 'ok')
+        read_names = self.basenames(self.table_structure(result).atomic_fns)
+        self.assertIn('report_unknown.csv', read_names)
+        # The non-conforming file is read, but its 'mystery' row does not match
+        # the SQL equality condition, so only the five north rows are returned.
+        self.assertEqual(result.data, [(50,)])
+        q.done()
+
+    def test_insufficient_conditions_read_all_files(self):
+        q = self.engine()
+        # Condition only on a non-partition column: nothing can be proven.
+        result = q.execute("select sum(amount) from %s where amount > 5" % self.glob_pattern)
+        self.assertEqual(result.status, 'ok')
+        structure = self.table_structure(result)
+        self.assertEqual(len(structure.atomic_fns), 11)
+        self.assertEqual(structure.skipped_atomic_fns, [])
+        q.done()
+
+    def test_or_conditions_are_pruned_correctly(self):
+        q = self.engine()
+        query = ("select sum(amount) from %s where day = '2026-11-10' "
+                 "and (region = 'north' or region = 'south')" % self.glob_pattern)
+        result = q.execute(query)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(
+            self.basenames(self.table_structure(result).atomic_fns),
+            ['report_north_2026-11-10.csv', 'report_south_2026-11-10.csv', 'report_unknown.csv'])
+        self.assertEqual(result.data, [(20,)])
+        q.done()
+
+    def test_positional_bound_parameters_prune_and_execute_correctly(self):
+        q = self.engine()
+        query = "select sum(amount) from %s where region = ? and day >= ? and day <= ?" % self.glob_pattern
+        result = q.execute(query, bound_params=['north', '2026-11-11', '2026-11-13'])
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(len(self.table_structure(result).atomic_fns), 4)
+        self.assertEqual(result.data, [(30,)])
+        q.done()
+
+    def test_named_bound_parameters_accept_prefixed_and_bare_keys(self):
+        query = "select sum(amount) from %s where region = :r and day = :d" % self.glob_pattern
+        for params in ({':r': 'south', ':d': '2026-11-12'}, {'r': 'south', 'd': '2026-11-12'}):
+            q = self.engine()
+            result = q.execute(query, bound_params=params)
+            self.assertEqual(result.status, 'ok', result.error.msg if result.error else '')
+            self.assertEqual(len(self.table_structure(result).atomic_fns), 2)
+            self.assertEqual(result.data, [(10,)])
+            q.done()
+
+    def test_left_join_results_are_correct_while_pruning_the_left_table(self):
+        dimension_file = os.path.join(self.tmpfolder, 'regions.csv')
+        with open(dimension_file, 'w') as f:
+            f.write('region,label\nnorth,N\nsouth,S\n')
+        q = self.engine()
+        query = ("select t.region, d.label, sum(t.amount) from %s t left join %s d on (t.region = d.region) "
+                 "where t.region = 'north' and t.day >= '2026-11-11' and t.day <= '2026-11-12' "
+                 "group by t.region, d.label" % (self.glob_pattern, os.path.realpath(dimension_file)))
+        result = q.execute(query)
+        self.assertEqual(result.status, 'ok', result.error.msg if result.error else '')
+        self.assertEqual(result.data, [('north', 'N', 20)])
+        self.assertEqual(len(self.table_structure(result).atomic_fns), 3)
+        q.done()
+
+    def test_pruned_unreadable_files_are_never_opened(self):
+        if os.geteuid() == 0:
+            self.skipTest('root bypasses file permissions')
+        unreadable = [os.path.join(self.tmpfolder, 'report_south_%s.csv' % day) for day in self.dates]
+        for filename in unreadable:
+            os.chmod(filename, 0)
+        try:
+            q = self.engine()
+            result = q.execute("select count(*) from %s where region = 'north'" % self.glob_pattern)
+            self.assertEqual(result.status, 'ok')
+            self.assertEqual(result.data, [(5,)])  # five north rows; non-conforming row does not match
+            q.done()
+
+            plain = QTextAsData(self.input_params).execute(
+                "select count(*) from %s where region = 'north'" % self.glob_pattern)
+            self.assertEqual(plain.status, 'error')
+        finally:
+            for filename in unreadable:
+                os.chmod(filename, stat.S_IRUSR | stat.S_IWUSR)
+
+    def test_pruned_table_is_reloaded_for_a_later_broader_query(self):
+        q = self.engine()
+        narrow = q.execute("select sum(amount) from %s where region = 'north' and day = '2026-11-10'" % self.glob_pattern)
+        self.assertEqual(narrow.status, 'ok')
+        self.assertEqual(len(self.table_structure(narrow).atomic_fns), 2)
+        broad = q.execute("select sum(amount) from %s where region = 'north'" % self.glob_pattern)
+        self.assertEqual(broad.status, 'ok', broad.error.msg if broad.error else '')
+        self.assertEqual(len(self.table_structure(broad).atomic_fns), 6)
+        self.assertEqual(broad.data, [(50,)])
+        q.done()
+
+    def test_integer_partition_format(self):
+        folder = tempfile.mkdtemp(prefix='q-int-partition-')
+        try:
+            for shard in range(4):
+                with open(os.path.join(folder, 'shard_%s.csv' % shard), 'w') as f:
+                    f.write('shard_id,value\n%s,%s\n' % (shard, shard))
+            pattern = os.path.realpath(os.path.join(folder, 'shard_*.csv'))
+            key = PartitionKey({pattern: [PartitionColumnSpec('shard_id', r'shard_(\d+)\.csv$', 'int')]})
+            q = QTextAsData(self.input_params, partition_key=key)
+            result = q.execute("select sum(value) from %s where shard_id = 2" % pattern)
+            self.assertEqual(result.status, 'ok')
+            self.assertEqual(result.data, [(2,)])
+            structure = result.metadata.table_structures[pattern]
+            self.assertEqual(self.basenames(structure.atomic_fns), ['shard_2.csv'])
+            self.assertEqual(len(structure.skipped_atomic_fns), 3)
+            q.done()
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_top_level_set_operation_disables_pruning(self):
+        q = self.engine()
+        query = ("select region from %s where region = 'north' "
+                 "union select region from %s where region = 'south'"
+                 % (self.glob_pattern, self.glob_pattern))
+        result = q.execute(query)
+        self.assertEqual(result.status, 'ok', result.error.msg if result.error else '')
+        structure = self.table_structure(result)
+        self.assertEqual(len(structure.atomic_fns), 11)
+        self.assertEqual(structure.skipped_atomic_fns, [])
+        q.done()
+
+    def test_unsupported_predicate_shape_disables_pruning(self):
+        pruner = PartitionPruner(self.partition_key())
+        files = sorted(glob.glob(self.glob_pattern))
+        # A function-based predicate cannot be evaluated against file names.
+        read, skipped = pruner.prune_files(
+            self.glob_pattern,
+            "select * from %s where substr(region,1,1) = 'n'" % self.glob_pattern,
+            files)
+        self.assertEqual(read, files)
+        self.assertEqual(skipped, [])
+
+    def test_partition_key_file_and_list_read_files_cli(self):
+        key_file = os.path.join(self.tmpfolder, 'partition-keys.json')
+        with open(key_file, 'w') as f:
+            json.dump({'tables': [{'table': self.glob_pattern, 'columns': [
+                {'name': 'region', 'pattern': r'report_([a-z]+)_\d{4}-\d{2}-\d{2}\.csv$', 'format': 'text'},
+                {'name': 'day', 'pattern': r'report_[a-z]+_(\d{4}-\d{2}-\d{2})\.csv$', 'format': 'date'}]}]}, f)
+        query = "select sum(amount) from %s where region = 'north' and day = '2026-11-11'" % self.glob_pattern
+        cmd = '%s -d , -H --partition-key-file %s --list-read-files "%s"' % (Q_EXECUTABLE, key_file, query)
+        returncode, output, errors = run_command(cmd)
+        self.assertEqual(returncode, 0)
+        self.assertEqual(output, [six.b('10')])
+        joined_errors = six.b('\n').join(errors)
+        self.assertIn(six.b('READ '), joined_errors)
+        self.assertIn(six.b('SKIPPED '), joined_errors)
+        self.assertIn(six.b('report_north_2026-11-11.csv'), joined_errors)
+        self.assertIn(six.b('report_unknown.csv'), joined_errors)
+
+    def test_partition_key_file_accepts_top_level_dict_form(self):
+        key_file = os.path.join(self.tmpfolder, 'partition-keys-dict.json')
+        with open(key_file, 'w') as f:
+            json.dump({self.glob_pattern: [
+                {'name': 'region', 'pattern': r'report_([a-z]+)_\d{4}-\d{2}-\d{2}\.csv$', 'format': 'text'}]}, f)
+        loaded = PartitionKey.from_json_file(key_file)
+        specs = loaded.specs_for_qtable(self.glob_pattern)
+        self.assertIsNotNone(specs)
+        self.assertEqual([spec.name for spec in specs], ['region'])
+        q = QTextAsData(self.input_params, partition_key=loaded)
+        result = q.execute("select count(*) from %s where region = 'south'" % self.glob_pattern)
+        self.assertEqual(result.status, 'ok')
+        # Five south files match; the non-conforming file is always retained.
+        self.assertEqual(len(self.table_structure(result).atomic_fns), 6)
+        q.done()
+
+    def test_invalid_partition_key_file_fails_cleanly(self):
+        bad_key_file = os.path.join(self.tmpfolder, 'bad-keys.json')
+        with open(bad_key_file, 'w') as f:
+            f.write('{this is not valid json')
+        query = "select count(*) from %s where region = 'north'" % self.glob_pattern
+        cmd = '%s -d , -H --partition-key-file %s "%s"' % (Q_EXECUTABLE, bad_key_file, query)
+        returncode, output, errors = run_command(cmd)
+        self.assertEqual(returncode, 92)
+        self.assertEqual(output, [])
+        self.assertTrue(any(b'partition key' in line.lower() for line in errors))
 
 
 class BenchmarkAttemptResults(object):

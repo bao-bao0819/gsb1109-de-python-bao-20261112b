@@ -104,3 +104,32 @@ Removed the dual py2/py3 support. Since q is packaged as a self-contained execut
 Users which for some reason still use q's main source code file directly and use python 2 would need to stay with the latest 2.0.19 release. In some next version, q's code structure is going to change significantly anyway in order to become a standard python module, so using the main source code file directly would not be possible.
 
 If you are such a user, and this decision hurts you considerably, please ping me.
+
+## Filename partition keys and partition pruning
+
+When report-like files encode part of their data in their names (for example `report_north_2026-11-10.csv`, where `north` is the region and `2026-11-10` the day), a query that filters on those columns does not need to open every matching file. A partition key declares how column values are encoded in member file names, allowing q to skip the files whose encoded values provably cannot satisfy the query's `WHERE` conditions.
+
+The partition key is provided through `--partition-key-file`, pointing to a JSON file. Both the explicit form and a top-level mapping are accepted:
+
+```
+{
+  "tables": [
+    {
+      "table": "/data/reports/report_*.csv",
+      "columns": [
+        {"name": "region", "pattern": "report_([a-z]+)_\\d{4}-\\d{2}-\\d{2}\\.csv$", "format": "text"},
+        {"name": "day",    "pattern": "report_[a-z]+_(\\d{4}-\\d{2}-\\d{2})\\.csv$", "format": "date"}
+      ]
+    }
+  ]
+}
+```
+
+* Each column's `pattern` is a regular expression with exactly one capture group applied to the file's basename. `format` is one of `text`, `int` or `date` (dates accept `YYYY-MM-DD`, `YYYYMMDD` and `YYYY/MM/DD` and are normalized to `YYYY-MM-DD`).
+* A file is skipped only when the `WHERE` clause is provably false for its encoded values. Equality, inequality and range comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`, `OR`, `NOT`, parentheses, table aliases and bound parameters (`?`, `:name`) are understood. Conditions on non-partition columns, unrecognized predicates, or anything that cannot be evaluated against a file name conservatively keep all files, so pruning never changes the query result.
+* A file whose name does not match a declared pattern can never be proven irrelevant and is always read. Non-conforming names are therefore treated as possible matches rather than excluded.
+* Top-level `UNION`/`EXCEPT`/`INTERSECT` queries and ambiguous unqualified column references disable pruning for safety.
+* `--list-read-files` prints the member files actually opened (`READ`) and the ones pruned (`SKIPPED`) for each table to standard error, so the physical files touched by a query can be audited. The same information is available through the `atomic_fns` and `skipped_atomic_fns` attributes of each table structure in the Python API.
+* The Python API accepts a `PartitionKey` directly through `QTextAsData(..., partition_key=...)`, and `execute`/`analyze` accept `bound_params` (a sequence for positional parameters or a dict for named parameters).
+
+Pruning is transparent: with or without a partition key, and with the optimization enabled or disabled, the query result is identical for the same input.
