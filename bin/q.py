@@ -1410,6 +1410,9 @@ class DelimitedFileReader(object):
 
         self.external_f = f is not None
         self.external_f_name = external_f_name
+        # Externally-provided streams (e.g. stdin) are owned by the caller, and
+        # may be shared by multiple references. Never close them here.
+        self.owns_file = f is None
 
     def get_lines_read(self):
         return self.lines_read
@@ -1470,10 +1473,11 @@ class DelimitedFileReader(object):
 
     def close_file(self):
         if not self.is_open:
-            # TODO Convert to assertion
-            raise Exception("Bug - file should already be open: %s" % ",".join(self.atomic_fns))
+            return
 
-        self.f.close()
+        if self.owns_file:
+            self.f.close()
+        self.is_open = False
         xprint("XX Closed file %s" % ",".join(self.atomic_fns))
 
     def generate_rows(self):
@@ -1576,6 +1580,12 @@ class MaterializedDelimitedFileState(MaterializedState):
 
         self.can_store_as_cached = None
 
+        # Non-file sources (currently data streams) can have content which is not
+        # uniquely identified by their size/modification-time. Such a source provides
+        # a session-unique identity which is included in its content signature, so
+        # separate streams never collide through the qcatalog.
+        self.content_signature_identity = None
+
     def get_materialized_state_type(self):
         return MaterializedStateType.DELIMITED_FILE
 
@@ -1658,7 +1668,8 @@ class MaterializedDelimitedFileState(MaterializedState):
         xprint("Target sqlite table name is %s" % target_sqlite_table_name)
         # Create the matching database table and populate it
         table_creator = TableCreator(self.qtable_name, self.delimited_file_reader,self.input_params, sqlite_db=database_info.sqlite_db,
-                                     target_sqlite_table_name=target_sqlite_table_name)
+                                     target_sqlite_table_name=target_sqlite_table_name,
+                                     content_signature_identity=self.content_signature_identity)
         table_creator.perform_analyze(self.dialect_id)
         xprint("after perform_analyze")
         self.content_signature = table_creator._generate_content_signature()
@@ -1722,17 +1733,44 @@ class MaterializedDelimitedFileState(MaterializedState):
         content_signature_key = self.db_to_use.calculate_content_signature_key(content_signature)
         xprint("table creator signature key: %s" % content_signature_key)
 
-        relevant_table = self.db_to_use.get_from_qcatalog(content_signature)['temp_table_name']
+        # Analysis has just created this table and registered it in the qcatalog
+        relevant_table = self.target_table_name
 
-        if not stop_after_analysis:
-            table_creator.perform_read_fully(self.dialect_id)
+        try:
+            if not stop_after_analysis:
+                table_creator.perform_read_fully(self.dialect_id)
 
-            self.save_cache_to_disk_if_needed(disk_db_filename, table_creator)
-
-
-        self.delimited_file_reader.close_file()
+                self.save_cache_to_disk_if_needed(disk_db_filename, table_creator)
+        except Exception:
+            # A partially-read table must never be exposed as success. Remove it and
+            # its catalog entry, so no reference in this session sees partial data.
+            self.abort_partial_read(table_creator, relevant_table)
+            raise
+        finally:
+            self.delimited_file_reader.close_file()
 
         return database_info, relevant_table
+
+    def abort_partial_read(self, table_creator, table_name):
+        xprint("Read failed - rolling back partial materialization of %s" % table_name)
+        try:
+            content_signature = table_creator.content_signature
+            if content_signature is not None:
+                content_signature_key = self.db_to_use.calculate_content_signature_key(content_signature)
+                self.db_to_use.execute_and_fetch(
+                    "DELETE FROM %s WHERE content_signature_key = ? and temp_table_name = ?" % self.db_to_use.QCATALOG_TABLE_NAME,
+                    (content_signature_key,table_name))
+        except Exception:
+            xprint("Could not remove qcatalog entry after failed read")
+        try:
+            if table_name is not None:
+                self.db_to_use.drop_table(table_name)
+        except Exception:
+            xprint("Could not drop partially-read table %s" % table_name)
+        try:
+            self.db_to_use.conn.commit()
+        except Exception:
+            xprint("Could not commit rollback of failed read")
 
     def save_cache_to_disk_if_needed(self, disk_db_filename, table_creator):
         if len(self.atomic_fns) > 1:
@@ -1785,6 +1823,7 @@ class MaterialiedDataStreamState(MaterializedDelimitedFileState):
 
         self.source_type = self.table_source_type
         self.source = self.data_stream.stream_id
+        self.content_signature_identity = '%s:%s' % (self.data_stream.stream_id, self.data_stream.get_identity())
 
         self.delimited_file_reader = DelimitedFileReader([], self.input_params, self.dialect_id, f=self.data_stream.stream,external_f_name=self.source)
 
@@ -2108,10 +2147,12 @@ class TableCreator(object):
         return "TableCreator<%s>" % str(self)
     __repr__ = __str__
 
-    def __init__(self, qtable_name, delimited_file_reader,input_params,sqlite_db=None,target_sqlite_table_name=None):
+    def __init__(self, qtable_name, delimited_file_reader,input_params,sqlite_db=None,target_sqlite_table_name=None,
+                 content_signature_identity=None):
 
         self.qtable_name = qtable_name
         self.delimited_file_reader = delimited_file_reader
+        self.content_signature_identity = content_signature_identity
 
         self.db_id = sqlite_db.db_id
 
@@ -2163,6 +2204,8 @@ class TableCreator(object):
             "original_file_size": size,
             "last_modification_time": last_modification_time
         })
+        if self.content_signature_identity is not None:
+            m["stream_identity"] = self.content_signature_identity
 
         return m
 
@@ -2505,6 +2548,12 @@ class DataStream(object):
         self.filename = filename
         self.stream = stream
 
+    def get_identity(self):
+        # A stream can be referenced through multiple names in the same session (e.g. for
+        # a self-join). The identity is the underlying stream object, so all references
+        # to the same non-rewindable input share a single materialization.
+        return id(self.stream)
+
     def __str__(self):
         return "QDataStream<stream_id=%s,filename=%s,stream=%s>" % (self.stream_id,self.filename,self.stream)
     __repr__ = __str__
@@ -2549,6 +2598,11 @@ class QTextAsData(object):
 
         self.loaded_table_structures_dict = OrderedDict()
         self.databases = OrderedDict()
+
+        # Data streams can be non-rewindable, so each underlying stream is read at most once
+        # per session. Maps stream identity -> materialized table structure, or the exception
+        # that occurred while reading it (so all references see the same failure).
+        self.data_stream_table_structures = OrderedDict()
 
         if data_streams_dict is not None:
             self.data_streams = DataStreams(data_streams_dict)
@@ -2714,9 +2768,13 @@ class QTextAsData(object):
 
         xprint("MFS to load: %s" % mfs)
 
+        # The same qtable (e.g. a file or a stream name) is loaded only once per session
         if qtable_name in self.loaded_table_structures_dict.keys():
-            xprint("Atomic filename %s found. no need to load" % qtable_name)
+            xprint("%s found. no need to load" % qtable_name)
             return None
+
+        if mfs.get_materialized_state_type() == MaterializedStateType.DATA_STREAM:
+            return self._load_data_stream(qtable_name, mfs, input_params, dialect_id, stop_after_analysis)
 
         xprint("qtable %s not found - loading" % qtable_name)
 
@@ -2728,6 +2786,51 @@ class QTextAsData(object):
         self.loaded_table_structures_dict[qtable_name] = mfs.mfs_structure
 
         return mfs.mfs_structure
+
+    def _load_data_stream(self,qtable_name, mfs, input_params, dialect_id, stop_after_analysis):
+        stream_identity = mfs.data_stream.get_identity()
+
+        cached = self.data_stream_table_structures.get(stream_identity)
+        if cached is not None:
+            if isinstance(cached, Exception):
+                xprint("Stream %s has already failed in this session. Propagating the failure" % mfs.data_stream)
+                raise cached
+
+            # A different reference to the same underlying stream. It must not be read
+            # again (streams may not be rewindable), so it reuses the materialized table.
+            xprint("Stream %s has already been materialized. Reusing it for reference %s" % (mfs.data_stream,qtable_name))
+            self.loaded_table_structures_dict[qtable_name] = self.create_table_structure_alias(cached, qtable_name)
+            return None
+
+        try:
+            self._load_mfs(mfs, input_params, dialect_id, stop_after_analysis)
+            xprint("Loaded stream: source-type %s source %s mfs_structure %s" % (mfs.source_type, mfs.source, mfs.mfs_structure))
+        except Exception as e:
+            # All references to this stream must fail, not just the one that read it
+            self.data_stream_table_structures[stream_identity] = e
+            raise
+
+        # Only a full read may be shared with other references. An analysis read
+        # consumes just part of the stream, so it must not be presented as the
+        # complete table to a second reference.
+        if not stop_after_analysis:
+            self.data_stream_table_structures[stream_identity] = mfs.mfs_structure
+
+        self.loaded_table_structures_dict[qtable_name] = mfs.mfs_structure
+
+        return mfs.mfs_structure
+
+    def create_table_structure_alias(self, table_structure, qtable_name):
+        return MaterializedStateTableStructure(qtable_name,
+                                               table_structure.atomic_fns,
+                                               table_structure.db_id,
+                                               table_structure.column_names,
+                                               table_structure.python_column_types,
+                                               table_structure.sqlite_column_types,
+                                               table_structure.get_table_name_for_querying(),
+                                               table_structure.source_type,
+                                               table_structure.source,
+                                               table_structure.planned_table_name)
 
     def already_attached_to_query_level_db(self,db_to_attach):
         attached_dbs = list(map(lambda x:x[1],self.query_level_db.get_sqlite_database_list()))

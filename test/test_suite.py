@@ -5540,6 +5540,90 @@ class BasicModuleTests(AbstractQTestCase):
 
         q.done()
 
+    def test_data_stream_aliased_twice_sees_same_original_rows(self):
+        data_streams_dict = {
+            'a': DataStream('stream-id','a',six.StringIO('1,x\n1,x\n2,y\n'))
+        }
+        q = QTextAsData(QInputParams(delimiter=','),data_streams_dict=data_streams_dict)
+
+        r = q.execute('select a.c1,a.c2,b.c1,b.c2 from a a join a b on (a.c1 = b.c1)')
+
+        self.assertTrue(r.status == 'ok')
+        self.assertTrue(r.error is None)
+        # Two identical rows for key 1 must produce four pairs, plus one pair for key 2
+        self.assertEqual(len(r.data),5)
+        self.assertEqual(len([x for x in r.data if x[0] == 1]),4)
+        self.assertEqual([x for x in r.data if x[0] == 2],[(2,'y',2,'y')])
+        self.assertEqual(r.metadata.table_structures['a'].get_table_name_for_querying(),'data_stream_stream_dash_id')
+
+        q.done()
+
+    def test_two_data_streams_with_identical_content_do_not_collide(self):
+        data_streams_dict = {
+            'a': DataStream('a','a',six.StringIO('1,x\n2,y\n')),
+            'b': DataStream('b','b',six.StringIO('1,x\n2,y\n'))
+        }
+        q = QTextAsData(QInputParams(delimiter=','),data_streams_dict=data_streams_dict)
+
+        r1 = q.execute('select * from a')
+        r2 = q.execute('select * from b')
+
+        self.assertTrue(r1.status == 'ok')
+        self.assertTrue(r1.error is None)
+        self.assertEqual(r1.data,[(1,'x'),(2,'y')])
+        self.assertTrue(r2.status == 'ok')
+        self.assertTrue(r2.error is None)
+        self.assertEqual(r2.data,[(1,'x'),(2,'y')])
+        self.assertEqual(r2.metadata.table_structures['b'].get_table_name_for_querying(),'data_stream_b')
+
+        q.done()
+
+    def test_separate_sessions_with_same_stream_id_do_not_share_data(self):
+        q1 = QTextAsData(QInputParams(delimiter=','),data_streams_dict={
+            '-': DataStream('stdin','-',six.StringIO('1,x\n'))
+        })
+        r1 = q1.execute('select * from -')
+        q1.done()
+
+        q2 = QTextAsData(QInputParams(delimiter=','),data_streams_dict={
+            '-': DataStream('stdin','-',six.StringIO('9,z\n'))
+        })
+        r2 = q2.execute('select * from -')
+        q2.done()
+
+        self.assertEqual(r1.data,[(1,'x')])
+        self.assertEqual(r2.data,[(9,'z')])
+
+    def test_data_stream_failure_is_shared_by_all_references(self):
+        class FailingStream(six.StringIO):
+            def __init__(self,data,max_lines):
+                super(FailingStream,self).__init__(data)
+                self.lines_read = 0
+                self.max_lines = max_lines
+
+            def readline(self,*args,**kwargs):
+                self.lines_read += 1
+                if self.lines_read > self.max_lines:
+                    raise IOError('input ended unexpectedly')
+                return super(FailingStream,self).readline(*args,**kwargs)
+
+        stream = FailingStream('1,x\n2,y\n3,z\n4,w\n',2)
+        data_streams_dict = {
+            'a': DataStream('a','a',stream),
+            'b': DataStream('b','b',stream)
+        }
+        q = QTextAsData(QInputParams(delimiter=','),data_streams_dict=data_streams_dict)
+
+        r1 = q.execute('select * from a')
+        self.assertEqual(r1.status,'error')
+
+        r2 = q.execute('select count(*) from a b')
+        self.assertEqual(r2.status,'error')
+
+        q.done()
+        # The engine must not close a caller-owned stream
+        self.assertFalse(stream.closed)
+
 
 
 class BenchmarkAttemptResults(object):
