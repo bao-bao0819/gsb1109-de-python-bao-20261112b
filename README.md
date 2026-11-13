@@ -77,6 +77,39 @@ For example, GPX 1.0 specified a `speed` attribute for every track point, but th
 
 gpx.py preserves GPX extensions. They are stored as [ElementTree](https://docs.python.org/2/library/xml.etree.elementtree.html#module-xml.etree.ElementTree) DOM objects. Extensions are part of GPX 1.1, and will be ignored when serializing a GPX object in a GPX 1.0 file.
 
+### Typed extension observations
+
+Different vendors can use the same extension element name (for example `temp`) for different measurements (reefer vs. engine temperature). `gpxpy.parse_observations` extracts extension leaves into a typed observation table by matching on the namespace URI and the full element hierarchy, not on the literal XML prefix. Because paths are canonicalized to [Clark notation](https://docs.python.org/3/library/xml.etree.elementtree.html#xml.etree.ElementTree.QName), re-binding a prefix mid-document or renaming every prefix in the file yields exactly the same business columns.
+
+A column mapping declares the namespaced path, value type and units; values are converted to the target unit and the source/channel plus the raw source text are kept on every row so contradictory values stay traceable. Unmapped extension leaves are returned with their original XML fragment so the mapping can be completed later:
+
+    import gpxpy
+
+    cold_ns = 'https://vendor-cold.example.com/telemetry/1'
+    engine_ns = 'https://vendor-engine.example.com/telemetry/1'
+
+    columns = [
+        # Clark notation: no prefix map needed
+        {'name': 'fridge_temperature_c',
+         'path': f'{{{cold_ns}}}telemetry/{{{cold_ns}}}temp',
+         'unit': 'C', 'source': 'vendor-cold', 'channel': 'fridge'},
+        # prefixed notation resolved through prefix_map
+        {'name': 'engine_temperature_c', 'path': 'b:engine/b:temp',
+         'unit': 'C', 'source_unit': 'F',
+         'source': 'vendor-engine', 'channel': 'engine'},
+    ]
+
+    with open('track.gpx') as gpx_file:
+        table = gpxpy.parse_observations(
+            gpx_file, columns,
+            prefix_map={'b': engine_ns, 'c': cold_ns})
+
+    print(table.column_names())   # ['fridge_temperature_c', 'engine_temperature_c']
+    print(table.to_rows())        # long-format typed observations
+    print(table.unknown[0].fragment)  # raw XML of an unmapped extension
+
+Two `temp` leaves on the same point are kept as two rows on different business columns. If several sources write the *same* column, `table.find_conflicts()` returns the groups whose normalized values still disagree after unit conversion.
+
 ## XML parsing
 
 The GPX version is automatically determined when parsing by reading the version attribute in the gpx node. If this attribute is not present then the version is assumed to be 1.0. A specific version can be forced by setting the `version` parameter in the parse function. Possible values for the 'version' parameter are `1.0`, `1.1` and `None`.

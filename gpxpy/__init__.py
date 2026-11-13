@@ -34,3 +34,16 @@ def parse(xml_or_file: AnyStr | IO[str], version: str | None = None) -> mod_gpx.
     parser = mod_parser.GPXParser(xml_or_file)
 
     return parser.parse(version)
+
+
+from .observations import (  # noqa: E402
+    ObservationColumn,
+    ObservationMapping,
+    ObservationRow,
+    ObservationTable,
+    UnknownExtension,
+    PointContext,
+    extract_observations,
+    parse_observations,
+    register_unit_converter,
+)

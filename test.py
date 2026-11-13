@@ -3724,5 +3724,220 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
 
+class ObservationTests(mod_unittest.TestCase):
+    COLD_NS = 'https://vendor-cold.example.com/telemetry/1'
+    ENGINE_NS = 'https://vendor-engine.example.com/telemetry/1'
+
+    def _mapping(self, prefix_cold: str, prefix_engine: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                'name': 'fridge_temperature_c',
+                'path': f'{prefix_cold}:telemetry/{prefix_cold}:temp',
+                'unit': 'C',
+                'source_unit': 'C',
+                'value_type': 'float',
+                'source': 'vendor-cold',
+                'channel': 'fridge',
+            },
+            {
+                'name': 'engine_temperature_c',
+                'path': f'{prefix_engine}:engine/{prefix_engine}:temp',
+                'unit': 'C',
+                'source_unit': 'F',
+                'value_type': 'float',
+                'source': 'vendor-engine',
+                'channel': 'engine',
+            },
+            {
+                'name': 'engine_rpm',
+                'path': f'{prefix_engine}:engine/{prefix_engine}:rpm',
+                'value_type': 'int',
+                'source': 'vendor-engine',
+                'channel': 'engine',
+            },
+        ]
+
+    def test_multivendor_typed_observations(self) -> None:
+        prefix_map = {'a': self.COLD_NS, 'b': self.ENGINE_NS,
+                      'c': self.COLD_NS}
+        with open('test_files/multivendor_telemetry.gpx') as gpx_file:
+            table = mod_gpxpy.parse_observations(
+                gpx_file, self._mapping('a', 'b'), prefix_map=prefix_map)
+
+        self.assertEqual(['fridge_temperature_c', 'engine_temperature_c',
+                          'engine_rpm'], table.column_names())
+
+        rows = table.to_rows()
+        # 2 fridge temps + 2 engine track temps + 1 engine waypoint temp + rpm
+        self.assertEqual(6, len(rows))
+
+        fridge = table.rows_for('fridge_temperature_c')
+        self.assertEqual([-18.5, -17.0], [row.value for row in fridge])
+        self.assertTrue(all(row.unit == 'C' for row in fridge))
+        self.assertTrue(all(row.channel == 'fridge' for row in fridge))
+        self.assertTrue(all(row.source == 'vendor-cold' for row in fridge))
+
+        engine = table.rows_for('engine_temperature_c')
+        # 194 F, 203 F (track) and 180 F (waypoint) normalized to Celsius
+        self.assertAlmostEqual((194.0 - 32.0) * 5.0 / 9.0, engine[0].value)
+        self.assertAlmostEqual((203.0 - 32.0) * 5.0 / 9.0, engine[1].value)
+        self.assertAlmostEqual((180.0 - 32.0) * 5.0 / 9.0, engine[2].value)
+        self.assertTrue(all(row.unit == 'C' for row in engine))
+        self.assertTrue(all(row.source_unit == 'F' for row in engine))
+        # Raw source text and origin survive the conversion
+        self.assertEqual('194.0', engine[0].raw_value)
+        self.assertEqual('wpt', engine[2].as_dict()['kind'])
+
+        rpm = table.rows_for('engine_rpm')
+        self.assertEqual(1, len(rpm))
+        self.assertEqual(2200, rpm[0].value)
+        self.assertIsInstance(rpm[0].value, int)
+
+        # Every source path is prefix-independent Clark notation, including
+        # for the point where the c: prefix was re-bound mid-document
+        expected_paths = {
+            f'{{{self.COLD_NS}}}telemetry/{{{self.COLD_NS}}}temp',
+            f'{{{self.ENGINE_NS}}}engine/{{{self.ENGINE_NS}}}temp',
+            f'{{{self.ENGINE_NS}}}engine/{{{self.ENGINE_NS}}}rpm',
+        }
+        self.assertEqual(expected_paths,
+                         {row.source_path for row in table.rows})
+
+    def test_same_point_two_temp_channels(self) -> None:
+        prefix_map = {'a': self.COLD_NS, 'b': self.ENGINE_NS}
+        with open('test_files/multivendor_telemetry.gpx') as gpx_file:
+            table = mod_gpxpy.parse_observations(
+                gpx_file, self._mapping('a', 'b'), prefix_map=prefix_map)
+
+        first_point = table.rows[0].context.point
+        point_rows = [row for row in table.rows
+                      if row.context.point is first_point]
+        columns = {row.column.name for row in point_rows}
+        self.assertEqual({'fridge_temperature_c', 'engine_temperature_c'},
+                         columns)
+        channels = {row.channel for row in point_rows}
+        self.assertEqual({'fridge', 'engine'}, channels)
+        # Different business columns -> no conflict reported
+        self.assertEqual([], table.find_conflicts())
+
+    def test_conflicting_values_keep_provenance(self) -> None:
+        # Both vendor temps land in one shared business column; after unit
+        # normalization they still disagree and both sources must be kept.
+        columns = [
+            mod_gpxpy.ObservationColumn(
+                name='temperature_c',
+                path=f'{{{self.COLD_NS}}}telemetry/{{{self.COLD_NS}}}temp',
+                unit='C', source='vendor-cold', channel='fridge'),
+            mod_gpxpy.ObservationColumn(
+                name='temperature_c',
+                path=f'{{{self.ENGINE_NS}}}engine/{{{self.ENGINE_NS}}}temp',
+                unit='C', source_unit='F',
+                source='vendor-engine', channel='engine'),
+        ]
+        with open('test_files/multivendor_telemetry.gpx') as gpx_file:
+            table = mod_gpxpy.parse_observations(gpx_file, columns)
+
+        conflicts = table.find_conflicts()
+        self.assertEqual(2, len(conflicts))  # two track points carry both
+        first_conflict = conflicts[0]
+        self.assertEqual(2, len(first_conflict))
+        sources = {row.source for row in first_conflict}
+        self.assertEqual({'vendor-cold', 'vendor-engine'}, sources)
+        for row in first_conflict:
+            self.assertIsNotNone(row.raw_value)
+            self.assertEqual('temperature_c', row.column.name)
+
+    def test_unknown_extensions_keep_fragment(self) -> None:
+        prefix_map = {'a': self.COLD_NS, 'b': self.ENGINE_NS}
+        with open('test_files/multivendor_telemetry.gpx') as gpx_file:
+            table = mod_gpxpy.parse_observations(
+                gpx_file, self._mapping('a', 'b'), prefix_map=prefix_map)
+
+        # Only the second track point has an unmapped diag/code leaf
+        self.assertEqual(1, len(table.unknown))
+        unknown = table.unknown[0]
+        code_path = f'{{{self.ENGINE_NS}}}engine/{{{self.ENGINE_NS}}}diag/{{{self.ENGINE_NS}}}code'
+        self.assertIn(code_path, unknown.paths)
+        self.assertIn('E07', unknown.fragment)
+        self.assertIn(self.ENGINE_NS, unknown.fragment)
+
+    def test_prefix_rebinding_and_reprefixing_are_equivalent(self) -> None:
+        # File A uses a/b (and re-binds c mid-document), file B uses
+        # cold/eng. Business columns and values must come out identical.
+        with open('test_files/multivendor_telemetry.gpx') as gpx_file:
+            table_a = mod_gpxpy.parse_observations(
+                gpx_file, self._mapping('a', 'b'),
+                prefix_map={'a': self.COLD_NS, 'b': self.ENGINE_NS,
+                            'c': self.COLD_NS})
+        with open('test_files/multivendor_telemetry_reprefixed.gpx') as gpx_file:
+            table_b = mod_gpxpy.parse_observations(
+                gpx_file, self._mapping('cold', 'eng'),
+                prefix_map={'cold': self.COLD_NS, 'eng': self.ENGINE_NS})
+
+        rows_a = sorted((row.column.name, row.value, row.channel,
+                         row.source_path, row.context.track_no,
+                         row.context.segment_no, row.context.point_no)
+                        for row in table_a.rows)
+        rows_b = sorted((row.column.name, row.value, row.channel,
+                         row.source_path, row.context.track_no,
+                         row.context.segment_no, row.context.point_no)
+                        for row in table_b.rows)
+        self.assertEqual(rows_a, rows_b)
+        self.assertEqual(table_a.column_names(), table_b.column_names())
+
+        # Clark-notation paths need no prefix map at all
+        clark_columns = [
+            mod_gpxpy.ObservationColumn(
+                'fridge_temperature_c',
+                f'{{{self.COLD_NS}}}telemetry/{{{self.COLD_NS}}}temp',
+                unit='C'),
+            mod_gpxpy.ObservationColumn(
+                'engine_temperature_c',
+                f'{{{self.ENGINE_NS}}}engine/{{{self.ENGINE_NS}}}temp',
+                unit='C', source_unit='F'),
+        ]
+        with open('test_files/multivendor_telemetry.gpx') as gpx_file:
+            clark_a = mod_gpxpy.parse_observations(gpx_file, clark_columns)
+        with open('test_files/multivendor_telemetry_reprefixed.gpx') as gpx_file:
+            clark_b = mod_gpxpy.parse_observations(gpx_file, clark_columns)
+        self.assertEqual([r.as_dict()['value'] for r in clark_a.rows],
+                         [r.as_dict()['value'] for r in clark_b.rows])
+
+    def test_path_normalization(self) -> None:
+        observations = mod_gpxpy.observations
+        prefix_map = {'a': 'urn:ns:a', 'b': 'urn:ns:b'}
+        self.assertEqual(
+            '{urn:ns:a}x/{urn:ns:b}y',
+            observations.normalize_path('a:x/b:y', prefix_map))
+        self.assertEqual(
+            '{urn:ns:a}x/{urn:ns:b}y',
+            observations.normalize_path('{urn:ns:a}x/{urn:ns:b}y',
+                                        prefix_map))
+        self.assertEqual('bare/leaf',
+                         observations.normalize_path('bare/leaf', prefix_map))
+        with self.assertRaises(ValueError):
+            observations.normalize_path('unknown:x', prefix_map)
+
+    def test_unit_conversion_helpers(self) -> None:
+        observations = mod_gpxpy.observations
+        self.assertAlmostEqual(0.0, observations.convert_value(32.0, 'F', 'C'))
+        self.assertAlmostEqual(100.0, observations.convert_value(212.0, 'F', 'C'))
+        self.assertEqual(5.0, observations.convert_value(5.0, None, 'C'))
+        self.assertEqual(5.0, observations.convert_value(5.0, 'C', 'C'))
+        with self.assertRaises(ValueError):
+            observations.convert_value(1.0, 'X', 'Y')
+        observations.register_unit_converter(
+            'X', 'Y', lambda value: value * 2.0)
+        self.assertEqual(4.0, observations.convert_value(2.0, 'X', 'Y'))
+
+    def test_mapping_rejects_duplicate_path(self) -> None:
+        columns = [
+            {'name': 'one', 'path': '{urn:ns}x/{urn:ns}temp'},
+            {'name': 'two', 'path': '{urn:ns}x/{urn:ns}temp'},
+        ]
+        with self.assertRaises(ValueError):
+            mod_gpxpy.ObservationMapping(columns)
+
+
 if __name__ == '__main__':
     mod_unittest.main()
