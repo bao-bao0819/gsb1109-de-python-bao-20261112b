@@ -48,6 +48,37 @@ Basic example
         print(entry.msgid, entry.msgstr)
 
 
+Building a byte-bounded slim catalog (``moslim``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Devices sometimes only allow a fixed number of bytes for the compiled
+``.mo`` file. ``moslim.py`` builds a loadable catalog that is guaranteed to
+fit: required entries are kept first (a plural message always ships with
+all of its branches), then the remaining entries are admitted by offline
+usage count while the real compiled size stays within the limit.
+
+.. code:: bash
+
+    $ python moslim.py app.po slim.mo --max-bytes 2048 \
+        --required "Save" --required "menu\x04Open" --usage usage.txt
+
+The ``usage.txt`` file holds one ``key = count`` line per msgid (contextual
+keys use the literal ``\x04`` separator). If the required closure alone is
+bigger than the budget, nothing is written and its compiled size is printed
+instead. The same logic is available programmatically:
+
+.. code:: python
+
+    import moslim
+
+    entries, report = moslim.build_slim_catalog(
+        polib.pofile('app.po'), max_bytes=2048,
+        required_keys=['Save'], usage={'Cancel': 12},
+    )
+    if entries is None:
+        print('closure alone needs', report['required_size'], 'bytes')
+
+
 .. |build-status-image| image:: https://api.travis-ci.com/izimobil/polib.svg?branch=master
    :target: https://app.travis-ci.com/github/izimobil/polib
    :alt: Travis build
