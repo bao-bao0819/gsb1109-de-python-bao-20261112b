@@ -14,6 +14,7 @@ Reference
     runners-hadoop.rst
     runners-inline.rst
     job.rst
+    framing.rst
     runners-local.rst
     utils-parse.rst
     protocols.rst
