@@ -61,6 +61,8 @@ API
 
 .. autofunction:: agatesql.table.sql_query
 
+.. autofunction:: agatesql.audit.audit_amount_column
+
 Authors
 =======
 
