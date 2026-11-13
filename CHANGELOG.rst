@@ -1,3 +1,8 @@
+Unreleased
+----------
+
+* feat: Add a ``merge_by_version`` option to :meth:`.Table.to_sql` for SQLite. Rows are reconciled by key and source version: identical re-sends are stored once, different content for the same version is quarantined in a conflict table instead of being applied, and a cancellation at the latest version removes the row. The set-based merge is unaffected by row order or chunk boundaries.
+
 0.7.3 - December 15, 2025
 -------------------------
 

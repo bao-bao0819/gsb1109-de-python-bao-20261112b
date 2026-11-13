@@ -2,7 +2,7 @@ from decimal import Decimal
 from textwrap import dedent
 
 import agate
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 import agatesql
@@ -273,6 +273,231 @@ class TestSQL(agate.AgateTestCase):
             actual = sum(r[0] for r in table.rows)
             self.assertEqual(len(table.rows), len(rows))
             self.assertEqual(expected, actual)
+        finally:
+            connection.close()
+            engine.dispose()
+
+
+class TestVersionedMerge(agate.AgateTestCase):
+    def setUp(self):
+        self.column_names = ['order_no', 'version', 'action', 'price']
+        self.column_types = [agate.Text(), agate.Number(), agate.Text(), agate.Number()]
+        self.connection_string = 'sqlite:///:memory:'
+
+    def _table(self, rows):
+        return agate.Table(rows, self.column_names, self.column_types)
+
+    def _merge(self, connection, rows, **kwargs):
+        self._table(rows).to_sql(
+            connection, 'orders', overwrite=True,
+            merge_by_version=True, key_columns=['order_no'], **kwargs)
+
+    def _business_rows(self, connection):
+        return connection.execute(
+            text('SELECT order_no, version, action, price FROM orders ORDER BY order_no')
+        ).all()
+
+    def _conflict_rows(self, connection):
+        return connection.execute(
+            text('SELECT order_no, version, action, price, conflict_reason '
+                 'FROM orders_conflicts ORDER BY order_no, price')
+        ).all()
+
+    def test_exact_resend_is_stored_once(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            self._merge(connection, (
+                ('A', 1, 'insert', 10),
+                ('A', 1, 'insert', 10),
+                ('B', 2, 'insert', 20),
+            ))
+
+            self.assertEqual(self._business_rows(connection), [
+                ('A', 1, 'insert', 10),
+                ('B', 2, 'insert', 20),
+            ])
+            self.assertEqual(self._conflict_rows(connection), [])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_two_prices_for_same_version_are_quarantined(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            # The two prices arrive in either order; neither may win by position.
+            self._merge(connection, (
+                ('A', 1, 'insert', 10),
+                ('A', 1, 'insert', 11),
+            ))
+
+            self.assertEqual(self._business_rows(connection), [])
+            self.assertEqual([row[:4] for row in self._conflict_rows(connection)], [
+                ('A', 1, 'insert', 10),
+                ('A', 1, 'insert', 11),
+            ])
+
+            self._merge(connection, (
+                ('A', 1, 'insert', 11),
+                ('A', 1, 'insert', 10),
+            ))
+
+            self.assertEqual(self._business_rows(connection), [])
+            self.assertEqual([row[:4] for row in self._conflict_rows(connection)], [
+                ('A', 1, 'insert', 10),
+                ('A', 1, 'insert', 11),
+            ])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_conflict_on_old_version_does_not_block_newer_version(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            self._merge(connection, (
+                ('A', 1, 'insert', 10),
+                ('A', 1, 'insert', 11),
+                ('A', 2, 'insert', 30),
+            ))
+
+            self.assertEqual(self._business_rows(connection), [
+                ('A', 2, 'insert', 30),
+            ])
+            self.assertEqual([row[:4] for row in self._conflict_rows(connection)], [
+                ('A', 1, 'insert', 10),
+                ('A', 1, 'insert', 11),
+            ])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_cancel_before_earlier_versions_keeps_order_out_of_table(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            # Cancellation of the newest version is received before the older
+            # orders it cancels.
+            self._merge(connection, (
+                ('A', 3, 'cancel', None),
+                ('A', 1, 'insert', 10),
+                ('A', 2, 'insert', 12),
+            ))
+
+            self.assertEqual(self._business_rows(connection), [])
+            self.assertEqual(self._conflict_rows(connection), [])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_merge_result_is_independent_of_chunking_and_row_order(self):
+        rows = (
+            ('A', 1, 'insert', 10),
+            ('A', 1, 'insert', 11),
+            ('B', 1, 'insert', 5),
+            ('B', 1, 'insert', 6),
+            ('C', 1, 'insert', 9),
+        )
+
+        results = []
+        for chunk_size in (None, 1, 2):
+            engine = create_engine(self.connection_string)
+            connection = engine.connect()
+            try:
+                self._table(rows).to_sql(
+                    connection, 'orders', overwrite=True, chunk_size=chunk_size,
+                    merge_by_version=True, key_columns=['order_no'])
+                results.append((self._business_rows(connection), self._conflict_rows(connection)))
+            finally:
+                connection.close()
+                engine.dispose()
+
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+        try:
+            self._table(tuple(reversed(rows))).to_sql(
+                connection, 'orders', overwrite=True, chunk_size=2,
+                merge_by_version=True, key_columns=['order_no'])
+            results.append((self._business_rows(connection), self._conflict_rows(connection)))
+        finally:
+            connection.close()
+            engine.dispose()
+
+        for result in results[1:]:
+            self.assertEqual(result, results[0])
+
+        business_rows, conflict_rows = results[0]
+        self.assertEqual(business_rows, [('C', 1, 'insert', 9)])
+        self.assertEqual([row[:4] for row in conflict_rows], [
+            ('A', 1, 'insert', 10),
+            ('A', 1, 'insert', 11),
+            ('B', 1, 'insert', 5),
+            ('B', 1, 'insert', 6),
+        ])
+
+    def test_newer_version_updates_and_older_version_cannot_downgrade(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            self._table((('A', 1, 'insert', 10),)).to_sql(
+                connection, 'orders',
+                merge_by_version=True, key_columns=['order_no'])
+            self._table((('A', 2, 'insert', 15),)).to_sql(
+                connection, 'orders', create=False,
+                merge_by_version=True, key_columns=['order_no'])
+            self._table((('A', 1, 'insert', 99),)).to_sql(
+                connection, 'orders', create=False,
+                merge_by_version=True, key_columns=['order_no'])
+
+            self.assertEqual(
+                connection.execute(text('SELECT version, price FROM orders')).all(),
+                [(2, 15)])
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_target_table_has_unique_constraint_on_key(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            self._merge(connection, (('A', 1, 'insert', 10),))
+
+            with self.assertRaises(IntegrityError):
+                connection.execute(text(
+                    "INSERT INTO orders (order_no, version, action, price) "
+                    "VALUES ('A', 9, 'insert', 1)"))
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_key_columns_are_required(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            with self.assertRaises(ValueError):
+                self._table((('A', 1, 'insert', 10),)).to_sql(
+                    connection, 'orders', merge_by_version=True)
+        finally:
+            connection.close()
+            engine.dispose()
+
+    def test_invalid_action_is_rejected(self):
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        try:
+            with self.assertRaises(ValueError):
+                self._table((('A', 1, 'unknown', 10),)).to_sql(
+                    connection, 'orders', merge_by_version=True,
+                    key_columns=['order_no'])
         finally:
             connection.close()
             engine.dispose()
