@@ -15,6 +15,9 @@
 from typing import IO, AnyStr
 
 from . import gpx as mod_gpx
+from . import separation as mod_separation
+from .separation import PlanarPoint, CoverageInterval, SeparationReport
+from .separation import calculate_separation, separation_exceedance_seconds
 
 __version__ = '1.6.2'
 

@@ -116,6 +116,42 @@ Additional command-line tools for GPX files can be downloaded here <https://gith
 pip install gpx-cmd-tools
 ```
 
+## Two-track separation cross-check
+
+When two devices on the same vehicle sample at different rates, a separation
+report must be built from the time interval both tracks actually cover. The
+`gpxpy.separation` module takes samples already expressed in a common local
+planar coordinate system (`x`/`y`, usually metres) and interpolates positions
+linearly in time between consecutive samples.
+
+```python
+import datetime
+import gpxpy.separation
+
+t0 = datetime.datetime(2026, 1, 1, 8, 0, 0)
+fast = [(t0, 0.0, 0.0), (t0 + datetime.timedelta(seconds=40), 200.0, 0.0),
+        (t0 + datetime.timedelta(seconds=100), 500.0, 0.0)]
+slow = [(t0, 0.0, 0.0), (t0 + datetime.timedelta(seconds=100), 0.0, 0.0)]
+
+report = gpxpy.separation.calculate_separation(fast, slow, threshold=100.0)
+report.coverage_seconds      # 100.0 -- shared time coverage only
+report.exceedance_seconds    # 80.0  -- strictly above 100 starts at t=20 s
+report.exceedance_intervals  # the [20 s, 100 s] interval, in datetimes
+```
+
+Guarantees:
+
+- Time outside the intersection of the two valid coverages never contributes.
+  If neither device sampled exactly at a threshold crossing, the crossing is
+  still solved analytically from the linear interpolation (no numeric stepping).
+- Exceedance is strict: separation equal to the threshold is not counted.
+- Swapping `track_a` and `track_b`, or inserting redundant samples on a straight
+  constant-velocity segment, leaves all reported durations identical.
+- `max_gap=` optionally treats long holes between samples as missing coverage
+  rather than interpolating through them.
+
+See `examples/separation/separation_example.py` for hand-checkable cases.
+
 ## License
 
 GPX.py is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)

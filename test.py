@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.separation as mod_separation
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -96,6 +97,12 @@ def equals(object1: Any, object2: Any, ignore: Any=None) -> bool:
 
 def almostEqual(number1: float, number2: float) -> bool:
     return 1 - number1 / number2 < 0.999999
+
+
+def _sep_point(base: mod_datetime.datetime, seconds: float,
+               x: float, y: float=0.0) -> mod_separation.PlanarPoint:
+    return mod_separation.PlanarPoint(
+        base + mod_datetime.timedelta(seconds=seconds), x, y)
 
 
 def get_dom_node(dom: Any, path: str) -> Any:
@@ -3723,6 +3730,202 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    def test_separation_static_vs_moving(self) -> None:
+        # A static at x=0; B moves at 5 units/s from (0,0) to (500,0).
+        # Separation > 100 from t=20s to t=100s => 80s. Neither track has a
+        # sample at t=20 (the crossing), so only interpolation can find it.
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, 0, 0), _sep_point(base, 100, 0)]
+        track_b = [_sep_point(base, 0, 0), _sep_point(base, 40, 200),
+                   _sep_point(base, 80, 400), _sep_point(base, 100, 500)]
+
+        report = mod_separation.calculate_separation(track_a, track_b, 100)
+        self.assertEqual(100, report.coverage_seconds)
+        self.assertAlmostEqual(80, report.exceedance_seconds, places=9)
+        self.assertAlmostEqual(500, report.max_separation, places=9)
+        self.assertEqual(1, len(report.exceedance_intervals))
+        self.assertEqual(_sep_point(base, 20, 0).time, report.exceedance_intervals[0].start_time)
+        self.assertEqual(_sep_point(base, 100, 0).time, report.exceedance_intervals[0].end_time)
+
+    def test_separation_overlap_only_counts_shared_coverage(self) -> None:
+        # A covers [0,100], B covers [30,150]. Shared coverage is [30,100]
+        # = 70s. B is at y=-300 at 30s and y=400 at 100s, so y = 10t-600:
+        # |y|>100 on [30,50) and (70,100] => 20+30 = 50s.
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, 0, 0), _sep_point(base, 100, 0)]
+        track_b = [_sep_point(base, 30, 0, -300), _sep_point(base, 100, 0, 400),
+                   _sep_point(base, 150, 0, 900)]
+
+        report = mod_separation.calculate_separation(track_a, track_b, 100)
+        self.assertEqual(70, report.coverage_seconds)
+        self.assertAlmostEqual(50, report.exceedance_seconds, places=9)
+        self.assertEqual(2, len(report.exceedance_intervals))
+        self.assertEqual(_sep_point(base, 50, 0).time, report.exceedance_intervals[0].end_time)
+        self.assertEqual(_sep_point(base, 70, 0).time, report.exceedance_intervals[1].start_time)
+        self.assertEqual(1, len(report.coverage_intervals))
+        self.assertEqual(_sep_point(base, 30, 0).time, report.coverage_intervals[0].start_time)
+        self.assertEqual(_sep_point(base, 100, 0).time, report.coverage_intervals[0].end_time)
+
+    def test_separation_two_crossings_without_boundary_samples(self) -> None:
+        # Relative x = -300+10t over [0,60]. |x|>100 on (0,20) and (40,60),
+        # so the answer is 40s even though no sample lies at t=20 or t=40.
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, 0, 0), _sep_point(base, 60, 0)]
+        track_b = [_sep_point(base, 0, -300), _sep_point(base, 60, 300)]
+
+        report = mod_separation.calculate_separation(track_a, track_b, 100)
+        self.assertAlmostEqual(40, report.exceedance_seconds, places=9)
+        self.assertEqual(2, len(report.exceedance_intervals))
+        self.assertEqual(_sep_point(base, 20, 0).time, report.exceedance_intervals[0].end_time)
+        self.assertEqual(_sep_point(base, 40, 0).time, report.exceedance_intervals[1].start_time)
+        self.assertAlmostEqual(300, report.max_separation, places=9)
+
+    def test_separation_is_invariant_to_sampling_rate_and_order(self) -> None:
+        # Constant-velocity straight lines; insert redundant samples on A.
+        # Every perturbation must produce the identical duration.
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, 0, 0), _sep_point(base, 100, 500)]
+        track_a_dense = [_sep_point(base, t, 5 * t) for t in (0, 7, 19, 33, 41, 57, 79, 88, 100)]
+        track_b = [_sep_point(base, 5, 25, 60), _sep_point(base, 55, 275, 60),
+                   _sep_point(base, 110, 550, 60)]
+
+        baseline = mod_separation.calculate_separation(track_a, track_b, 50).exceedance_seconds
+        swapped = mod_separation.calculate_separation(track_b, track_a, 50).exceedance_seconds
+        redundant = mod_separation.calculate_separation(track_a_dense, track_b, 50).exceedance_seconds
+        self.assertAlmostEqual(baseline, swapped, places=9)
+        self.assertAlmostEqual(baseline, redundant, places=9)
+        self.assertAlmostEqual(95, baseline, places=9)
+
+    def test_separation_strictly_greater_than_threshold(self) -> None:
+        # Separation is exactly the threshold for the whole shared coverage.
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, 0, 0), _sep_point(base, 60, 0)]
+        track_b = [_sep_point(base, 0, 0, 100), _sep_point(base, 60, 0, 100)]
+
+        report = mod_separation.calculate_separation(track_a, track_b, 100)
+        self.assertEqual(60, report.coverage_seconds)
+        self.assertEqual(0, report.exceedance_seconds)
+        self.assertAlmostEqual(100, report.max_separation, places=9)
+
+    def test_separation_identical_tracks_never_exceed(self) -> None:
+        base = mod_datetime.datetime(2026, 1, 1)
+        track = [_sep_point(base, t, 2 * t, 3 * t) for t in range(0, 101, 5)]
+
+        report = mod_separation.calculate_separation(track, list(track), 0)
+        self.assertEqual(0, report.exceedance_seconds)
+        self.assertEqual(100, report.coverage_seconds)
+
+    def test_separation_gap_removes_coverage(self) -> None:
+        # With max_gap=30s the 50s hole in B is missing coverage, so only
+        # [0,50] and [100,150] are shared: 100s. Without max_gap the hole is
+        # interpolated and the whole [0,150] is covered.
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, seconds, 0) for seconds in range(0, 151, 10)]
+        track_b = ([_sep_point(base, seconds, 0) for seconds in range(0, 51, 10)] +
+                   [_sep_point(base, seconds, 0) for seconds in range(100, 151, 10)])
+
+        gap = mod_datetime.timedelta(seconds=30)
+        report = mod_separation.calculate_separation(track_a, track_b, 200, max_gap=gap)
+        self.assertEqual(100, report.coverage_seconds)
+        self.assertEqual(2, len(report.coverage_intervals))
+
+        report = mod_separation.calculate_separation(track_a, track_b, 200)
+        self.assertEqual(150, report.coverage_seconds)
+
+    def test_separation_no_shared_coverage(self) -> None:
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, 0, 0), _sep_point(base, 40, 0)]
+        track_b = [_sep_point(base, 50, 0, 1000), _sep_point(base, 90, 0, 1000)]
+
+        report = mod_separation.calculate_separation(track_a, track_b, 1)
+        self.assertEqual(0, report.coverage_seconds)
+        self.assertEqual(0, report.exceedance_seconds)
+        self.assertEqual((), report.exceedance_intervals)
+
+    def test_separation_input_validation(self) -> None:
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [_sep_point(base, 0, 0), _sep_point(base, 10, 0)]
+
+        with self.assertRaises(ValueError):
+            mod_separation.calculate_separation(track_a, track_a, -1)
+        with self.assertRaises(ValueError):
+            mod_separation.calculate_separation(track_a, track_a, float('nan'))
+        with self.assertRaises(ValueError):
+            mod_separation.calculate_separation(track_a, track_a, 10,
+                                                   max_gap=mod_datetime.timedelta(0))
+        with self.assertRaises(ValueError):
+            mod_separation.calculate_separation(
+                [_sep_point(base, 0, 0), _sep_point(base, 0, 5)], track_a, 1)
+        with self.assertRaises(ValueError):
+            mod_separation.calculate_separation(
+                [_sep_point(base, 0, 0), _sep_point(base, 10, 0),
+                 _sep_point(base, 20, float('inf'))], track_a, 1)
+
+    def test_separation_multi_segment_never_interpolates_across_gap(self) -> None:
+        # A is split into [0,40] and [80,120]. B covers [0,120] and moves
+        # far away during the hole. If A were interpolated straight from
+        # its 40s point to its 80s point, separation would stay small for
+        # most of the hole and the answer would be wrong.
+        base = mod_datetime.datetime(2026, 1, 1)
+        segment_1 = [_sep_point(base, 0, 0), _sep_point(base, 40, 0)]
+        segment_2 = [_sep_point(base, 80, 0), _sep_point(base, 120, 0)]
+        track_a = [segment_1, segment_2]
+        track_b = [_sep_point(base, 0, 0), _sep_point(base, 40, 0),
+                   _sep_point(base, 80, 0), _sep_point(base, 120, 0)]
+
+        report = mod_separation.calculate_separation(track_a, track_b, 0)
+        self.assertEqual(80, report.coverage_seconds)
+        self.assertEqual(2, len(report.coverage_intervals))
+
+    def test_separation_accepts_segment_objects(self) -> None:
+        base = mod_datetime.datetime(2026, 1, 1)
+
+        class Segment:
+            def __init__(self, points):
+                self.points = points
+
+        class Track:
+            def __init__(self, segments):
+                self.segments = segments
+
+        track_a = Track([Segment([_sep_point(base, 0, 0), _sep_point(base, 60, 0)])])
+        track_b = Track([Segment([_sep_point(base, 0, 0, 100),
+                                  _sep_point(base, 60, 0, 100)])])
+
+        report = mod_separation.calculate_separation(track_a, track_b, 50)
+        self.assertEqual(60, report.coverage_seconds)
+        self.assertEqual(60, report.exceedance_seconds)
+
+    def test_separation_overlapping_segments_rejected(self) -> None:
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [[_sep_point(base, 0, 0), _sep_point(base, 60, 0)],
+                   [_sep_point(base, 30, 0), _sep_point(base, 90, 0)]]
+        track_b = [[_sep_point(base, 0, 0), _sep_point(base, 90, 0)]]
+
+        with self.assertRaises(ValueError):
+            mod_separation.calculate_separation(track_a, track_b, 1)
+
+    def test_separation_accepts_generators(self) -> None:
+        base = mod_datetime.datetime(2026, 1, 1)
+
+        def samples(offset: float):
+            for seconds in (0, 100):
+                yield (base + mod_datetime.timedelta(seconds=seconds), 5 * seconds, offset)
+
+        self.assertAlmostEqual(
+            100,
+            mod_separation.separation_exceedance_seconds(samples(0), samples(60), 50),
+            places=9)
+
+    def test_separation_accepts_time_xy_tuples(self) -> None:
+        base = mod_datetime.datetime(2026, 1, 1)
+        track_a = [(base, 0.0, 0.0), (base + mod_datetime.timedelta(seconds=60), 0.0, 0.0)]
+        track_b = [(base, 0.0, 100.0), (base + mod_datetime.timedelta(seconds=60), 0.0, 100.0)]
+
+        seconds = mod_separation.separation_exceedance_seconds(track_a, track_b, 99)
+        self.assertAlmostEqual(60, seconds, places=9)
+
 
 if __name__ == '__main__':
     mod_unittest.main()

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `gpxpy.separation` for cross-checking threshold-exceedance time between two tracks sampled at different rates, integrating only over their shared time coverage with analytic linear interpolation.
+
 ## v1.6.1
 
 - Minor fix
