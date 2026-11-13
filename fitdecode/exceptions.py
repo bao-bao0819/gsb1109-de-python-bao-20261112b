@@ -14,6 +14,10 @@ class FitCRCError(FitError):
     pass
 
 
+class FitIndexError(FitError):
+    pass
+
+
 class FitEOFError(FitError):
     def __init__(self, expected, got, offset, message=''):
         self.expected = expected  #: number of expected bytes

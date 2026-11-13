@@ -5,6 +5,19 @@ Change Log
 ==========
 
 
+UNRELEASED
+==========
+
+* Added optional record-interval indexing of seekable FIT streams: passing
+  ``index_interval`` to ``FitReader`` builds a ``FitIndex`` of resumable
+  snapshots (message definitions, developer fields and compressed timestamp
+  context) while reading, and passing a ``FitIndexEntry`` (or a ``FitIndex``)
+  as ``resume_from`` makes a new ``FitReader`` continue decoding from a nearby
+  position instead of from the beginning of the file. An index is bound to the
+  content it was built from: a ``FitIndexError`` is raised if the stream has
+  been altered since.
+
+
 v0.11.0 (2025-08-06)
 ====================
 

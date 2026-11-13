@@ -1,7 +1,9 @@
 # Copyright (c) Jean-Charles Lefebvre
 # SPDX-License-Identifier: MIT
 
+import bisect
 import enum
+import hashlib
 import io
 import struct
 import warnings
@@ -11,9 +13,11 @@ from . import profile
 from . import records
 from . import types
 from . import utils
-from .exceptions import FitCRCError, FitEOFError, FitHeaderError, FitParseError
+from .exceptions import (
+    FitCRCError, FitEOFError, FitHeaderError, FitIndexError, FitParseError)
 
-__all__ = ['CrcCheck', 'ErrorHandling', 'FitReader']
+__all__ = [
+    'CrcCheck', 'ErrorHandling', 'FitReader', 'FitIndex', 'FitIndexEntry']
 
 _UNSET = object()
 
@@ -84,6 +88,141 @@ class RecordHeader:
         self.time_offset = time_offset
 
 
+class FitIndexEntry:
+    """
+    A resumable snapshot of `FitReader`'s internal state, captured at a record
+    boundary while building a `FitIndex`.
+
+    An entry carries everything that is required to resume the decoding of a
+    FIT stream from ``offset`` instead of from the beginning of the file:
+
+    * the registry of message definitions (``local_mesg_defs``) in effect at
+      that point, so that message types that were defined - and possibly
+      redefined - earlier in the file are still known;
+    * the registry of developer data types (``local_dev_types``);
+    * the compressed timestamp context (``compressed_ts_accumulator``) along
+      with the other timestamp-related state values;
+    * the running CRC value and the remaining body size of the current FIT
+      file, so that CRC checking keeps working transparently.
+
+    Objects of this class are not meant to be instantiated by the user but by
+    `FitReader` itself (see the ``index_interval`` option of `FitReader`'s
+    constructor).
+    """
+
+    __slots__ = (
+        'fit_index', 'offset', 'chunk_index', 'read_size', 'fit_file_index',
+        'crc', 'header', 'current_file_id', 'body_bytes_left',
+        'local_mesg_defs', 'local_dev_types', 'compressed_ts_accumulator',
+        'accumulators', 'last_timestamp', 'hr_start_timestamp')
+
+    def __init__(
+            self, *, fit_index, offset, chunk_index, read_size,
+            fit_file_index, crc, header, current_file_id, body_bytes_left,
+            local_mesg_defs, local_dev_types, compressed_ts_accumulator,
+            accumulators, last_timestamp, hr_start_timestamp):
+        #: the `FitIndex` object this entry belongs to
+        self.fit_index = fit_index
+
+        #: the file offset of the next record to read (i.e. resuming from this
+        #: entry makes the reader continue from this very offset)
+        self.offset = offset
+
+        #: the index number of the next chunk to read
+        self.chunk_index = chunk_index
+
+        self.read_size = read_size
+        self.fit_file_index = fit_file_index
+        self.crc = crc
+
+        #: the `FitHeader` of the FIT file this entry belongs to
+        self.header = header
+
+        self.current_file_id = current_file_id
+        self.body_bytes_left = body_bytes_left
+
+        #: `dict` of the `FitDefinitionMessage` objects in effect at this
+        #: point of the stream (key: local message number)
+        self.local_mesg_defs = local_mesg_defs
+
+        #: `dict` of the developer data types in effect at this point of the
+        #: stream (key: developer data index)
+        self.local_dev_types = local_dev_types
+
+        #: state value of the so-called "Compressed Timestamp Header"
+        self.compressed_ts_accumulator = compressed_ts_accumulator
+
+        self.accumulators = accumulators
+        self.last_timestamp = last_timestamp
+        self.hr_start_timestamp = hr_start_timestamp
+
+
+class FitIndex:
+    """
+    A record-interval index of a FIT stream, built by `FitReader` while
+    decoding a *seekable* input (see the ``index_interval`` option of
+    `FitReader`'s constructor).
+
+    It allows one to resume the decoding of the same input from a position
+    that is close to a point of interest, instead of having to decode the
+    whole stream from the beginning again. This is especially useful when only
+    the last part of a big activity file is of interest.
+
+    An index is *complete* - and therefore usable to resume reading - only
+    once the `FitReader` that built it has been iterated until exhaustion.
+
+    An index is bound to the exact content of the stream it was built from:
+    resuming with an index whose stream has been altered in any way (even
+    partially, e.g. the tail of the file has been replaced) raises a
+    `FitIndexError` instead of silently decoding the new data with a stale
+    state.
+    """
+
+    __slots__ = (
+        'interval', 'stream_offset', 'entries', 'stream_size', 'stream_hash',
+        'complete')
+
+    def __init__(self, interval, stream_offset):
+        #: the requested record interval between two consecutive entries
+        self.interval = interval
+
+        #: the file offset at which the indexed FIT stream starts
+        self.stream_offset = stream_offset
+
+        #: the list of `FitIndexEntry` objects, ordered by increasing offset
+        self.entries = []
+
+        #: the size in bytes of the indexed stream (`None` until complete)
+        self.stream_size = None
+
+        #: the fingerprint of the indexed stream's content (`None` until
+        #: complete)
+        self.stream_hash = None
+
+        #: whether the stream has been read in its entirety
+        self.complete = False
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __getitem__(self, item):
+        return self.entries[item]
+
+    def entry_before(self, offset):
+        """
+        Get the `FitIndexEntry` that allows to resume reading at the closest
+        position before or at file *offset*.
+
+        Return `None` if no entry matches.
+        """
+        idx = bisect.bisect_right(
+            [entry.offset for entry in self.entries], offset) - 1
+        return self.entries[idx] if idx >= 0 else None
+
+
 class FitReader:
     """
     Parse the content of a FIT stream or storage.
@@ -147,12 +286,26 @@ class FitReader:
       context-sensitive data due to its instance being shared with other readers
       and/or by multiple threads (typically `DefaultDataProcessor`).
 
+    Record index:
+
+    * If *index_interval* is set to a positive `int`, a `FitIndex` is built
+      while reading, with one `FitIndexEntry` being captured about every
+      *index_interval* records. The index being built can be retrieved via the
+      `index` property. The input must be *seekable*.
+    * If *resume_from* is set to a `FitIndexEntry` (or to a `FitIndex`, in
+      which case its last entry is used), this reader resumes the decoding of
+      the stream from that entry's position, after having checked that the
+      content of the stream still matches the one the index was built from.
+      A `FitIndexError` is raised if the stream has been altered since the
+      index was built. *resume_from* and *index_interval* are mutually
+      exclusive.
+
     """
 
     def __init__(
             self, fileish, *, processor=_UNSET, check_crc=CrcCheck.WARN,
             error_handling=ErrorHandling.WARN, keep_raw_chunks=False,
-            data_bag=_UNSET):
+            data_bag=_UNSET, index_interval=None, resume_from=None):
         # backward compatibility
         if check_crc is True:
             check_crc = CrcCheck.RAISE
@@ -202,6 +355,19 @@ class FitReader:
         self._last_timestamp = 0
         self._hr_start_timestamp = 0  # special case for the ``hr`` message
 
+        # record index state (private)
+        self._index = None  # the `FitIndex` being built, if any
+        self._index_hasher = None  # running fingerprint of the indexed stream
+        self._index_records_since = 0  # records read since last index entry
+
+        if index_interval is not None and resume_from is not None:
+            raise ValueError(
+                'index_interval and resume_from are mutually exclusive')
+
+        if index_interval is not None:
+            if not isinstance(index_interval, int) or index_interval <= 0:
+                raise ValueError('index_interval must be a positive int')
+
         if hasattr(fileish, 'read'):
             self._fd = fileish
             self._fd_owned = False
@@ -217,6 +383,25 @@ class FitReader:
             self._chunk_offset = self._read_offset
         except (AttributeError, OSError):
             pass
+
+        if index_interval is not None or resume_from is not None:
+            if not self._is_seekable():
+                raise FitIndexError(
+                    'record indexing requires a seekable input')
+
+        if index_interval is not None:
+            self._index = FitIndex(index_interval, self._read_offset)
+            self._index_hasher = hashlib.blake2b(digest_size=16)
+
+        if resume_from is not None:
+            if isinstance(resume_from, FitIndex):
+                if not resume_from.entries:
+                    raise FitIndexError('cannot resume from an empty index')
+                resume_from = resume_from.entries[-1]
+            elif not isinstance(resume_from, FitIndexEntry):
+                raise ValueError(
+                    'resume_from must be a FitIndexEntry or a FitIndex')
+            self._restore_index_entry(resume_from)
 
     def __del__(self):
         self.close()
@@ -303,6 +488,17 @@ class FitReader:
         """
         return self._local_dev_types
 
+    @property
+    def index(self):
+        """
+        The `FitIndex` being built by this reader, if the ``index_interval``
+        option was specified to the constructor. `None` otherwise.
+
+        The index is *complete* - i.e. usable to resume reading - only once
+        this reader has been iterated until exhaustion.
+        """
+        return self._index
+
     def close(self):
         """
         Close the internal file handle if it is owned by this object, and clear
@@ -329,6 +525,7 @@ class FitReader:
         self._accumulators = {}
         self._last_timestamp = 0
         self._hr_start_timestamp = 0
+        self._index_records_since = 0
 
     # ONLY PRIVATE METHODS BELOW ***********************************************
 
@@ -359,6 +556,11 @@ class FitReader:
             elif self._body_bytes_left > 0:
                 assert self._header is not None
 
+                if self._index is not None and (
+                        self._index_records_since == 0 or
+                        self._index_records_since >= self._index.interval):
+                    self._add_index_entry()
+
                 record = self._read_record()
 
                 assert isinstance(record, (
@@ -367,6 +569,7 @@ class FitReader:
 
                 assert self._chunk_size <= self._body_bytes_left
                 self._body_bytes_left -= self._chunk_size
+                self._index_records_since += 1
 
                 yield record
                 _update_state()
@@ -394,6 +597,14 @@ class FitReader:
                 # resetting it only when a FIT header is read.
                 self._reset_per_fit_state()
 
+        # the stream has been read in its entirety: the index being built, if
+        # any, is now complete and can be used to resume reading
+        if self._index is not None and not self._index.complete:
+            self._index.stream_size = \
+                self._read_offset - self._index.stream_offset
+            self._index.stream_hash = self._index_hasher.digest()
+            self._index.complete = True
+
     def _reset_per_fit_state(self):
         # reset per-FIT-file state
         self._crc = utils.CRC_START
@@ -406,6 +617,7 @@ class FitReader:
         self._accumulators = {}
         self._last_timestamp = 0
         self._hr_start_timestamp = 0
+        self._index_records_since = 0
 
     def _read_header(self):
         try:
@@ -834,6 +1046,8 @@ class FitReader:
         if chunk:
             if self.check_crc is not CrcCheck.DISABLED:
                 self._crc = utils.compute_crc(chunk, crc=self._crc)
+            if self._index_hasher is not None:
+                self._index_hasher.update(chunk)
             self._chunk_size += chunk_size
             self._read_offset += chunk_size
             self._read_size += chunk_size
@@ -856,6 +1070,93 @@ class FitReader:
 
         return records.FitChunk(
             self._chunk_index, self._chunk_offset, chunk)
+
+    def _is_seekable(self):
+        try:
+            return bool(self._fd.seekable())
+        except (AttributeError, OSError):
+            return False
+
+    @staticmethod
+    def _copy_dev_types(dev_types):
+        # dev types are mutated in place as the stream is being decoded, so
+        # both snapshotting and restoring require a deep(ish) copy
+        return {
+            dev_data_index: {**dev_type, 'fields': dict(dev_type['fields'])}
+            for dev_data_index, dev_type in dev_types.items()}
+
+    @staticmethod
+    def _copy_accumulators(accumulators):
+        return {
+            mesg_num: dict(mesg_accumulators)
+            for mesg_num, mesg_accumulators in accumulators.items()}
+
+    def _add_index_entry(self):
+        assert self._chunk_size == 0  # at a record boundary
+
+        self._index.entries.append(FitIndexEntry(
+            fit_index=self._index,
+            offset=self._chunk_offset,
+            chunk_index=self._chunk_index,
+            read_size=self._read_size,
+            fit_file_index=self._fit_file_index,
+            crc=self._crc,
+            header=self._header,
+            current_file_id=self._current_file_id,
+            body_bytes_left=self._body_bytes_left,
+            local_mesg_defs=dict(self._local_mesg_defs),
+            local_dev_types=self._copy_dev_types(self._local_dev_types),
+            compressed_ts_accumulator=self._compressed_ts_accumulator,
+            accumulators=self._copy_accumulators(self._accumulators),
+            last_timestamp=self._last_timestamp,
+            hr_start_timestamp=self._hr_start_timestamp))
+
+    def _restore_index_entry(self, entry):
+        index = entry.fit_index
+
+        if not index.complete:
+            raise FitIndexError(
+                'cannot resume from an incomplete index (the stream has not '
+                'been read in its entirety yet)')
+
+        # make sure that the stream's content is still the very same one the
+        # index was built from, so that a stale index cannot silently match
+        # new data (e.g. if the tail of the file has been replaced)
+        self._fd.seek(index.stream_offset)
+        hasher = hashlib.blake2b(digest_size=16)
+        bytes_left = index.stream_size
+        while bytes_left > 0:
+            chunk = self._fd.read(min(64 * 1024, bytes_left))
+            if not chunk:
+                raise FitIndexError(
+                    'stream is smaller than what the index was built from '
+                    '(stream changed?)')
+            hasher.update(chunk)
+            bytes_left -= len(chunk)
+
+        if hasher.digest() != index.stream_hash:
+            raise FitIndexError(
+                'index does not match the content of this stream '
+                '(stream changed?)')
+
+        # restore the reader's state as it was when the entry was captured
+        self._fd.seek(entry.offset)
+        self._read_offset = entry.offset
+        self._read_size = entry.read_size
+        self._chunk_index = entry.chunk_index
+        self._chunk_offset = entry.offset
+        self._chunk_size = 0
+        self._fit_file_index = entry.fit_file_index
+        self._crc = entry.crc
+        self._header = entry.header
+        self._current_file_id = entry.current_file_id
+        self._body_bytes_left = entry.body_bytes_left
+        self._local_mesg_defs = dict(entry.local_mesg_defs)
+        self._local_dev_types = self._copy_dev_types(entry.local_dev_types)
+        self._compressed_ts_accumulator = entry.compressed_ts_accumulator
+        self._accumulators = self._copy_accumulators(entry.accumulators)
+        self._last_timestamp = entry.last_timestamp
+        self._hr_start_timestamp = entry.hr_start_timestamp
 
     def _add_dev_data_id(self, message):
         try:
