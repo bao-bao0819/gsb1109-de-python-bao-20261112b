@@ -5,6 +5,18 @@ Change Log
 ==========
 
 
+Unreleased
+==========
+
+* New ``fitdecode.stream`` module providing ``FitStreamSegmenter`` to split a
+  stream of chained FIT files that arrives piece by piece. It commits each
+  complete, CRC-validated file while keeping a partially received one pending
+  until more bytes are fed, distinguishes a corrupt segment from an incomplete
+  one, never treats header-looking bytes inside corrupt data as a valid file,
+  and reports auditable absolute source offsets and boundaries for every
+  segment.
+
+
 v0.11.0 (2025-08-06)
 ====================
 

@@ -9,6 +9,7 @@ from .__meta__ import (
 from .exceptions import *
 from .records import *
 from .reader import *
+from .stream import *
 from .processors import *
 
 from . import types
@@ -16,3 +17,4 @@ from . import profile
 from . import utils
 from . import processors
 from . import reader
+from . import stream
