@@ -42,6 +42,7 @@ import gpxpy as mod_gpxpy
 import gpxpy.gpx as mod_gpx
 import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
+import gpxpy.conversion as mod_conversion
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
 
@@ -3723,6 +3724,322 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+class ConversionTests(mod_unittest.TestCase):
+    """
+    Tests for GPX 1.1 -> 1.0 down-conversion and point-by-point round-trip
+    reconciliation (gpxpy.conversion).
+    """
+
+    EXT_NS = 'https://example.com/ext'
+
+    def _ext(self, name: str, text: str) -> Any:
+        element = mod_etree.Element(f'{{{self.EXT_NS}}}{name}')
+        element.text = text
+        return element
+
+    def _build_fleet_gpx(self) -> mod_gpx.GPX:
+        gpx = mod_gpx.GPX()
+        gpx.creator = 'fleet'
+        gpx.nsmap['ext'] = self.EXT_NS
+        gpx.metadata_extensions = [self._ext('meta', 'm')]
+        gpx.extensions = [self._ext('root', 'r')]
+
+        waypoint_a = mod_gpx.GPXWaypoint(10.0, 20.0, name='WP-A')
+        waypoint_a.link = 'http://a'
+        waypoint_a.link_text = 'A'
+        waypoint_a.link_type = 'text/html'
+        waypoint_a.extensions = [self._ext('hr', '100')]
+        gpx.waypoints.append(waypoint_a)
+
+        waypoint_b = mod_gpx.GPXWaypoint(11.0, 21.0, name='WP-B')
+        waypoint_b.link = 'http://b'
+        waypoint_b.link_text = 'B'
+        waypoint_b.extensions = [self._ext('hr', '101')]
+        gpx.waypoints.append(waypoint_b)
+
+        route = mod_gpx.GPXRoute(name='R')
+        route_point = mod_gpx.GPXRoutePoint(30.0, 40.0)
+        route_point.extensions = [self._ext('routepoint', 'rp')]
+        route.points.append(route_point)
+        route.extensions = [self._ext('routeext', 're')]
+        gpx.routes.append(route)
+
+        track = mod_gpx.GPXTrack(name='T')
+        track.extensions = [self._ext('trackext', 'te')]
+        segment = mod_gpx.GPXTrackSegment()
+        for index, latitude in enumerate((1.0, 2.0, 3.0)):
+            point = mod_gpx.GPXTrackPoint(latitude, 30.0 + index,
+                                          speed=10.0 + index)
+            point.course = 45.0
+            point.time = mod_datetime.datetime(
+                2020, 1, 1, 0, 0, index, tzinfo=mod_gpxfield.SimpleTZ())
+            point.extensions = [self._ext('power', str(200 + index))]
+            segment.points.append(point)
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+        return gpx
+
+    def _echo(self, xml_1_0: str) -> mod_gpx.GPX:
+        return mod_gpxpy.parse(xml_1_0)
+
+    def test_downconvert_emits_1_0_payload_and_manifest(self) -> None:
+        gpx = self._build_fleet_gpx()
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+
+        self.assertIn('version="1.0"', xml_1_0)
+        self.assertIn('http://www.topografix.com/GPX/1/0', xml_1_0)
+        # 1.1 links become 1.0 url/urlname text elements:
+        self.assertIn('<url>http://a</url>', xml_1_0)
+        self.assertIn('<urlname>A</urlname>', xml_1_0)
+        # Track point speed/course are native GPX 1.0 elements:
+        self.assertIn('<speed>', xml_1_0)
+        self.assertIn('<course>45.0</course>', xml_1_0)
+        # Vendor extensions cannot be expressed in GPX 1.0:
+        self.assertNotIn('extensions', xml_1_0)
+        self.assertNotIn('text/html', xml_1_0)
+
+        self.assertEqual(mod_conversion.MANIFEST_VERSION,
+                         manifest['gpxpy_manifest_version'])
+        self.assertEqual('1.1', manifest['source_gpx_version'])
+        self.assertEqual('1.0', manifest['target_gpx_version'])
+        waypoint_entry = manifest['points'][mod_conversion.waypoint_key(0)]
+        self.assertEqual('text/html', waypoint_entry['link_type'])
+        self.assertEqual('hr', waypoint_entry['extensions'][0]['tag'].split('}')[1])
+        self.assertIn('track_extensions', manifest)
+        self.assertIn('route_extensions', manifest)
+        self.assertIn('metadata_extensions', manifest)
+        self.assertIn('root_extensions', manifest)
+        self.assertEqual(self.EXT_NS, manifest['nsmap']['ext'])
+
+        # The manifest is a JSON-serialisable batch sidecar:
+        restored_manifest = mod_conversion.manifest_from_json(
+            mod_conversion.manifest_to_json(manifest))
+        self.assertEqual(manifest, restored_manifest)
+
+    def test_speed_course_are_recoverable_without_manifest(self) -> None:
+        gpx = mod_gpx.GPX()
+        segment = mod_gpx.GPXTrackSegment()
+        point = mod_gpx.GPXTrackPoint(1.0, 2.0, speed=12.5)
+        point.course = 90.0
+        segment.points.append(point)
+        gpx.tracks.append(mod_gpx.GPXTrack())
+        gpx.tracks[0].segments.append(segment)
+
+        _xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        # No 1.1-only data means nothing has to be stored for this point:
+        self.assertNotIn(mod_conversion.track_point_key(0, 0, 0),
+                         manifest['points'])
+
+        result = mod_conversion.reconcile_round_trip(
+            gpx, self._echo(_xml_1_0), manifest)
+        key = mod_conversion.track_point_key(0, 0, 0)
+        self.assertEqual(mod_conversion.FIELD_RECOVERABLE,
+                         result.field_status(key, 'speed'))
+        self.assertEqual(mod_conversion.FIELD_RECOVERABLE,
+                         result.field_status(key, 'course'))
+
+    def test_unchanged_round_trip_restores_manifest_values(self) -> None:
+        gpx = self._build_fleet_gpx()
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        result = mod_conversion.reconcile_round_trip(
+            gpx, self._echo(xml_1_0), manifest)
+
+        summary = result.summary()
+        self.assertEqual(0, summary[mod_conversion.POINT_MODIFIED])
+        self.assertEqual(0, summary[mod_conversion.POINT_LOST])
+        self.assertEqual(0, summary[mod_conversion.POINT_NEW])
+        self.assertEqual(0, summary[mod_conversion.POINT_AMBIGUOUS])
+        self.assertEqual(0, len(result.suspended_extensions))
+
+        waypoint_key = mod_conversion.waypoint_key(0)
+        self.assertEqual(mod_conversion.FIELD_RECOVERABLE,
+                         result.field_status(waypoint_key, 'link'))
+        self.assertEqual(mod_conversion.FIELD_MAPPED,
+                         result.field_status(waypoint_key, 'link_type'))
+        self.assertEqual(mod_conversion.FIELD_MAPPED,
+                         result.field_status(waypoint_key, 'extensions'))
+
+        merged = result.apply()
+        merged_waypoint = merged.waypoints[0]
+        self.assertEqual('http://a', merged_waypoint.link)
+        self.assertEqual('text/html', merged_waypoint.link_type)
+        self.assertEqual('hr', merged_waypoint.extensions[0].tag.split('}')[1])
+        self.assertEqual('100', merged_waypoint.extensions[0].text)
+        track_point = merged.tracks[0].segments[0].points[0]
+        self.assertEqual(10.0, track_point.speed)
+        self.assertEqual(45.0, track_point.course)
+        self.assertEqual('power', track_point.extensions[0].tag.split('}')[1])
+        self.assertEqual('te',
+                         merged.tracks[0].extensions[0].text)
+        self.assertEqual('re',
+                         merged.routes[0].extensions[0].text)
+        self.assertEqual('r', merged.extensions[0].text)
+        self.assertEqual('m', merged.metadata_extensions[0].text)
+
+        # The rebuilt ledger serialises back to valid GPX 1.1 with prefixes:
+        xml_1_1 = merged.to_xml('1.1')
+        reparsed = mod_gpxpy.parse(xml_1_1)
+        self.assertEqual('1.1', reparsed.version)
+        self.assertIn('<ext:hr>100</ext:hr>', xml_1_1)
+        self.assertNotIn('<speed>', xml_1_1)
+
+    def test_terminal_modifications_win(self) -> None:
+        gpx = self._build_fleet_gpx()
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        echo = self._echo(xml_1_0)
+
+        echo.waypoints[0].latitude = 99.9
+        echo.waypoints[0].link = 'http://edited'
+        echo.tracks[0].segments[0].points[1].speed = 77.0
+
+        result = mod_conversion.reconcile_round_trip(gpx, echo, manifest)
+        waypoint_key = mod_conversion.waypoint_key(0)
+        track_key = mod_conversion.track_point_key(0, 0, 1)
+        self.assertEqual(mod_conversion.POINT_MODIFIED,
+                         result.by_status(mod_conversion.POINT_MODIFIED)[0].status)
+        self.assertEqual(mod_conversion.FIELD_MODIFIED,
+                         result.field_status(waypoint_key, 'latitude'))
+        self.assertEqual(mod_conversion.FIELD_MODIFIED,
+                         result.field_status(waypoint_key, 'link'))
+        self.assertEqual(mod_conversion.FIELD_MODIFIED,
+                         result.field_status(track_key, 'speed'))
+
+        merged = result.apply()
+        # Reply values win, including for native GPX 1.0 fields:
+        self.assertEqual(99.9, merged.waypoints[0].latitude)
+        self.assertEqual('http://edited', merged.waypoints[0].link)
+        self.assertEqual(77.0, merged.tracks[0].segments[0].points[1].speed)
+        # Untouched manifest-only data is still restored:
+        self.assertEqual('text/html', merged.waypoints[0].link_type)
+
+    def test_deleted_point_is_lost_and_its_extension_suspended(self) -> None:
+        gpx = self._build_fleet_gpx()
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        echo = self._echo(xml_1_0)
+        del echo.tracks[0].segments[0].points[1]
+
+        result = mod_conversion.reconcile_round_trip(gpx, echo, manifest)
+        lost_key = mod_conversion.track_point_key(0, 0, 1)
+        self.assertEqual([lost_key],
+                         [item.point_key for item in result.by_status(mod_conversion.POINT_LOST)])
+        self.assertEqual(1, len(result.suspended_extensions))
+        suspended = result.suspended_extensions[0]
+        self.assertEqual(lost_key, suspended.owner_key)
+        self.assertEqual('power', suspended.element.tag.split('}')[1])
+        self.assertEqual('201', suspended.element.text)
+
+        # By default the terminal deletion is honoured and the extension is
+        # never re-attached to another observation:
+        merged = result.apply()
+        self.assertEqual(2, len(merged.tracks[0].segments[0].points))
+        for point in merged.tracks[0].segments[0].points:
+            self.assertNotEqual('201', point.extensions[0].text
+                                if point.extensions else None)
+
+        # Opting in restores the point but keeps its extension suspended:
+        merged_with_lost = result.apply(restore_lost_points=True)
+        self.assertEqual(3, len(merged_with_lost.tracks[0].segments[0].points))
+        restored = merged_with_lost.tracks[0].segments[0].points[-1]
+        self.assertEqual(2.0, restored.latitude)
+        self.assertEqual([], restored.extensions)
+
+    def test_reordered_waypoints_match_by_coordinates(self) -> None:
+        gpx = self._build_fleet_gpx()
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        echo = self._echo(xml_1_0)
+        echo.waypoints = [echo.waypoints[1], echo.waypoints[0]]
+
+        result = mod_conversion.reconcile_round_trip(gpx, echo, manifest)
+        mapping = {item.point_key: item.echo_key
+                   for item in result.point_reconciliations
+                   if item.point_key.startswith('wpt:')}
+        self.assertEqual(mod_conversion.waypoint_key(1), mapping['wpt:0'])
+        self.assertEqual(mod_conversion.waypoint_key(0), mapping['wpt:1'])
+
+        merged = result.apply()
+        # Terminal ordering is kept and extensions follow their real owner:
+        self.assertEqual([11.0, 10.0],
+                         [waypoint.latitude for waypoint in merged.waypoints])
+        self.assertEqual('101', merged.waypoints[0].extensions[0].text)
+        self.assertEqual('100', merged.waypoints[1].extensions[0].text)
+
+    def test_collocated_waypoints_are_ambiguous_and_suspended(self) -> None:
+        gpx = mod_gpx.GPX()
+        gpx.nsmap['ext'] = self.EXT_NS
+        first = mod_gpx.GPXWaypoint(12.0, 22.0, name='DUP')
+        first.extensions = [self._ext('hr', 'a')]
+        second = mod_gpx.GPXWaypoint(12.0, 22.0, name='DUP')
+        second.extensions = [self._ext('hr', 'b')]
+        unique = mod_gpx.GPXWaypoint(13.0, 23.0, name='UNIQUE')
+        unique.extensions = [self._ext('hr', 'c')]
+        gpx.waypoints = [first, second, unique]
+
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        echo = self._echo(xml_1_0)
+        echo.waypoints = [echo.waypoints[1], echo.waypoints[0], echo.waypoints[2]]
+
+        result = mod_conversion.reconcile_round_trip(gpx, echo, manifest)
+        ambiguous = result.by_status(mod_conversion.POINT_AMBIGUOUS)
+        ambiguous_original = {item.point_key for item in ambiguous}
+        self.assertIn(mod_conversion.waypoint_key(0), ambiguous_original)
+        self.assertIn(mod_conversion.waypoint_key(1), ambiguous_original)
+        suspended_owners = {item.owner_key for item in result.suspended_extensions}
+        self.assertEqual(
+            {mod_conversion.waypoint_key(0), mod_conversion.waypoint_key(1)},
+            suspended_owners)
+
+        merged = result.apply()
+        collocated = [w for w in merged.waypoints if w.latitude == 12.0]
+        # Nothing is guessed: no extension is glued onto either candidate:
+        self.assertEqual([], collocated[0].extensions)
+        self.assertEqual([], collocated[1].extensions)
+        # The uniquely identified point is still reconciled normally:
+        unique_merged = [w for w in merged.waypoints if w.latitude == 13.0][0]
+        self.assertEqual('c', unique_merged.extensions[0].text)
+
+    def test_new_terminal_point_is_reported(self) -> None:
+        gpx = self._build_fleet_gpx()
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        echo = self._echo(xml_1_0)
+        added = mod_gpx.GPXWaypoint(50.0, 60.0, name='ADDED')
+        echo.waypoints.append(added)
+
+        result = mod_conversion.reconcile_round_trip(gpx, echo, manifest)
+        new_points = result.by_status(mod_conversion.POINT_NEW)
+        self.assertEqual(1, len(new_points))
+        self.assertEqual(1, result.summary()[mod_conversion.POINT_NEW])
+
+        merged = result.apply()
+        self.assertIn(50.0, [w.latitude for w in merged.waypoints])
+
+    def test_container_extension_suspended_when_container_removed(self) -> None:
+        gpx = self._build_fleet_gpx()
+        xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        echo = self._echo(xml_1_0)
+        del echo.tracks[0]
+
+        result = mod_conversion.reconcile_round_trip(gpx, echo, manifest)
+        self.assertIn('trk:0', result.suspended_container_owners)
+        track_suspension = [item for item in result.suspended_extensions
+                            if item.owner_key == 'trk:0']
+        self.assertEqual(1, len(track_suspension))
+        self.assertEqual('trackext',
+                         track_suspension[0].element.tag.split('}')[1])
+        # Surviving route extension is still restored:
+        merged = result.apply()
+        self.assertEqual('re',
+                         merged.routes[0].extensions[0].text)
+        self.assertEqual([], merged.tracks)
+
+    def test_manifest_rejects_unknown_version(self) -> None:
+        gpx = self._build_fleet_gpx()
+        _xml_1_0, manifest = mod_conversion.downconvert_to_1_0(gpx)
+        manifest['gpxpy_manifest_version'] = 999
+        with self.assertRaises(mod_gpx.GPXException):
+            mod_conversion.manifest_from_json(
+                mod_conversion.manifest_to_json(manifest))
+
 
 if __name__ == '__main__':
     mod_unittest.main()

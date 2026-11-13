@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `gpxpy.conversion`: GPX 1.1 -> 1.0 down-conversion with a JSON batch manifest and point-by-point round-trip reconciliation. Fields are classified as `recoverable` (from the 1.0 reply), `mapped` (restored from the manifest) or `modified` (changed by the terminal). Deleted, reordered, collocated and newly added points are handled explicitly; extensions whose owner cannot be identified uniquely are suspended instead of being re-attached.
+
 ## v1.6.1
 
 - Minor fix

@@ -77,6 +77,36 @@ For example, GPX 1.0 specified a `speed` attribute for every track point, but th
 
 gpx.py preserves GPX extensions. They are stored as [ElementTree](https://docs.python.org/2/library/xml.etree.elementtree.html#module-xml.etree.ElementTree) DOM objects. Extensions are part of GPX 1.1, and will be ignored when serializing a GPX object in a GPX 1.0 file.
 
+## GPX 1.1 -> 1.0 conversion with round-trip reconciliation
+
+Sending a GPX 1.1 batch to a read-only GPX 1.0 terminal loses information the old format cannot express: point/container vendor `extensions`, the `type` of a link, and (for track points) anything only stored in 1.1. Track-point `speed`/`course` and `url`/`urlname` links are native GPX 1.0 and survive on their own.
+
+`gpxpy.conversion.downconvert_to_1_0()` returns both the GPX 1.0 payload and a JSON *manifest* containing the 1.1-only values. The manifest must travel with the batch:
+
+```python
+from gpxpy import conversion
+
+xml_1_0, manifest = conversion.downconvert_to_1_0(gpx_1_1)
+sidecar = conversion.manifest_to_json(manifest)
+```
+
+After the terminal replies, parse its GPX 1.0 file and reconcile it against the original batch plus the manifest:
+
+```python
+echo_gpx = gpxpy.parse(xml_from_terminal)
+manifest = conversion.manifest_from_json(sidecar)
+result = conversion.reconcile_round_trip(original_gpx, echo_gpx, manifest)
+print(result.summary())
+```
+
+Every point is reported as `unchanged`, `restored`, `modified`, `lost`, `new` or `ambiguous`, and every field is classified as:
+
+- `recoverable` — the value comes straight from the 1.0 reply and matches the batch;
+- `mapped` — the 1.0 format cannot hold it, so it is restored from the manifest;
+- `modified` — the terminal changed it, and the reply value wins.
+
+Points are matched by unique coordinates within their container (waypoint list, route, track segment), so deletions and same-named waypoint reorderings are handled. When coordinates collide and the owner cannot be identified uniquely the point is `ambiguous` and its extensions are *suspended* (`result.suspended_extensions`) rather than silently attached to another observation. `result.apply()` builds the updated GPX 1.1 ledger, honouring terminal edits/deletions and restoring only safely attributable manifest data.
+
 ## XML parsing
 
 The GPX version is automatically determined when parsing by reading the version attribute in the gpx node. If this attribute is not present then the version is assumed to be 1.0. A specific version can be forced by setting the `version` parameter in the parse function. Possible values for the 'version' parameter are `1.0`, `1.1` and `None`.
