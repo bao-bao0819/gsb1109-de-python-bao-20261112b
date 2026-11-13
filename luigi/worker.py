@@ -317,10 +317,11 @@ class TaskStatusReporter:
     where fork method needs to pickle the process object (e.g.  Windows).
     """
 
-    def __init__(self, scheduler, task_id, worker_id, scheduler_messages):
+    def __init__(self, scheduler, task_id, worker_id, scheduler_messages, run_id=None):
         self._task_id = task_id
         self._worker_id = worker_id
         self._scheduler = scheduler
+        self._run_id = run_id
         self.scheduler_messages = scheduler_messages
 
     def update_tracking_url(self, tracking_url):
@@ -333,7 +334,7 @@ class TaskStatusReporter:
         self._scheduler.set_task_progress_percentage(self._task_id, percentage)
 
     def decrease_running_resources(self, decrease_resources):
-        self._scheduler.decrease_running_task_resources(self._task_id, decrease_resources)
+        self._scheduler.decrease_running_task_resources(self._task_id, decrease_resources, worker=self._worker_id, run_id=self._run_id)
 
     def report_task_statistics(self, statistics):
         self._scheduler.report_task_statistics(self._task_id, statistics)
@@ -569,6 +570,7 @@ class Worker:
         self._suspended_tasks = {}
         self._batch_running_tasks = {}
         self._batch_families_sent = set()
+        self._task_run_ids = {}
 
         self._first_task = None
 
@@ -1012,6 +1014,11 @@ class Worker:
             batch_tasks = filter(None, [self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]])
             self._batch_running_tasks[task_id] = batch_tasks
 
+        if task_id is not None:
+            # remember which run attempt the scheduler dispatched, so that
+            # status updates can be matched to this attempt later on
+            self._task_run_ids[task_id] = r.get("run_id")
+
         return GetWorkResponse(
             task_id=task_id,
             running_tasks=running_tasks,
@@ -1031,7 +1038,8 @@ class Worker:
 
         task = self._scheduled_tasks[task_id]
 
-        task_process = self._create_task_process(task)
+        run_id = self._task_run_ids.pop(task_id, None)
+        task_process = self._create_task_process(task, run_id=run_id)
 
         self._running_tasks[task_id] = task_process
 
@@ -1042,9 +1050,9 @@ class Worker:
             # Run in the same process
             task_process.run()
 
-    def _create_task_process(self, task):
+    def _create_task_process(self, task, run_id=None):
         message_queue = multiprocessing.Queue() if task.accepts_messages else None
-        reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue)
+        reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue, run_id=run_id)
         use_multiprocessing = self._config.force_multiprocessing or bool(self.worker_processes > 1)
         return ContextManagedTaskProcess(
             self._config.task_process_context,

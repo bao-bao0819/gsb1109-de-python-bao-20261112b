@@ -280,6 +280,7 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        self.run_id = 0  # identifies the current run attempt, bumped on every dispatch
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -529,7 +530,8 @@ class SimpleTaskState:
         self.set_status(task, BATCH_RUNNING)
         task.batch_id = batch_id
         task.worker_running = worker_id
-        task.resources_running = task.resources
+        task.resources_running = task.resources.copy()
+        task.run_id = getattr(task, "run_id", 0) + 1
         task.time_running = time.time()
 
     def set_status(self, task, new_status, config=None):
@@ -886,6 +888,7 @@ class Scheduler:
                 # copy resources_running of the first batch task
                 batch_tasks = self._state.get_batch_running_tasks(batch_id)
                 task.resources_running = batch_tasks[0].resources_running.copy()
+                task.run_id = getattr(batch_tasks[0], "run_id", 0)
             task.time_running = time.time()
 
         if accepts_messages is not None:
@@ -1263,12 +1266,14 @@ class Scheduler:
             reply["task_params"] = combined_params
             reply["batch_id"] = batch_id
             reply["batch_task_ids"] = [task.id for task in batched_tasks]
+            reply["run_id"] = getattr(best_task, "run_id", None)
 
         elif best_task:
             self.update_metrics_task_started(best_task)
             self._state.set_status(best_task, RUNNING, self._config)
             best_task.worker_running = worker_id
             best_task.resources_running = best_task.resources.copy()
+            best_task.run_id = getattr(best_task, "run_id", 0) + 1
             best_task.time_running = time.time()
             self._update_task_history(best_task, RUNNING, host=host)
 
@@ -1276,6 +1281,7 @@ class Scheduler:
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
+            reply["run_id"] = best_task.run_id
 
         else:
             reply["task_id"] = None
@@ -1621,10 +1627,20 @@ class Scheduler:
             return {"taskId": task_id, "progressPercentage": None}
 
     @rpc_method()
-    def decrease_running_task_resources(self, task_id, decrease_resources):
+    def decrease_running_task_resources(self, task_id, decrease_resources, worker=None, run_id=None):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
             if task.status != RUNNING:
+                return
+
+            if worker is not None and task.worker_running != worker:
+                # the release was issued by a previous run attempt on another
+                # worker, it must not affect the current attempt
+                return
+
+            if run_id is not None and getattr(task, "run_id", None) != run_id:
+                # the release was issued by a previous run attempt of the task,
+                # its resources were already handed back when that attempt ended
                 return
 
             def decrease(resources, decrease_resources):

@@ -439,6 +439,84 @@ class SchedulerApiTest(unittest.TestCase):
         for task_id in ("A_1", "A_2", "A_1_2"):
             self.assertEqual(2, self.sch.get_running_task_resources(task_id)["resources"]["x"])
 
+    def test_batch_decrease_resources_keeps_requirements(self):
+        # a mid-run release must not shrink the declared requirements,
+        # so a later attempt re-acquires the full amount again
+        self.sch.update_resources(x=3)
+        self._start_simple_batch(resources={"x": 3})
+        self.sch.decrease_running_task_resources("A_1_2", {"x": 1})
+        for task_id in ("A_1", "A_2", "A_1_2"):
+            self.assertEqual(2, self.sch.get_running_task_resources(task_id)["resources"]["x"])
+        for task_id in ("A_1", "A_2"):
+            self.assertEqual({"x": 3}, self.sch.task_list("", "")[task_id]["resources"])
+
+    def test_decrease_resources_stale_release_from_old_attempt(self):
+        # a delayed release from a previous attempt (reported late by the old
+        # worker) must not affect the resources held by the current attempt
+        self.setTime(0)
+        self.sch.update_resources(source=1, parse=1, other=1)
+        self.sch.add_task(worker="W1", task_id="A", resources={"source": 1, "parse": 1}, priority=3)
+        self.sch.add_task(worker="W2", task_id="B", resources={"other": 1}, priority=2)
+        self.sch.add_task(worker="W2", task_id="C", resources={"source": 1}, priority=1)
+
+        work = self.sch.get_work(worker="W1")
+        self.assertEqual("A", work["task_id"])
+        first_run_id = work["run_id"]
+
+        # the task releases the source quota mid-run (e.g. download finished)
+        self.sch.decrease_running_task_resources("A", {"source": 1}, worker="W1", run_id=first_run_id)
+        self.assertEqual({"source": 0, "parse": 1}, self.sch.get_running_task_resources("A")["resources"])
+
+        # the attempt fails, the old worker disappears and the task is retried
+        self.sch.add_task(worker="W1", task_id="A", status=FAILED, resources={"source": 1, "parse": 1})
+        self.setTime(101)  # retry_delay is 100, worker_disconnect_delay is 10
+        self.sch.ping(worker="W2")
+        self.sch.prune()
+        self.sch.add_task(worker="W2", task_id="A", resources={"source": 1, "parse": 1})
+        work = self.sch.get_work(worker="W2")
+        self.assertEqual("A", work["task_id"])
+        self.assertNotEqual(first_run_id, work["run_id"])
+        self.assertEqual({"source": 1, "parse": 1}, self.sch.get_running_task_resources("A")["resources"])
+
+        # the delayed release of the first attempt finally arrives: ignore it
+        self.sch.decrease_running_task_resources("A", {"source": 1}, worker="W1", run_id=first_run_id)
+        self.assertEqual({"source": 1, "parse": 1}, self.sch.get_running_task_resources("A")["resources"])
+        self.assertEqual(1, self.sch.resources()["source"]["used"])
+
+        # an unrelated resource can still be handed out, the held one cannot
+        work = self.sch.get_work(worker="W2")
+        self.assertEqual("B", work["task_id"])
+        self.assertIsNone(self.sch.get_work(worker="W2")["task_id"])
+
+    def test_decrease_resources_duplicate_release_same_worker(self):
+        # a duplicated release of an old attempt must not affect the new
+        # attempt, even when both attempts run on the same worker
+        self.setTime(0)
+        self.sch.update_resources(source=1)
+        self.sch.add_task(worker=WORKER, task_id="A", resources={"source": 1})
+
+        work = self.sch.get_work(worker=WORKER)
+        self.assertEqual("A", work["task_id"])
+        first_run_id = work["run_id"]
+
+        self.sch.add_task(worker=WORKER, task_id="A", status=FAILED, resources={"source": 1})
+        self.setTime(101)  # retry_delay is 100
+        self.sch.ping(worker=WORKER)
+        self.sch.prune()
+
+        work = self.sch.get_work(worker=WORKER)
+        self.assertEqual("A", work["task_id"])
+        self.assertNotEqual(first_run_id, work["run_id"])
+
+        # the duplicated release of the first attempt arrives late: ignore it
+        self.sch.decrease_running_task_resources("A", {"source": 1}, worker=WORKER, run_id=first_run_id)
+        self.assertEqual({"source": 1}, self.sch.get_running_task_resources("A")["resources"])
+
+        # a release belonging to the current attempt is still applied
+        self.sch.decrease_running_task_resources("A", {"source": 1}, worker=WORKER, run_id=work["run_id"])
+        self.assertEqual({"source": 0}, self.sch.get_running_task_resources("A")["resources"])
+        self.assertEqual(0, self.sch.resources()["source"]["used"])
+
     def test_batch_tracking_url(self):
         self._start_simple_batch()
         self.sch.add_task(worker=WORKER, task_id="A_1_2", tracking_url="http://test.tracking.url/")
