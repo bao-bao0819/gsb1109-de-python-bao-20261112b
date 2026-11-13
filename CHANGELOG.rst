@@ -1,3 +1,11 @@
+Unreleased
+----------
+
+* feat: Add ``agatesql.incremental`` for repeatable, resumable batch reads from SQLite
+  into agate. Batches run against a point-in-time snapshot and resume from a serializable
+  ``(timestamp, key)`` keyset cursor; sources that cannot sustain the contract raise
+  instead of returning a cursor that can silently lose rows.
+
 0.7.3 - December 15, 2025
 -------------------------
 
