@@ -959,30 +959,35 @@ class XFRecord(BiffRecord):
         else:
             used_attr = pack('B', 0xF4)
 
+        left_colour = borders.left_colour
+        right_colour = borders.right_colour
+        top_colour = borders.top_colour
+        bottom_colour = borders.bottom_colour
+        diag_colour = borders.diag_colour
         if borders.left == borders.NO_LINE:
-            borders.left_colour = 0x00
+            left_colour = 0x00
         if borders.right == borders.NO_LINE:
-            borders.right_colour = 0x00
+            right_colour = 0x00
         if borders.top == borders.NO_LINE:
-            borders.top_colour = 0x00
+            top_colour = 0x00
         if borders.bottom == borders.NO_LINE:
-            borders.bottom_colour = 0x00
+            bottom_colour = 0x00
         if borders.diag == borders.NO_LINE:
-            borders.diag_colour = 0x00
+            diag_colour = 0x00
         brd1 = pack('<L',
             ((borders.left          & 0x0F) << 0 ) |
             ((borders.right         & 0x0F) << 4 ) |
             ((borders.top           & 0x0F) << 8 ) |
             ((borders.bottom        & 0x0F) << 12) |
-            ((borders.left_colour   & 0x7F) << 16) |
-            ((borders.right_colour  & 0x7F) << 23) |
+            ((left_colour           & 0x7F) << 16) |
+            ((right_colour          & 0x7F) << 23) |
             ((borders.need_diag1    & 0x01) << 30) |
             ((borders.need_diag2    & 0x01) << 31)
         )
         brd2 = pack('<L',
-            ((borders.top_colour    & 0x7F) << 0 ) |
-            ((borders.bottom_colour & 0x7F) << 7 ) |
-            ((borders.diag_colour   & 0x7F) << 14) |
+            ((top_colour            & 0x7F) << 0 ) |
+            ((bottom_colour         & 0x7F) << 7 ) |
+            ((diag_colour           & 0x7F) << 14) |
             ((borders.diag          & 0x0F) << 21) |
             ((pattern.pattern       & 0x3F) << 26)
         )

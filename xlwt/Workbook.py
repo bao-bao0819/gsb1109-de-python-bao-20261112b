@@ -105,6 +105,18 @@ class Workbook(object):
     def get_style_stats(self):
         return self.__styles.stats[:]
 
+    def get_unmerged_style_diffs(self):
+        """
+        Return the XF definitions that could not be reused even though the
+        workbook was created with ``style_compression=2``.
+
+        Each entry is a dict naming the number format and the font,
+        alignment, borders, pattern and protection search keys, so the
+        caller can see which component kept otherwise identical styles
+        apart. Entries are ordered by their first occurrence.
+        """
+        return self.__styles.unmerged_style_diffs()
+
     def set_owner(self, value):
         self.__owner = value
 

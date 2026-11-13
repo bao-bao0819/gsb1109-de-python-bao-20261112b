@@ -4,9 +4,116 @@ from __future__ import print_function
 import six
 
 from . import Formatting
-from .BIFFRecords import NumberFormatRecord, StyleRecord, XFRecord
+from .BIFFRecords import FontRecord, NumberFormatRecord, StyleRecord, XFRecord
 
 FIRST_USER_DEFINED_NUM_FORMAT_IDX = 164
+
+
+class _FrozenObject(object):
+    # Read-only container: once a style has been registered, its emitted
+    # definition must not change even if the caller mutates the original
+    # formatting object.
+    __slots__ = ()
+
+    def __setattr__(self, name, value):
+        raise AttributeError("frozen style component is read-only")
+
+    def _search_key(self):
+        return tuple(getattr(self, name) for name in self.__slots__)
+
+
+class FrozenFont(_FrozenObject):
+    __slots__ = (
+        'height', 'italic', 'struck_out', 'outline', 'shadow',
+        'colour_index', 'bold', '_weight', 'escapement', 'underline',
+        'family', 'charset', 'name',
+    )
+
+    def __init__(self, font):
+        for name in self.__slots__:
+            object.__setattr__(self, name, getattr(font, name))
+
+    def get_biff_record(self):
+        # Mirrors Formatting.Font.get_biff_record without mutating state.
+        options = 0x00
+        if self.bold:
+            options |= 0x01
+            weight = 0x02BC
+        else:
+            weight = self._weight
+        if self.italic:
+            options |= 0x02
+        if self.underline != Formatting.Font.UNDERLINE_NONE:
+            options |= 0x04
+        if self.struck_out:
+            options |= 0x08
+        if self.outline:
+            options |= 0x10
+        if self.shadow:
+            options |= 0x20
+        return FontRecord(
+            self.height, options, self.colour_index, weight,
+            self.escapement, self.underline, self.family, self.charset,
+            self.name,
+        )
+
+
+class FrozenAlignment(_FrozenObject):
+    __slots__ = ('horz', 'vert', 'dire', 'orie', 'rota',
+                 'wrap', 'shri', 'inde', 'merg')
+
+    def __init__(self, alignment):
+        for name in self.__slots__:
+            object.__setattr__(self, name, getattr(alignment, name))
+
+
+class FrozenBorders(_FrozenObject):
+    __slots__ = (
+        'left', 'right', 'top', 'bottom', 'diag',
+        'left_colour', 'right_colour', 'top_colour',
+        'bottom_colour', 'diag_colour',
+        'need_diag1', 'need_diag2',
+    )
+
+    NO_LINE = Formatting.Borders.NO_LINE
+
+    def __init__(self, borders):
+        for name in self.__slots__:
+            object.__setattr__(self, name, getattr(borders, name))
+        # XFRecord drops the colour of sides without a line. Apply the same
+        # normalization up front so the emitted bytes are identical.
+        for line_attr, colour_attr in (
+                ('left', 'left_colour'), ('right', 'right_colour'),
+                ('top', 'top_colour'), ('bottom', 'bottom_colour'),
+                ('diag', 'diag_colour')):
+            if getattr(self, line_attr) == self.NO_LINE:
+                object.__setattr__(self, colour_attr, 0x00)
+
+
+class FrozenPattern(_FrozenObject):
+    __slots__ = ('pattern', 'pattern_fore_colour', 'pattern_back_colour')
+
+    def __init__(self, pattern):
+        for name in self.__slots__:
+            object.__setattr__(self, name, getattr(pattern, name))
+
+
+class FrozenProtection(_FrozenObject):
+    __slots__ = ('cell_locked', 'formula_hidden')
+
+    def __init__(self, protection):
+        for name in self.__slots__:
+            object.__setattr__(self, name, getattr(protection, name))
+
+
+def _freeze_gof(gof):
+    alignment, borders, pattern, protection = gof
+    return (
+        FrozenAlignment(alignment),
+        FrozenBorders(borders),
+        FrozenPattern(pattern),
+        FrozenProtection(protection),
+    )
 
 class XFStyle(object):
 
@@ -66,6 +173,7 @@ class StyleCollection(object):
         self._font_id2x = {}
         self._font_x2id = {}
         self._font_val2x = {}
+        self._font_x2frozen = {}
 
         for x in (0, 1, 2, 3, 5): # The font with index 4 is omitted in all BIFF versions
             font = Formatting.Font()
@@ -73,10 +181,15 @@ class StyleCollection(object):
             self._font_id2x[font] = x
             self._font_x2id[x] = font
             self._font_val2x[search_key] = x
+            self._font_x2frozen[x] = FrozenFont(font)
 
         self._xf_id2x = {}
         self._xf_x2id = {}
-        self._xf_val2x = {}
+        self._xf_x2key = {}
+        self._xf_snapshot2x = {}
+        self._unmerged_diffs = []
+        self._unmerged_keys = set()
+        self._track_diffs = False
 
         self._num_formats = {}
         for fmtidx, fmtstr in zip(range(0, 23), StyleCollection._std_num_fmt_list[0:23]):
@@ -86,11 +199,89 @@ class StyleCollection(object):
 
         self.default_style = XFStyle()
         self._default_xf = self._add_style(self.default_style)[0]
+        self._track_diffs = True
 
     def add(self, style):
         if style == None:
             return 0x10
         return self._add_style(style)[1]
+
+    @staticmethod
+    def _xf_snapshot(font_idx, num_format_idx, gof):
+        # Snapshot the whole XF definition, including the number format
+        # string, so that styles which look identical on a sample of zero
+        # values (e.g. money vs. percentage formats) are never merged.
+        return (font_idx, num_format_idx) + tuple(obj._search_key() for obj in gof)
+
+    def _register_xf(self, live_xf, frozen_xf, xf_key):
+        # _xf_id2x keeps the caller's tuple so identity-based stats keep
+        # their original meaning; _xf_x2id keeps the immutable snapshot that
+        # is actually emitted.
+        xf_index = self._xf_snapshot2x.get(xf_key)
+        if xf_index is not None:
+            self._xf_id2x[live_xf] = xf_index
+            return xf_index, True
+        xf_index = 0x10 + len(self._xf_x2id)
+        self._xf_id2x[live_xf] = xf_index
+        self._xf_snapshot2x[xf_key] = xf_index
+        self._xf_x2id[xf_index] = frozen_xf
+        self._xf_x2key[xf_index] = xf_key
+        return xf_index, False
+
+    def _record_unmerged_diff(self, xf_key):
+        if not self._track_diffs or xf_key in self._unmerged_keys:
+            return
+        self._unmerged_keys.add(xf_key)
+        font_idx, num_format_idx, alignment_key, borders_key, pattern_key, protection_key = xf_key
+        num_format_strs = [
+            fmt_str for fmt_str, fmt_idx in self._num_formats.items()
+            if fmt_idx == num_format_idx
+        ]
+        self._unmerged_diffs.append({
+            'num_format_idx': num_format_idx,
+            'num_format_str': num_format_strs[0] if num_format_strs else None,
+            'font_idx': font_idx,
+            'alignment': alignment_key,
+            'borders': borders_key,
+            'pattern': pattern_key,
+            'protection': protection_key,
+        })
+
+    def unmerged_style_diffs(self):
+        # Definitions that produced a new XF record even though style
+        # compression was enabled; each entry names the component that
+        # prevented reuse. Entries are ordered by first occurrence.
+        return [dict(item) for item in self._unmerged_diffs]
+
+    def _resolve_font(self, font):
+        # Identity reuse is only valid while the object still matches the
+        # snapshot taken at registration. A mutated font falls through to
+        # value-based lookup so it gets a new index instead of rewriting the
+        # style already used by earlier rows.
+        if font in self._font_id2x:
+            font_idx = self._font_id2x[font]
+            frozen = self._font_x2frozen.get(font_idx)
+            if frozen is None or frozen._search_key() == font._search_key():
+                self.stats[0] += 1
+                return font_idx
+        if self.style_compression:
+            search_key = font._search_key()
+            font_idx = self._font_val2x.get(search_key)
+            if font_idx is not None:
+                self._font_id2x[font] = font_idx
+                self.stats[1] += 1
+                return font_idx
+            font_idx = len(self._font_x2id) + 1 # Why plus 1? Font 4 is missing
+            self._font_id2x[font] = font_idx
+            self._font_val2x[search_key] = font_idx
+            self._font_x2id[font_idx] = font
+            self._font_x2frozen[font_idx] = FrozenFont(font)
+            self.stats[2] += 1
+            return font_idx
+        font_idx = len(self._font_id2x) + 1
+        self._font_id2x[font] = font_idx
+        self.stats[2] += 1
+        return font_idx
 
     def _add_style(self, style):
         num_format_str = style.num_format_str
@@ -104,43 +295,32 @@ class StyleCollection(object):
             )
             self._num_formats[num_format_str] = num_format_idx
 
-        font = style.font
-        if font in self._font_id2x:
-            font_idx = self._font_id2x[font]
-            self.stats[0] += 1
-        elif self.style_compression:
-            search_key = font._search_key()
-            font_idx = self._font_val2x.get(search_key)
-            if font_idx is not None:
-                self._font_id2x[font] = font_idx
-                self.stats[1] += 1
-            else:
-                font_idx = len(self._font_x2id) + 1 # Why plus 1? Font 4 is missing
-                self._font_id2x[font] = font_idx
-                self._font_val2x[search_key] = font_idx
-                self._font_x2id[font_idx] = font
-                self.stats[2] += 1
-        else:
-            font_idx = len(self._font_id2x) + 1
-            self._font_id2x[font] = font_idx
-            self.stats[2] += 1
+        font_idx = self._resolve_font(style.font)
 
         gof = (style.alignment, style.borders, style.pattern, style.protection)
         xf = (font_idx, num_format_idx) + gof
-        if xf in self._xf_id2x:
-            xf_index = self._xf_id2x[xf]
+        identity_index = self._xf_id2x.get(xf)
+        if self.style_compression == 2 and identity_index is not None:
+            # The tuple was registered before; trust the identity shortcut
+            # only while its snapshot still matches the current objects.
+            identity_valid = (
+                self._xf_x2key.get(identity_index)
+                == self._xf_snapshot(font_idx, num_format_idx, gof)
+            )
+        else:
+            identity_valid = identity_index is not None
+
+        if identity_index is not None and identity_valid:
+            xf_index = identity_index
             self.stats[3] += 1
         elif self.style_compression == 2:
-            xf_key = (font_idx, num_format_idx) + tuple(obj._search_key() for obj in gof)
-            xf_index = self._xf_val2x.get(xf_key)
-            if xf_index is not None:
-                self._xf_id2x[xf] = xf_index
+            xf_key = self._xf_snapshot(font_idx, num_format_idx, gof)
+            frozen_xf = (font_idx, num_format_idx) + _freeze_gof(gof)
+            xf_index, reused = self._register_xf(xf, frozen_xf, xf_key)
+            if reused:
                 self.stats[4] += 1
             else:
-                xf_index = 0x10 + len(self._xf_x2id)
-                self._xf_id2x[xf] = xf_index
-                self._xf_val2x[xf_key] = xf_index
-                self._xf_x2id[xf_index] = xf
+                self._record_unmerged_diff(xf_key)
                 self.stats[5] += 1
         else:
             xf_index = 0x10 + len(self._xf_id2x)
@@ -157,27 +337,7 @@ class StyleCollection(object):
         return self._add_font(font)
 
     def _add_font(self, font):
-        if font in self._font_id2x:
-            font_idx = self._font_id2x[font]
-            self.stats[0] += 1
-        elif self.style_compression:
-            search_key = font._search_key()
-            font_idx = self._font_val2x.get(search_key)
-            if font_idx is not None:
-                self._font_id2x[font] = font_idx
-                self.stats[1] += 1
-            else:
-                font_idx = len(self._font_x2id) + 1 # Why plus 1? Font 4 is missing
-                self._font_id2x[font] = font_idx
-                self._font_val2x[search_key] = font_idx
-                self._font_x2id[font_idx] = font
-                self.stats[2] += 1
-        else:
-            font_idx = len(self._font_id2x) + 1
-            self._font_id2x[font] = font_idx
-            self.stats[2] += 1
-
-        return font_idx
+        return self._resolve_font(font)
 
 
     def get_biff_data(self):
@@ -191,7 +351,7 @@ class StyleCollection(object):
     def _all_fonts(self):
         result = b''
         if self.style_compression:
-            fonts = self._font_x2id.items()
+            fonts = self._font_x2frozen.items()
         else:
             fonts = [(x, o) for o, x in self._font_id2x.items()]
         for font_idx, font in sorted(fonts):
