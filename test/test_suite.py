@@ -38,10 +38,11 @@ import pytest
 import uuid
 import sqlite3
 import re
+import csv
 import collections
 
 sys.path.append(os.path.join(os.path.abspath(os.path.dirname(sys.argv[0])),'..','bin'))
-from bin.q import QTextAsData, QOutput, QOutputPrinter, QInputParams, DataStream, Sqlite3DB
+from bin.q import QTextAsData, QOutput, QOutputPrinter, QInputParams, DataStream, Sqlite3DB, DelimitedFileReader
 
 # q uses this encoding as the default output encoding. Some of the tests use it in order to 
 # make sure that the output is correctly encoded
@@ -3095,7 +3096,7 @@ with_universal_newlines=True
         retcode, o, e = run_command(cmd, env_to_inject=env_to_inject)
 
         self.assertEqual(retcode, 0)
-        self.assertEqual(len(o), 34)
+        self.assertEqual(len(o), 35)
         self.assertEqual(len(e), 0)
 
         self.assertEqual(o[0],six.b('[options]'))
@@ -3138,6 +3139,7 @@ with_universal_newlines=True
         self.assertEqual(m[six.b('tab_delimited_output')],six.b('True'))
         self.assertEqual(m[six.b('verbose')],six.b('True'))
         self.assertEqual(m[six.b('with_universal_newlines')],six.b('True'))
+        self.assertEqual(m[six.b('fault_tolerant_report_path')],six.b('None'))
 
         self.cleanup(tmp_qrc_file)
 
@@ -4793,6 +4795,161 @@ class ParsingModeTests(AbstractQTestCase):
         self.assertEqual(len(e),1)
         self.assertTrue(e[0].startswith(six.b("Strict mode - Expected 4 columns instead of 5 columns")))
         self.assertTrue(six.b(' row 751.') in e[0])
+
+        self.cleanup(tmpfile)
+
+
+FAULT_TOLERANT_DIALECT = 'q_fault_tolerant_test_dialect'
+csv.register_dialect(FAULT_TOLERANT_DIALECT, delimiter=',', quotechar='"',
+                     quoting=csv.QUOTE_MINIMAL, doublequote=True,
+                     skipinitialspace=True, escapechar=None)
+
+
+class FaultTolerantInputTests(AbstractQTestCase):
+
+    def _read_jsonl(self, filename):
+        with open(filename, encoding='utf-8') as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _entries(self, report, kind):
+        return [entry for entry in report if entry['kind'] == kind]
+
+    def test_bad_column_count_row_is_listed_and_good_rows_remain_queryable(self):
+        tmpfile = self.create_file_with_data(six.b(
+            'id,name,val\n1,alice,10\n2,bob,20,extra\n3,carol,30\n'))
+        report_filename = tmpfile.name + '.jsonl'
+
+        cmd = Q_EXECUTABLE + ' -d , -H -P --fault-tolerant-report %s "select id from %s"' % (
+            report_filename, tmpfile.name)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        # The bad 4-column row is absent, the two well-formed rows are queryable
+        self.assertEqual(o, [six.b('1'), six.b('3')])
+        self.assertTrue(any(six.b('Fault-tolerant input report') in line for line in e))
+
+        report = self._read_jsonl(report_filename)
+        bad = self._entries(report, 'bad-record')
+        self.assertEqual(len(bad), 1)
+        entry = bad[0]
+        self.assertEqual(entry['source'], os.path.realpath(tmpfile.name))
+        # Logical record numbering counts every source record, including header
+        self.assertEqual(entry['record_number'], 3)
+        self.assertEqual(entry['start_line'], 3)
+        self.assertEqual(entry['end_line'], 3)
+        self.assertTrue('column count mismatch' in entry['reason'])
+        self.assertEqual(entry['raw_text'], '2,bob,20,extra\n')
+        self.assertTrue(entry['start_offset'] < entry['end_offset'])
+
+        summary = self._entries(report, 'source-summary')
+        self.assertEqual(len(summary), 1)
+        # good_records counts structurally valid records, including the header
+        self.assertEqual(summary[0]['good_records'], 3)
+        self.assertEqual(summary[0]['bad_records'], 1)
+        self.assertEqual(summary[0]['undetermined_region'], False)
+
+        os.remove(report_filename)
+        self.cleanup(tmpfile)
+
+    def test_quoted_newline_belongs_to_one_record_and_is_kept(self):
+        tmpfile = self.create_file_with_data(six.b(
+            'id,name\n1,"line1\nline2"\n2,bob\n3,carol,x\n'))
+        report_filename = tmpfile.name + '.jsonl'
+
+        cmd = Q_EXECUTABLE + ' -d , -H --fault-tolerant-report %s "select count(*) from %s"' % (
+            report_filename, tmpfile.name)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        # Two well-formed rows (the multiline quoted row counts as one)
+        self.assertEqual(o, [six.b('2')])
+
+        report = self._read_jsonl(report_filename)
+        bad = self._entries(report, 'bad-record')
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]['record_number'], 4)
+        self.assertEqual(bad[0]['start_line'], 5)
+
+        os.remove(report_filename)
+        self.cleanup(tmpfile)
+
+    def test_unclosed_quote_becomes_single_undetermined_region(self):
+        tmpfile = self.create_file_with_data(six.b(
+            'id,name\n1,alice\n2,"unclosed,99\ntail1\ntail2'))
+        report_filename = tmpfile.name + '.jsonl'
+
+        cmd = Q_EXECUTABLE + ' -d , -H -P --fault-tolerant-report %s "select id from %s"' % (
+            report_filename, tmpfile.name)
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        # The good prefix is still queryable; no fabricated bad line numbers
+        self.assertEqual(o, [six.b('1')])
+
+        report = self._read_jsonl(report_filename)
+        undetermined = self._entries(report, 'undetermined-region')
+        self.assertEqual(len(undetermined), 1)
+        region = undetermined[0]
+        self.assertIsNone(region['end_line'])
+        self.assertEqual(region['source'], os.path.realpath(tmpfile.name))
+        self.assertTrue('unclosed quote' in region['reason'])
+        self.assertTrue(region['raw_text'].startswith('2,"unclosed'))
+        # No per-line bad records are invented for the tail
+        self.assertEqual(self._entries(report, 'bad-record'), [])
+        self.assertTrue(any(six.b('undetermined region') in line for line in e))
+
+        os.remove(report_filename)
+        self.cleanup(tmpfile)
+
+    def test_every_non_header_byte_is_accounted_for(self):
+        tmpfile = self.create_file_with_data(six.b(
+            'id,name,val\n1,alice,10\n2,bob,20,extra\n3,"multi\nline",30\n4,"unclosed,99\ntail'))
+        report_filename = tmpfile.name + '.jsonl'
+        with open(tmpfile.name, 'rb') as fh:
+            text = fh.read().decode('utf-8')
+
+        params = QInputParams(
+            delimiter=',', skip_header=True,
+            fault_tolerant_report_path=report_filename)
+        reader = DelimitedFileReader([os.path.realpath(tmpfile.name)],
+                                     params, FAULT_TOLERANT_DIALECT)
+        reader.open_file()
+        list(reader.generate_rows())
+        reader.close_file()
+        reader.flush_fault_tolerant_reports()
+
+        good_ranges = []
+        for plan in reader.fault_tolerant_plans:
+            for kind, meta, *rest in plan.items:
+                if kind == 'good':
+                    good_ranges.append((meta['start_offset'], meta['end_offset']))
+
+        report = self._read_jsonl(report_filename)
+        side_ranges = [(entry['start_offset'], entry['end_offset'])
+                       for entry in report
+                       if entry['kind'] in ('bad-record', 'undetermined-region')]
+
+        # The header is the first good record; everything else must be tiled.
+        header_range = good_ranges[0]
+        header_len = header_range[1] - header_range[0]
+        accounted = sorted(good_ranges[1:] + side_ranges)
+        reconstructed = ''.join(text[a:b] for a, b in accounted)
+
+        self.assertEqual(reconstructed, text[header_len:])
+
+        os.remove(report_filename)
+        self.cleanup(tmpfile)
+
+    def test_legacy_behavior_unchanged_without_report_option(self):
+        tmpfile = self.create_file_with_data(six.b(
+            'a,b\n1,2\n3,4,9\n'))
+        cmd = Q_EXECUTABLE + ' -d , -P "select * from %s"' % tmpfile.name
+        retcode, o, e = run_command(cmd)
+
+        self.assertEqual(retcode, 0)
+        # Without -H every line is data; relaxed mode pads short rows and
+        # merges extra columns, exactly as before fault tolerance existed
+        self.assertEqual(o, [six.b('a|b|'), six.b('1|2|'), six.b('3|4|9')])
 
         self.cleanup(tmpfile)
 

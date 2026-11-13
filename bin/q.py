@@ -1266,6 +1266,208 @@ def py3_encoded_csv_reader(encoding, f, dialect,row_data_only=False,**kwargs):
 
 encoded_csv_reader = py3_encoded_csv_reader
 
+
+# ---------------------------------------------------------------------------
+# Fault-tolerant delimited input reading
+#
+# The csv module silently accepts an unclosed quote at end of file (it treats
+# the rest of the input as the last record), so once a quote is left open the
+# record boundaries can no longer be trusted. The scanner below determines the
+# deterministic record boundaries on its own first. Records whose boundaries
+# are clear are always parsed; structurally broken records are diverted into a
+# traceable side report instead of aborting the query. If the tail of the input
+# has no deterministic boundary anymore, it is reported as a single
+# undetermined region rather than inventing per-line bad row numbers.
+#
+# Every non-header character of the input is therefore accounted for by either a
+# good record (visible to the query) or a bad-record / undetermined-region
+# entry in the side report.
+# ---------------------------------------------------------------------------
+
+FAULT_TOLERANT_KIND_BAD_RECORD = 'bad-record'
+FAULT_TOLERANT_KIND_UNDETERMINED_REGION = 'undetermined-region'
+FAULT_TOLERANT_KIND_SOURCE_SUMMARY = 'source-summary'
+
+
+class FaultTolerantInputReport(object):
+    """Traceable inventory of one fault-tolerantly read input source."""
+
+    def __init__(self, source_name, report_path):
+        self.source_name = source_name
+        self.report_path = report_path
+        self.good_record_count = 0
+        self.total_chars = 0
+        self.entries = []
+
+    def add_bad_record(self, record_number, start_line, end_line,
+                       start_offset, end_offset, reason, raw_text):
+        self.entries.append(OrderedDict([
+            ('kind', FAULT_TOLERANT_KIND_BAD_RECORD),
+            ('source', self.source_name),
+            ('record_number', record_number),
+            ('start_line', start_line),
+            ('end_line', end_line),
+            ('start_offset', start_offset),
+            ('end_offset', end_offset),
+            ('reason', reason),
+            ('raw_text', raw_text),
+        ]))
+
+    def set_undetermined_region(self, start_line, start_offset, end_offset,
+                                reason, raw_text):
+        self.entries.append(OrderedDict([
+            ('kind', FAULT_TOLERANT_KIND_UNDETERMINED_REGION),
+            ('source', self.source_name),
+            ('start_line', start_line),
+            ('end_line', None),
+            ('start_offset', start_offset),
+            ('end_offset', end_offset),
+            ('reason', reason),
+            ('raw_text', raw_text),
+        ]))
+
+    def has_undetermined_region(self):
+        return any(entry['kind'] == FAULT_TOLERANT_KIND_UNDETERMINED_REGION
+                   for entry in self.entries)
+
+    def bad_record_count(self):
+        return sum(1 for entry in self.entries
+                   if entry['kind'] == FAULT_TOLERANT_KIND_BAD_RECORD)
+
+    def to_jsonl_lines(self):
+        lines = [json.dumps(entry, ensure_ascii=False) for entry in self.entries]
+        summary = OrderedDict([
+            ('kind', FAULT_TOLERANT_KIND_SOURCE_SUMMARY),
+            ('source', self.source_name),
+            ('total_chars', self.total_chars),
+            ('good_records', self.good_record_count),
+            ('bad_records', self.bad_record_count()),
+            ('undetermined_region', self.has_undetermined_region()),
+            ('report_path', self.report_path),
+        ])
+        lines.append(json.dumps(summary, ensure_ascii=False))
+        return lines
+
+
+def scan_delimited_record_segments(text, dialect):
+    """Split decoded input text into deterministic record segments.
+
+    Newlines inside quoted fields belong to the same record, so a segment may
+    span several physical lines. The final segment is returned with
+    closed=False only when the input ends while a quote is still open; such a
+    segment covers the rest of the input and no further boundaries can be
+    determined.
+    """
+    delimiter = dialect.delimiter
+    quotechar = dialect.quotechar
+    quoting_active = dialect.quoting != csv.QUOTE_NONE
+    doublequote = bool(dialect.doublequote)
+    escapechar = dialect.escapechar
+
+    n = len(text)
+    segments = []
+    in_quote = False
+    field_start = True
+    segment_start = 0
+    segment_start_line = 1
+    physical_line = 1
+    i = 0
+
+    while i < n:
+        ch = text[i]
+
+        if ch == '\n':
+            physical_line += 1
+            if not in_quote:
+                # The range includes the terminating newline so that the
+                # good/bad/undetermined ranges tile the whole input without
+                # leaving the newline bytes unaccounted for.
+                segments.append({
+                    'start_offset': segment_start,
+                    'end_offset': i + 1,
+                    'start_line': segment_start_line,
+                    'end_line': physical_line - 1,
+                    'closed': True,
+                })
+                segment_start = i + 1
+                segment_start_line = physical_line
+                field_start = True
+            i += 1
+            continue
+
+        if in_quote:
+            if escapechar is not None and ch == escapechar and i + 1 < n:
+                # escaped character (e.g. \\") stays part of the quoted field
+                i += 2
+                continue
+            if ch == quotechar:
+                if doublequote and i + 1 < n and text[i + 1] == quotechar:
+                    i += 2
+                    continue
+                in_quote = False
+                field_start = False
+            i += 1
+            continue
+
+        if ch == quotechar and quoting_active and field_start:
+            in_quote = True
+            field_start = False
+        elif ch == delimiter:
+            field_start = True
+        else:
+            # quotes outside of field starts (or with quoting disabled) are
+            # literal and do not affect record boundaries
+            field_start = False
+        i += 1
+
+    if segment_start < n or in_quote:
+        segments.append({
+            'start_offset': segment_start,
+            'end_offset': n,
+            'start_line': segment_start_line,
+            'end_line': physical_line,
+            'closed': not in_quote,
+        })
+
+    return segments
+
+
+class FaultTolerantSourcePlan(object):
+    """Materialized boundary plan for one input source (file or stream).
+
+    The whole decoded content is read up front because detecting an unclosed
+    quote requires knowing where the input ends. A cursor is maintained so the
+    analyze pass and the full-read pass can share one materialized plan.
+    """
+
+    def __init__(self, source_name, report, text, segments):
+        self.source_name = source_name
+        self.report = report
+        self.text = text
+        self.segments = segments
+        self.segment_cursor = 0
+        self.first_row_pending = True
+
+
+def open_fault_tolerant_source_stream(filename, input_params, skipped_bom):
+    if input_params.gzipped_input or filename.endswith('.gz'):
+        import gzip
+        stream = gzip.open(filename, mode='rt', encoding=input_params.input_encoding)
+    else:
+        mode = 'rU' if input_params.with_universal_newlines else 'r'
+        stream = io.open(filename, mode, newline=None,
+                         encoding=input_params.input_encoding)
+    if input_params.input_encoding == 'utf-8-sig' and not skipped_bom:
+        skip_BOM(stream)
+    return stream
+
+
+def reset_fault_tolerant_report(path):
+    if path:
+        with io.open(path, 'w', encoding='utf-8'):
+            pass
+
+
 def normalized_filename(filename):
     return filename
 
@@ -1411,6 +1613,183 @@ class DelimitedFileReader(object):
         self.external_f = f is not None
         self.external_f_name = external_f_name
 
+        # Fault-tolerant reading state. One report is kept per input source
+        # (file or stream), keyed by the source name.
+        self.fault_tolerant_reports = OrderedDict()
+        self.fault_tolerant_plans = []
+
+    def fault_tolerant_mode_active(self):
+        return bool(self.input_params.fault_tolerant_report_path)
+
+    def _get_or_create_fault_tolerant_report(self, source_name):
+        report = self.fault_tolerant_reports.get(source_name)
+        if report is None:
+            report = FaultTolerantInputReport(
+                source_name, self.input_params.fault_tolerant_report_path)
+            self.fault_tolerant_reports[source_name] = report
+        return report
+
+    def _classify_fault_tolerant_segments(self, plan, dialect_obj):
+        record_number = 0
+        plan.items = []
+        plan.undetermined = False
+        for segment in plan.segments:
+            raw_text = plan.text[segment['start_offset']:segment['end_offset']]
+
+            if not segment['closed']:
+                plan.undetermined = True
+                plan.report.set_undetermined_region(
+                    segment['start_line'], segment['start_offset'],
+                    segment['end_offset'],
+                    'unclosed quote reached end of input; record boundaries after this point are not deterministic',
+                    raw_text)
+                continue
+
+            record_number += 1
+            meta = OrderedDict([
+                ('source', plan.source_name),
+                ('record_number', record_number),
+                ('start_line', segment['start_line']),
+                ('end_line', segment['end_line']),
+                ('start_offset', segment['start_offset']),
+                ('end_offset', segment['end_offset']),
+                ('raw_text', raw_text),
+            ])
+
+            # A blank physical line (raw_text '\n') parses to a single empty
+            # record [], matching the standard csv reader's behavior.
+            try:
+                parsed_rows = list(csv.reader(io.StringIO(raw_text), dialect_obj))
+                parse_error = None
+                if len(parsed_rows) != 1:
+                    parse_error = 'csv parse error: expected a single record, got %s' % len(parsed_rows)
+            except csv.Error as e:
+                parsed_rows = []
+                parse_error = 'csv parse error: %s' % str(e)
+
+            if parse_error is None:
+                plan.report.good_record_count += 1
+                plan.items.append(('good', meta, parsed_rows[0]))
+            else:
+                plan.report.add_bad_record(
+                    record_number, segment['start_line'], segment['end_line'],
+                    segment['start_offset'], segment['end_offset'],
+                    parse_error, raw_text)
+                plan.items.append(('bad', meta))
+
+    def _build_fault_tolerant_plans(self):
+        dialect_obj = csv.get_dialect(self.dialect)
+        if self.external_f:
+            sources = [(self.external_f_name, self.f, False)]
+        else:
+            sources = [(atomic_fn, None, True) for atomic_fn in self.atomic_fns]
+
+        plans = []
+        for source_name, provided_stream, owns_stream in sources:
+            report = self._get_or_create_fault_tolerant_report(source_name)
+            if provided_stream is None:
+                stream = open_fault_tolerant_source_stream(
+                    source_name, self.input_params, self.skipped_bom)
+            else:
+                stream = provided_stream
+
+            text = stream.read()
+            if isinstance(text, bytes):
+                text = text.decode(self.input_params.input_encoding)
+            if owns_stream:
+                stream.close()
+
+            report.total_chars = len(text)
+            segments = scan_delimited_record_segments(text, dialect_obj)
+            plan = FaultTolerantSourcePlan(source_name, report, text, segments)
+            self._classify_fault_tolerant_segments(plan, dialect_obj)
+            plans.append(plan)
+
+        self.fault_tolerant_plans = plans
+        self._classify_column_count_mismatches()
+        return plans
+
+    def _classify_column_count_mismatches(self):
+        # The expected column count is table-wide. An explicit -c always wins.
+        # With a header row, its column count is the structural baseline.
+        # Otherwise the modal data column count is used so a minority of
+        # malformed rows cannot pollute the baseline (on a tie, the largest
+        # count wins). Header records do not participate as data.
+        header_col_count = None
+        data_column_counts = []
+        for plan in self.fault_tolerant_plans:
+            header_seen = not self.input_params.skip_header
+            for item in plan.items:
+                if item[0] != 'good':
+                    continue
+                col_vals = item[2]
+                if not header_seen:
+                    header_col_count = len(col_vals)
+                    header_seen = True
+                    continue
+                if len(col_vals) > 0:
+                    data_column_counts.append(len(col_vals))
+
+        if self.input_params.expected_column_count is not None:
+            expected_col_count = self.input_params.expected_column_count
+        elif header_col_count is not None:
+            expected_col_count = header_col_count
+        elif len(data_column_counts) > 0:
+            frequencies = {}
+            for count in data_column_counts:
+                frequencies[count] = frequencies.get(count, 0) + 1
+            highest_frequency = max(frequencies.values())
+            modal_counts = [count for count, freq in frequencies.items()
+                            if freq == highest_frequency]
+            expected_col_count = max(modal_counts)
+        else:
+            expected_col_count = None
+
+        if expected_col_count is None:
+            return
+
+        for plan in self.fault_tolerant_plans:
+            header_seen = not self.input_params.skip_header
+            for item_index, item in enumerate(plan.items):
+                if item[0] != 'good':
+                    continue
+                if not header_seen:
+                    header_seen = True
+                    continue
+
+                meta = item[1]
+                col_vals = item[2]
+                # Blank records are kept (relaxed mode pads them with NULLs)
+                if len(col_vals) == 0 or len(col_vals) == expected_col_count:
+                    continue
+
+                reason = 'column count mismatch: expected %s columns but record has %s columns' % (
+                    expected_col_count, len(col_vals))
+                plan.report.good_record_count -= 1
+                plan.report.add_bad_record(
+                    meta['record_number'], meta['start_line'], meta['end_line'],
+                    meta['start_offset'], meta['end_offset'], reason,
+                    meta['raw_text'])
+                plan.items[item_index] = ('bad', meta)
+
+    def flush_fault_tolerant_reports(self):
+        report_path = self.input_params.fault_tolerant_report_path
+        if not report_path:
+            return
+        with io.open(report_path, 'a', encoding='utf-8') as out:
+            for report in self.fault_tolerant_reports.values():
+                for line in report.to_jsonl_lines():
+                    out.write(six.u(line) + six.u('\n'))
+
+    def get_fault_tolerant_report_summaries(self):
+        return [OrderedDict([
+            ('source', report.source_name),
+            ('report_path', report.report_path),
+            ('good_records', report.good_record_count),
+            ('bad_records', report.bad_record_count()),
+            ('undetermined_region', report.has_undetermined_region()),
+        ]) for report in self.fault_tolerant_reports.values()]
+
     def get_lines_read(self):
         return self.lines_read
 
@@ -1432,11 +1811,23 @@ class DelimitedFileReader(object):
     def open_file(self):
         if self.external_f:
             xprint("External f has been provided. No need to open the file")
+            if self.fault_tolerant_mode_active():
+                self.fault_tolerant_plans = self._build_fault_tolerant_plans()
             return
 
         # TODO Support universal newlines for gzipped and stdin data as well
 
         xprint("XX Opening file %s" % ",".join(self.atomic_fns))
+
+        if self.fault_tolerant_mode_active():
+            # Fault-tolerant mode materializes every source up front so the
+            # end of the input (and thus an unclosed quote) is known. The
+            # plans keep a cursor which the analyze and full-read passes share.
+            self.fault_tolerant_plans = self._build_fault_tolerant_plans()
+            self.f = None
+            self.is_open = True
+            return
+
         import fileinput
 
         def q_openhook(filename, mode):
@@ -1473,10 +1864,40 @@ class DelimitedFileReader(object):
             # TODO Convert to assertion
             raise Exception("Bug - file should already be open: %s" % ",".join(self.atomic_fns))
 
-        self.f.close()
+        if self.f is not None:
+            self.f.close()
         xprint("XX Closed file %s" % ",".join(self.atomic_fns))
 
+    def _generate_fault_tolerant_rows(self):
+        for plan in self.fault_tolerant_plans:
+            while plan.segment_cursor < len(plan.items):
+                item_index = plan.segment_cursor
+                item = plan.items[item_index]
+                plan.segment_cursor += 1
+
+                if item[0] == 'bad':
+                    # Structurally broken records never reach the query
+                    continue
+
+                col_vals = item[2]
+                is_first_line = plan.first_row_pending
+                plan.first_row_pending = False
+
+                self.lines_read += 1
+
+                if self.external_f:
+                    yield self.external_f_name, 0, False, col_vals
+                else:
+                    if is_first_line:
+                        self.file_number += 1
+                    yield plan.source_name, self.file_number, is_first_line, col_vals
+
     def generate_rows(self):
+        if self.fault_tolerant_mode_active():
+            for row in self._generate_fault_tolerant_rows():
+                yield row
+            return
+
         csv_reader = encoded_csv_reader(self.input_params.input_encoding, self.f, dialect=self.dialect,row_data_only=self.external_f)
         try:
             # TODO Some order with regard to separating data-streams for actual files
@@ -2127,6 +2548,7 @@ class TableCreator(object):
         self.expected_column_count = input_params.expected_column_count
         self.input_delimiter = input_params.delimiter
         self.with_universal_newlines = input_params.with_universal_newlines
+        self.fault_tolerant_report_path = input_params.fault_tolerant_report_path
 
         self.column_inferer = TableColumnInferer(input_params)
 
@@ -2159,6 +2581,7 @@ class TableCreator(object):
             "mode": self.mode,
             "expected_column_count": self.expected_column_count,
             "input_delimiter": self.input_delimiter,
+            "fault_tolerant": bool(self.fault_tolerant_report_path),
             "inferer": self.column_inferer._generate_content_signature(),
             "original_file_size": size,
             "last_modification_time": last_modification_time
@@ -2468,7 +2891,8 @@ class QInputParams(object):
             max_column_length_limit=131072,
             read_caching=False,
             write_caching=False,
-            max_attached_sqlite_databases = 10):
+            max_attached_sqlite_databases = 10,
+            fault_tolerant_report_path=None):
         self.skip_header = skip_header
         self.delimiter = delimiter
         self.input_encoding = input_encoding
@@ -2485,6 +2909,7 @@ class QInputParams(object):
         self.read_caching = read_caching
         self.write_caching = write_caching
         self.max_attached_sqlite_databases = max_attached_sqlite_databases
+        self.fault_tolerant_report_path = fault_tolerant_report_path
 
     def merged_with(self,input_params):
         params = QInputParams(**self.__dict__)
@@ -2566,6 +2991,34 @@ class QTextAsData(object):
 
         self.add_db_to_database_list(DatabaseInfo(self.query_level_db_id,self.query_level_db,needs_closing=True))
         self.add_db_to_database_list(DatabaseInfo(self.adhoc_db_id,self.adhoc_db,needs_closing=True))
+
+        # Fault-tolerant input reports accumulate across the tables of a run
+        self.fault_tolerant_warnings = []
+        self._emitted_fault_warning_count = 0
+        report_path = default_input_params.fault_tolerant_report_path
+        if report_path:
+            reset_fault_tolerant_report(report_path)
+
+    def drain_fault_tolerant_warnings(self):
+        # Returns only warnings not returned by previous calls, so several
+        # queries sharing one engine never duplicate input-report warnings.
+        pending = self.fault_tolerant_warnings[self._emitted_fault_warning_count:]
+        self._emitted_fault_warning_count = len(self.fault_tolerant_warnings)
+        return pending
+
+    def _handle_fault_tolerant_report(self, mfs, input_params):
+        reader = getattr(mfs, 'delimited_file_reader', None)
+        if reader is None or not reader.fault_tolerant_mode_active():
+            return
+
+        reader.flush_fault_tolerant_reports()
+        for summary in reader.get_fault_tolerant_report_summaries():
+            parts = ["Fault-tolerant input report for '%s': %s good record(s), %s bad record(s)" % (
+                summary['source'], summary['good_records'], summary['bad_records'])]
+            if summary['undetermined_region']:
+                parts.append("1 undetermined region (an unclosed quote leaves the tail without deterministic record boundaries; no per-line bad row numbers were invented)")
+            parts.append("details in %s" % summary['report_path'])
+            self.fault_tolerant_warnings.append(QWarning(None, "; ".join(parts)))
 
     def done(self):
         xprint("Inside done: Database list is %s" % self.databases)
@@ -2661,7 +3114,12 @@ class QTextAsData(object):
         mfs.choose_db_to_use(forced_db_to_use,stop_after_analysis)
         xprint("Chosen db to use: source %s source_type %s db_id %s db_to_use %s" % (mfs.source,mfs.source_type,mfs.db_id,mfs.db_to_use))
 
-        database_info,relevant_table = mfs.make_data_available(stop_after_analysis)
+        try:
+            database_info,relevant_table = mfs.make_data_available(stop_after_analysis)
+        finally:
+            # Persist the input report even if reading/analysis raised, so the
+            # classified bad records and undetermined region are never lost
+            self._handle_fault_tolerant_report(mfs, input_params)
 
         if not self.is_adhoc_db(mfs.db_to_use) and not self.should_copy_instead_of_attach(input_params):
             if not self.already_attached_to_query_level_db(mfs.db_to_use):
@@ -2908,6 +3366,8 @@ class QTextAsData(object):
             if len(db_results_obj.results) == 0:
                 warnings.append(QWarning(None, "Warning - data is empty"))
 
+            warnings = self.drain_fault_tolerant_warnings() + warnings
+
             return QOutput(
                 data = db_results_obj.results,
                 metadata = QMetadata(
@@ -2987,6 +3447,7 @@ class QTextAsData(object):
                 xprint(traceback.format_exc())
             error = QError(e,repr(e),199)
 
+        warnings = self.drain_fault_tolerant_warnings() + warnings
         return QOutput(data=None,warnings = warnings,error = error , metadata=QMetadata(table_structures=self.loaded_table_structures_dict,new_table_structures=self.loaded_table_structures_dict,output_column_name_list=[]))
 
     def execute(self,query_str,input_params=None,save_db_to_disk_filename=None):
@@ -3336,6 +3797,7 @@ def initialize_command_line_parser(p, qrc_filename):
         default_query_filename = get_option_with_default(p, 'string', 'query_filename', None)
         default_query_encoding = get_option_with_default(p, 'string', 'query_encoding', locale.getpreferredencoding())
         default_max_attached_sqlite_databases = get_option_with_default(p,'int','max_attached_sqlite_databases', 10)
+        default_fault_tolerant_report_path = get_option_with_default(p, 'string', 'fault_tolerant_report_path', None)
     except IncorrectDefaultValueException as e:
         print("Incorrect value '%s' for option %s in .qrc file %s (option type is %s)" % (
         e.actual_value, e.option, qrc_filename, e.option_type))
@@ -3394,9 +3856,12 @@ def initialize_command_line_parser(p, qrc_filename):
     input_data_option_group.add_argument("-M", "--max-column-length-limit", 
                                        default=default_max_column_length_limit,
                                        help="Sets the maximum column length.")
-    input_data_option_group.add_argument("-U", "--with-universal-newlines", 
+    input_data_option_group.add_argument("-U", "--with-universal-newlines",
                                        default=default_with_universal_newlines, action="store_true",
                                        help="Expect universal newlines in the data. Limitation: -U works only with regular files for now, stdin or .gz files are not supported yet.")
+    input_data_option_group.add_argument("--fault-tolerant-report", dest="fault_tolerant_report_path",
+                                       default=default_fault_tolerant_report_path,
+                                       help="Fault-tolerant input reading. Structurally valid records stay queryable, while bad records (with their source file, logical record number, physical lines, raw character range and failure reason) and any undetermined tail region caused by an unclosed quote are written to this JSONL report. Every non-header input character is accounted for by either a good record or a report entry.")
     # -----------------------------------------------
     output_data_option_group = parser.add_argument_group("Output Options")
     output_data_option_group.add_argument("-D", "--output-delimiter", 
@@ -3622,7 +4087,8 @@ def parse_options(args, options):
                                         max_column_length_limit=max_column_length_limit,
                                         read_caching=read_caching,
                                         write_caching=write_caching,
-                                        max_attached_sqlite_databases=options.max_attached_sqlite_databases)
+                                        max_attached_sqlite_databases=options.max_attached_sqlite_databases,
+                                        fault_tolerant_report_path=options.fault_tolerant_report_path)
 
     output_params = QOutputParams(
         delimiter=options.output_delimiter,

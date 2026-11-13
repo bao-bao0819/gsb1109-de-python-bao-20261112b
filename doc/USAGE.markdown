@@ -148,6 +148,15 @@ Options:
                         Expect universal newlines in the data. Limitation: -U
                         works only with regular files for now, stdin or .gz
                         files are not supported yet.
+    --fault-tolerant-report FAULT_TOLERANT_REPORT_PATH
+                        Fault-tolerant input reading. Structurally valid
+                        records stay queryable, while bad records (source file,
+                        logical record number, physical lines, raw character
+                        range and failure reason) and any undetermined tail
+                        region caused by an unclosed quote are written to this
+                        JSONL report. Every non-header input character is
+                        accounted for by either a good record or a report
+                        entry.
 
   Output Options:
     -D OUTPUT_DELIMITER, --output-delimiter=OUTPUT_DELIMITER
@@ -205,6 +214,21 @@ q supports two parsing modes:
 
 * `relaxed` - This is the default mode. It tries to lean towards simplicity of use. When a row doesn't contains enough columns, they'll be filled with nulls, and when there are too many, the extra values will be merged to the last column. Defining the number of expected columns in this mode is done using the `-c` parameter. If it is not provided, then the number of columns is detected automatically (In most use cases, there is no need to specify `-c`)
 * `strict` - Strict mode is for hardcore csv/tsv parsing. Whenever a row doesn't contain the proper number of columns, processing will stop. `-c` must be provided when using this mode
+
+### Fault-tolerant input reading
+Providing `--fault-tolerant-report <path>` switches input reading to a fault-tolerant mode. The query still runs over the records that are structurally valid, while anything that cannot be trusted is diverted to a JSON Lines side report instead of aborting the whole run. The report is overwritten at the start of each q invocation and can also be configured through `.qrc` (`fault_tolerant_report_path=...`).
+
+Record boundaries are determined independently of Python's csv module, because the csv module silently accepts an unclosed quote at end of file. The rules are:
+
+* Newlines inside quoted fields belong to the same record, so one logical record may span several physical lines.
+* A record whose boundaries are clear but whose column count does not match the expected count is kept out of the query and listed as a bad record. The expected column count comes from `-c` when provided, otherwise from the header row, otherwise from the modal data column count.
+* If an unclosed quote means the rest of the input no longer has deterministic boundaries, that tail is recorded once as an `undetermined-region`. q does not fabricate per-line bad row numbers for it, and the good prefix before it remains queryable.
+
+Every non-header input character belongs to exactly one of: a good record (visible to the query), a `bad-record` entry, or an `undetermined-region` entry. Each report line is a JSON object:
+
+* `bad-record` - contains `source` (file name), `record_number` (logical record number, including the header), `start_line`/`end_line` (physical lines), `start_offset`/`end_offset` (raw character range into the decoded input text, including the terminating newline), `reason`, and the original `raw_text`.
+* `undetermined-region` - contains `source`, the `start_line` and `start_offset` where determinism was lost, `end_offset` at end of input, `end_line` set to null, `reason`, and the original `raw_text` of the whole tail.
+* `source-summary` - one per input source, with total character count, good/bad record counts, whether an undetermined region exists, and the report path.
 
 ### Output formatting option
 The format of F is as a list of X=f separated by commas, where X is a column number and f is a python format:
