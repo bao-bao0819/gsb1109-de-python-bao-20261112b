@@ -695,6 +695,227 @@ class TestPoFile(unittest.TestCase):
         expected_po = polib.pofile('tests/test_merge_after.po')
         self.assertEqual(po, expected_po)
 
+    def test_merge_rename_adopts_translations(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        po = polib.pofile('tests/test_merge_rename_before.po')
+        report = po.merge(refpot)
+        adopted = dict((r.new_msgid, r.old_msgid) for r in report.adopted)
+        self.assertEqual(adopted[u('Save document')], u('Save file'))
+        self.assertEqual(adopted[u('Open document')], u('Open'))
+        self.assertEqual(adopted[u('Close document')], u('Close window'))
+        self.assertEqual(adopted[u('%d document')], u('%d file'))
+        entry = po.find('Save document')
+        self.assertEqual(entry.msgstr, u('Datei speichern'))
+        self.assertEqual(entry.previous_msgid, u('Save file'))
+        # A renamed key means the translation needs confirmation.
+        self.assertTrue(entry.fuzzy)
+        plural = po.find('%d document')
+        self.assertEqual(plural.msgstr_plural, {0: u('%d Datei'),
+                                                1: u('%d Dateien')})
+        self.assertTrue(plural.fuzzy)
+        context = po.find('Open document', msgctxt='menu')
+        self.assertEqual(context.msgstr, u('Öffnen'))
+        self.assertTrue(context.fuzzy)
+
+    def test_merge_rename_keeps_fuzzy(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        po = polib.pofile('tests/test_merge_rename_before.po')
+        report = po.merge(refpot)
+        adopted = dict((r.new_msgid, r.old_msgid) for r in report.adopted)
+        self.assertEqual(adopted[u('Close document')], u('Close window'))
+        entry = po.find('Close document')
+        self.assertEqual(entry.msgstr, u('Fenster schließen'))
+        self.assertTrue(entry.fuzzy)
+
+    def test_merge_rename_split_is_unclaimed(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        po = polib.pofile('tests/test_merge_rename_before.po')
+        report = po.merge(refpot)
+        split = [r for r in report.unclaimed if r.reason == 'split']
+        self.assertEqual(len(split), 2)
+        self.assertEqual(sorted(r.new_key for r in split),
+                         [u('Delete all rows'), u('Delete selected row')])
+        for relation in split:
+            self.assertEqual(relation.old_key, u('Delete row'))
+            self.assertFalse(relation.adopted)
+        for msgid in ('Delete all rows', 'Delete selected row'):
+            entry = po.find(msgid)
+            self.assertEqual(entry.msgstr, u(''))
+            self.assertEqual(entry.previous_msgid, u('Delete row'))
+        self.assertNotIn('Delete all rows', report.as_dict()['adopted'])
+
+    def test_merge_rename_split_is_order_independent(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        before = polib.pofile('tests/test_merge_rename_before.po')
+        before_report = before.merge(refpot)
+
+        refpot2 = polib.pofile('tests/test_merge_rename.pot')
+        refpot2.reverse()
+        po2 = polib.pofile('tests/test_merge_rename_before.po')
+        second_report = po2.merge(refpot2)
+
+        def ownership(po):
+            return dict(
+                (e.msgid_with_context,
+                 (e.msgstr, tuple(sorted(e.msgstr_plural.items())), e.fuzzy))
+                for e in po if not e.obsolete
+            )
+
+        def relations(report):
+            return sorted(
+                (r.old_key, r.new_key, r.status, r.reason)
+                for r in report.relations
+            )
+
+        self.assertEqual(ownership(before), ownership(po2))
+        self.assertEqual(relations(before_report), relations(second_report))
+
+    def test_merge_rename_missing_source_is_unclaimed(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        po = polib.pofile('tests/test_merge_rename_before.po')
+        report = po.merge(refpot)
+        missing = [r for r in report.unclaimed if r.reason == 'source_missing']
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0].old_key, u('Print preview'))
+        self.assertEqual(po.find('Preview document').msgstr, u(''))
+
+    def test_merge_rename_twice_is_idempotent(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        po = polib.pofile('tests/test_merge_rename_before.po')
+        first_report = po.merge(refpot)
+        first_text = str(po)
+        obsolete_count = len(po.obsolete_entries())
+        second_report = po.merge(refpot)
+        self.assertEqual(second_report.created, 0)
+        self.assertEqual(second_report.obsoleted, 0)
+        self.assertEqual(len(po.obsolete_entries()), obsolete_count)
+        self.assertEqual(str(po), first_text)
+        self.assertEqual(len(second_report.adopted),
+                         len(first_report.adopted))
+        self.assertEqual(len(second_report.unclaimed),
+                         len(first_report.unclaimed))
+
+    def test_merge_rename_twice_after_reload(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        po = polib.pofile('tests/test_merge_rename_before.po')
+        po.merge(refpot)
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            po.save(tmpfile)
+            reloaded = polib.pofile(tmpfile)
+            report = reloaded.merge(refpot)
+            self.assertEqual(report.created, 0)
+            self.assertEqual(report.obsoleted, 0)
+            self.assertEqual(str(reloaded), str(po))
+        finally:
+            os.remove(tmpfile)
+
+    def test_merge_rename_keeps_reviewed_state(self):
+        refpot = polib.pofile('tests/test_merge_rename.pot')
+        po = polib.pofile('tests/test_merge_rename_before.po')
+        po.merge(refpot)
+        po.find('Save document').fuzzy = False
+        report = po.merge(refpot)
+        self.assertFalse(po.find('Save document').fuzzy)
+        self.assertEqual(report.created, 0)
+        self.assertEqual(report.obsoleted, 0)
+
+    def test_merge_rename_duplicate_sources_are_unclaimed(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='New', previous_msgid='Old'))
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Old', msgstr='eins'))
+        po.append(polib.POEntry(msgid='Old', msgstr='zwei'))
+        report = po.merge(refpot)
+        self.assertEqual(len(report.adopted), 0)
+        self.assertEqual(len(report.unclaimed), 1)
+        self.assertEqual(report.unclaimed[0].reason, 'ambiguous_source')
+        self.assertEqual(po.find('New').msgstr, '')
+
+    def test_merge_rename_ambiguous_new_key_is_unclaimed(self):
+        # The new key is claimed by the template's previous_msgid and, at the
+        # same time, the pofile records a different previous key for it.
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='New', previous_msgid='Old one'))
+        po = polib.POFile()
+        old = polib.POEntry(msgid='New')
+        old.previous_msgid = 'Old two'
+        old.msgstr = 'zwei'
+        po.append(old)
+        po.append(polib.POEntry(msgid='Old one', msgstr='eins'))
+        report = po.merge(refpot)
+        self.assertEqual(len(report.adopted), 0)
+        self.assertEqual(len(report.unclaimed), 2)
+        self.assertEqual(sorted(r.reason for r in report.unclaimed),
+                         ['ambiguous_source', 'ambiguous_source'])
+        self.assertEqual(sorted(r.old_key for r in report.unclaimed),
+                         ['Old one', 'Old two'])
+        self.assertEqual(po.find('New').msgstr, 'zwei')
+
+    def test_merge_rename_two_previous_keys_one_new_key(self):
+        refpot = polib.POFile()
+        entry = polib.POEntry(msgid='New')
+        entry.previous_msgid = 'Old one'
+        refpot.append(entry)
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Old one', msgstr='eins'))
+        po.append(polib.POEntry(msgid='Old two', msgstr='zwei'))
+        report = po.merge(refpot)
+        # The pofile itself cannot claim two previous keys for one entry,
+        # so this is a straightforward adoption.
+        self.assertEqual(len(report.adopted), 1)
+        self.assertEqual(po.find('New').msgstr, 'eins')
+
+    def test_merge_rename_uses_previous_key_from_pofile(self):
+        # The template has no #| hints at all; the rename is only recorded
+        # in the pofile, as left by a previous extraction.
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='New key'))
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Old key', msgstr='alt'))
+        entry = polib.POEntry(msgid='New key', previous_msgid='Old key')
+        entry.fuzzy = True
+        po.append(entry)
+        report = po.merge(refpot)
+        self.assertEqual(len(report.adopted), 1)
+        self.assertEqual(po.find('New key').msgstr, 'alt')
+        self.assertTrue(po.find('New key').fuzzy)
+        repeat = po.merge(refpot)
+        self.assertEqual(repeat.created, 0)
+        self.assertEqual(repeat.obsoleted, 0)
+
+    def test_merge_rename_pofile_split_is_unclaimed(self):
+        # Same split, but the only source of the relation is the pofile.
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='Save one'))
+        refpot.append(polib.POEntry(msgid='Save two'))
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Save', msgstr='speichern'))
+        for msgid in ('Save one', 'Save two'):
+            entry = polib.POEntry(msgid=msgid)
+            entry.previous_msgid = 'Save'
+            po.append(entry)
+        report = po.merge(refpot)
+        self.assertEqual(len(report.adopted), 0)
+        self.assertEqual(sorted(r.reason for r in report.unclaimed),
+                         ['split', 'split'])
+        self.assertEqual(po.find('Save one').msgstr, '')
+        self.assertEqual(po.find('Save two').msgstr, '')
+
+    def test_merge_rename_old_key_still_present(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='Old'))
+        renamed = polib.POEntry(msgid='New', previous_msgid='Old')
+        refpot.append(renamed)
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Old', msgstr='alt'))
+        report = po.merge(refpot)
+        self.assertEqual(len(report.adopted), 0)
+        self.assertEqual(report.unclaimed[0].reason,
+                         'source_still_present')
+        self.assertEqual(po.find('New').msgstr, '')
+
     def test_percent_translated(self):
         po = polib.pofile('tests/test_pofile_helpers.po')
         self.assertEqual(po.percent_translated(), 53)

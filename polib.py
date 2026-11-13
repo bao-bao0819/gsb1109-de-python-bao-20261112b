@@ -25,7 +25,8 @@ import io
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'default_encoding', 'escape', 'unescape', 'detect_encoding',
+           'MergeReport', 'RenameRelation', ]
 
 
 # the default encoding to use when encoding cannot be detected
@@ -96,6 +97,212 @@ def _is_file(filename_or_contents):
         return os.path.isfile(filename_or_contents)
     except (TypeError, ValueError, UnicodeEncodeError):
         return False
+# }}}
+# rename report helpers {{{
+
+
+def _key_from_parts(msgctxt, msgid):
+    """
+    Build the same lookup key as :attr:`POEntry.msgid_with_context` from a
+    context and a msgid that may come from ``previous_msgctxt`` and
+    ``previous_msgid``.
+    """
+    if msgctxt:
+        return '%s%s%s' % (msgctxt, "\x04", msgid)
+    return msgid
+
+
+class RenameRelation(object):
+    """
+    Describes the relation between an old message key and a key of the new
+    template, inferred from ``previous_msgid`` / ``previous_msgctxt``.
+
+    ``status`` is either ``"adopted"`` (the translation was carried over) or
+    ``"unclaimed"`` (the relation could not be resolved unambiguously).
+    ``reason`` gives the reason for an unclaimed relation, see ``REASONS``:
+    ``"split"`` when several new keys claim the same old key,
+    ``"ambiguous_source"`` when several old entries match, ``"source_missing"``
+    when no old entry matches, ``"source_untranslated"`` when the old entry has
+    no translation, ``"source_still_present"`` when the old key is still part
+    of the new template, ``"target_translated"`` when the new key already has
+    a different translation, and ``"incompatible_plural"`` when the plural
+    shapes do not match. ``candidates`` lists the keys involved in the
+    conflict.
+    """
+
+    ADOPTED = 'adopted'
+    UNCLAIMED = 'unclaimed'
+
+    REASONS = {
+        'split': 'the old key was split into several new keys',
+        'ambiguous_source': 'several old entries claim the new key',
+        'source_missing': 'the old key is not in the pofile',
+        'source_untranslated': 'the old entry has no translation',
+        'source_still_present': 'the old key is still in the template',
+        'target_translated': 'the new key already has a translation',
+        'incompatible_plural': 'the plural forms do not match',
+    }
+
+    def __init__(self, old_msgid, new_msgid, old_msgctxt=None,
+                 new_msgctxt=None, status=UNCLAIMED, reason=None,
+                 old_entry=None, new_entry=None, candidates=None):
+        self.old_msgid = old_msgid
+        self.old_msgctxt = old_msgctxt
+        self.new_msgid = new_msgid
+        self.new_msgctxt = new_msgctxt
+        self.status = status
+        self.reason = reason
+        self.old_entry = old_entry
+        self.new_entry = new_entry
+        self.candidates = candidates or []
+        self.old_key = _key_from_parts(old_msgctxt, old_msgid)
+        self.new_key = _key_from_parts(new_msgctxt, new_msgid)
+
+    @property
+    def adopted(self):
+        """Whether the old translation was carried over to the new key."""
+        return self.status == self.ADOPTED
+
+    def as_dict(self):
+        """Return a plain dict representation of the relation."""
+        return {
+            'old_msgid': self.old_msgid,
+            'old_msgctxt': self.old_msgctxt,
+            'old_key': self.old_key,
+            'new_msgid': self.new_msgid,
+            'new_msgctxt': self.new_msgctxt,
+            'new_key': self.new_key,
+            'status': self.status,
+            'reason': self.reason,
+            'reason_text': self.REASONS.get(self.reason),
+            'candidates': list(self.candidates),
+        }
+
+    def __repr__(self):
+        status = self.status
+        if self.reason:
+            status = '%s:%s' % (status, self.reason)
+        return '<RenameRelation %r -> %r (%s)>' % (
+            self.old_key, self.new_key, status
+        )
+
+
+class MergeReport(object):
+    """
+    Result of :meth:`POFile.merge`.
+
+    ``adopted`` contains the rename relations whose translation was carried
+    over to the new template, ``unclaimed`` contains relations that need a
+    human decision (a split or an ambiguous claim). ``relations`` contains
+    both lists in that order. ``created`` and ``obsoleted`` count the entries
+    added to the catalog and the entries newly marked obsolete by the merge;
+    merging again with the same template reports zero for both.
+    """
+
+    def __init__(self, adopted=None, unclaimed=None):
+        self.adopted = adopted or []
+        self.unclaimed = unclaimed or []
+        self.created = 0
+        self.obsoleted = 0
+
+    @property
+    def relations(self):
+        """All rename relations, adopted ones first."""
+        return self.adopted + self.unclaimed
+
+    def as_dict(self):
+        """Return a plain dict representation of the report."""
+        return {
+            'adopted': [r.as_dict() for r in self.adopted],
+            'unclaimed': [r.as_dict() for r in self.unclaimed],
+            'created': self.created,
+            'obsoleted': self.obsoleted,
+        }
+
+    def to_dict(self):
+        """Alias of :meth:`as_dict`."""
+        return self.as_dict()
+
+    def __getitem__(self, key):
+        if key in ('adopted', 'unclaimed', 'relations', 'created',
+                   'obsoleted'):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def keys(self):
+        return ['adopted', 'unclaimed', 'relations', 'created', 'obsoleted']
+
+    def __iter__(self):
+        return iter(self.relations)
+
+    def __len__(self):
+        return len(self.relations)
+
+    def __repr__(self):
+        return '<MergeReport adopted=%d unclaimed=%d>' % (
+            len(self.adopted), len(self.unclaimed)
+        )
+
+
+def _has_translation(entry):
+    """
+    Return ``True`` if the entry carries a translation, even a fuzzy one.
+
+    Unlike :meth:`POEntry.translated`, this does not treat fuzzy entries as
+    untranslated: fuzzy translations are exactly the ones that must be
+    carried over while keeping the needs-review state.
+    """
+    if entry.msgstr:
+        return True
+    if entry.msgstr_plural:
+        return any(value for value in entry.msgstr_plural.values())
+    return False
+
+
+def _translation_signature(entry):
+    """
+    Return an order-independent signature of an entry translation.
+
+    The fuzzy flag is deliberately left out: whether a translator already
+    reviewed the carried translation must not turn a repeat merge into a
+    conflict.
+    """
+    plural = tuple(sorted(entry.msgstr_plural.items())) \
+        if entry.msgstr_plural else ()
+    return (entry.msgstr, plural)
+
+
+def _adopt_translation(target, source):
+    """
+    Copy the translation of ``source`` into ``target`` and keep it in the
+    needs-review (fuzzy) state, as msgmerge does when a msgid changed. Return
+    ``True`` on success, ``False`` if the plural shapes are not compatible.
+    """
+    if target.msgid_plural:
+        if not source.msgstr_plural:
+            return False
+        if target.msgstr_plural:
+            if any(pos not in source.msgstr_plural
+                   for pos in target.msgstr_plural):
+                return False
+            for pos in target.msgstr_plural:
+                target.msgstr_plural[pos] = source.msgstr_plural[pos]
+        else:
+            # The new template does not declare plural positions yet, keep
+            # the shape of the old translation.
+            target.msgstr_plural = dict(source.msgstr_plural)
+    else:
+        if source.msgstr_plural or not source.msgstr:
+            return False
+        target.msgstr = source.msgstr
+    target.fuzzy = True
+    return True
 # }}}
 # function pofile() {{{
 
@@ -719,7 +926,7 @@ class POFile(_BaseFile):
     def merge(self, refpot):
         """
         Convenience method that merges the current pofile with the pot file
-        provided. It behaves exactly as the gettext msgmerge utility:
+        provided. It behaves like the gettext msgmerge utility:
 
         * comments of this file will be preserved, but extracted comments and
           occurrences will be discarded;
@@ -727,27 +934,303 @@ class POFile(_BaseFile):
           dot comments and file positions will be preserved;
         * the fuzzy flags are preserved.
 
+        Entries whose message key changed are also taken into account: when an
+        entry carries ``previous_msgid``/``previous_msgctxt``, the translation
+        of the entry matching this previous key is carried over to the new key
+        and is marked fuzzy, so that the changed key is confirmed by a
+        translator. A previous key claimed by several new keys (a split) or a
+        new key claimed by several previous keys is never resolved by
+        iteration order: such relations are left untouched and reported as
+        unclaimed.
+
         Keyword argument:
 
         ``refpot``
             object POFile, the reference catalog.
+
+        Returns a :class:`~polib.MergeReport` describing the rename relations
+        that were adopted and the ones left unclaimed.
         """
-        # Store entries in dict/set for faster access
-        self_entries = dict(
-            (entry.msgid_with_context, entry) for entry in self
+        report = MergeReport()
+        refpot_entries = list(refpot)
+        live_refpot = [entry for entry in refpot_entries
+                       if not entry.obsolete]
+        refpot_msgids = set(
+            entry.msgid_with_context for entry in refpot_entries
         )
-        refpot_msgids = set(entry.msgid_with_context for entry in refpot)
-        # Merge entries that are in the refpot
-        for entry in refpot:
-            e = self_entries.get(entry.msgid_with_context)
+
+        # Index our own entries by key. A key may be duplicated (for example
+        # a live entry and an obsolete one), so keep every candidate and pick
+        # deterministically instead of letting a dict keep the last one read.
+        self_entries = {}
+        for entry in self:
+            self_entries.setdefault(
+                entry.msgid_with_context, []
+            ).append(entry)
+
+        # Remember previous keys carried by the pofile before merging, since
+        # merging with the template may overwrite them. Duplicated live
+        # entries are all remembered: they may be the source material for a
+        # rename and only an actual conflict should make them unclaimed.
+        self_claims = {}
+        for entry in self:
+            if entry.obsolete or entry.previous_msgid is None:
+                continue
+            self_claims.setdefault(entry.msgid_with_context, []).append(
+                (entry.previous_msgid, entry.previous_msgctxt)
+            )
+
+        # Merge entries that are in the refpot, matching exact keys first.
+        targets = {}
+        for entry in refpot_entries:
+            key = entry.msgid_with_context
+            e = self._merge_target(self_entries.get(key, []))
             if e is None:
                 e = POEntry()
                 self.append(e)
+                self_entries.setdefault(key, []).append(e)
+                report.created += 1
+                kept_previous = None
+            else:
+                kept_previous = (e.previous_msgid, e.previous_msgctxt,
+                                 e.previous_msgid_plural)
             e.merge(entry)
+            if kept_previous is not None and kept_previous[0] is not None:
+                same_previous = (
+                    e.previous_msgid == kept_previous[0] and
+                    e.previous_msgctxt == kept_previous[1]
+                )
+                if entry.previous_msgid is None:
+                    # The template does not repeat the previous key, but the
+                    # po file already recorded the rename: keep it so that
+                    # merging again with the same template stays idempotent.
+                    e.previous_msgid, e.previous_msgctxt, \
+                        e.previous_msgid_plural = kept_previous
+                elif same_previous and e.previous_msgid_plural is None:
+                    e.previous_msgid_plural = kept_previous[2]
+            targets[key] = e
+
+        # Collect rename claims from both sides: the reference template may
+        # carry previous keys, and so may the already extracted pofile.
+        claims = []
+        seen = set()
+
+        def add_claim(new_key, previous_msgid, previous_msgctxt,
+                      current_msgctxt=None):
+            if not previous_msgid:
+                return
+            if previous_msgctxt is None:
+                # An unchanged context is not repeated in the #| comments,
+                # so the old key keeps the current context.
+                previous_msgctxt = current_msgctxt
+            old_key = _key_from_parts(previous_msgctxt, previous_msgid)
+            if old_key == new_key or new_key not in targets:
+                return
+            if targets[new_key].obsolete:
+                # No point carrying a translation over to an obsolete entry.
+                return
+            claim = (new_key, old_key, previous_msgid, previous_msgctxt)
+            if claim[:2] not in seen:
+                seen.add(claim[:2])
+                claims.append(claim)
+
+        for entry in live_refpot:
+            add_claim(entry.msgid_with_context, entry.previous_msgid,
+                      entry.previous_msgctxt, entry.msgctxt)
+        for new_key in sorted(self_claims):
+            if new_key not in targets:
+                continue
+            for previous_msgid, previous_msgctxt in self_claims[new_key]:
+                add_claim(new_key, previous_msgid, previous_msgctxt,
+                          targets[new_key].msgctxt)
+
+        # A previous key claimed by more than one new key is a split. A new
+        # key claimed by more than one previous key is ambiguous. Both are
+        # reported as unclaimed without picking a winner.
+        live_refpot_keys = set(e.msgid_with_context for e in live_refpot)
+        claims_by_old = {}
+        claims_by_new = {}
+        for claim in claims:
+            claims_by_old.setdefault(claim[1], []).append(claim)
+            claims_by_new.setdefault(claim[0], []).append(claim)
+
+        adopted = []
+        unclaimed = []
+        for old_key in sorted(claims_by_old):
+            old_claims = claims_by_old[old_key]
+            new_keys = sorted(set(c[0] for c in old_claims))
+            if len(new_keys) > 1:
+                # A single old key feeds several new keys (a split): do not
+                # copy the translation to any of them, a human must decide.
+                for claim in sorted(old_claims):
+                    unclaimed.append(RenameRelation(
+                        old_msgid=claim[2],
+                        old_msgctxt=claim[3],
+                        new_msgid=targets[claim[0]].msgid,
+                        new_msgctxt=targets[claim[0]].msgctxt,
+                        status=RenameRelation.UNCLAIMED,
+                        reason='split',
+                        new_entry=targets[claim[0]],
+                        candidates=new_keys,
+                    ))
+                continue
+            claim = old_claims[0]
+            new_key, _, previous_msgid, previous_msgctxt = claim
+            new_claims = claims_by_new[new_key]
+            if len(set(c[1] for c in new_claims)) > 1:
+                # One new key claims several old keys: same problem.
+                unclaimed.append(RenameRelation(
+                    old_msgid=previous_msgid,
+                    old_msgctxt=previous_msgctxt,
+                    new_msgid=targets[new_key].msgid,
+                    new_msgctxt=targets[new_key].msgctxt,
+                    status=RenameRelation.UNCLAIMED,
+                    reason='ambiguous_source',
+                    new_entry=targets[new_key],
+                    candidates=sorted(set(c[1] for c in new_claims)),
+                ))
+                continue
+            if old_key in live_refpot_keys:
+                # The old key is still a message of the new template, so it
+                # was not renamed and must not be treated as a source.
+                unclaimed.append(RenameRelation(
+                    old_msgid=previous_msgid,
+                    old_msgctxt=previous_msgctxt,
+                    new_msgid=targets[new_key].msgid,
+                    new_msgctxt=targets[new_key].msgctxt,
+                    status=RenameRelation.UNCLAIMED,
+                    reason='source_still_present',
+                    new_entry=targets[new_key],
+                ))
+                continue
+
+            candidates = [
+                entry for entry in self_entries.get(old_key, [])
+                if entry is not targets[new_key]
+            ]
+            # A stale obsolete duplicate must not compete with the live
+            # entry: only when no live candidate is left do we look at
+            # obsolete ones.
+            live_candidates = [e for e in candidates if not e.obsolete]
+            if live_candidates:
+                candidates = live_candidates
+            translated = [e for e in candidates if _has_translation(e)]
+            # Duplicate entries carrying the exact same translation are not
+            # a real ambiguity, they all designate the same source.
+            signatures = set(
+                _translation_signature(e) for e in translated
+            )
+            if len(signatures) > 1:
+                unclaimed.append(RenameRelation(
+                    old_msgid=previous_msgid,
+                    old_msgctxt=previous_msgctxt,
+                    new_msgid=targets[new_key].msgid,
+                    new_msgctxt=targets[new_key].msgctxt,
+                    status=RenameRelation.UNCLAIMED,
+                    reason='ambiguous_source',
+                    new_entry=targets[new_key],
+                    candidates=sorted(set(e.msgid_with_context
+                                          for e in translated)),
+                ))
+                continue
+            if not translated:
+                unclaimed.append(RenameRelation(
+                    old_msgid=previous_msgid,
+                    old_msgctxt=previous_msgctxt,
+                    new_msgid=targets[new_key].msgid,
+                    new_msgctxt=targets[new_key].msgctxt,
+                    status=RenameRelation.UNCLAIMED,
+                    reason='source_missing' if not candidates
+                    else 'source_untranslated',
+                    new_entry=targets[new_key],
+                    candidates=[e.msgid_with_context for e in candidates],
+                ))
+                continue
+
+            source = translated[0]
+            target = targets[new_key]
+            recorded_ctxt = previous_msgctxt \
+                if previous_msgctxt != target.msgctxt else None
+            already_recorded = (
+                target.previous_msgid == previous_msgid and
+                target.previous_msgctxt == recorded_ctxt
+            )
+            if _has_translation(target):
+                if already_recorded or \
+                        _translation_signature(target) == \
+                        _translation_signature(source):
+                    # A previous merge already carried the translation over:
+                    # keep the merge idempotent instead of counting it again.
+                    # The current flags are kept as-is, so a translator who
+                    # already cleared the fuzzy flag is not overridden.
+                    pass
+                else:
+                    unclaimed.append(RenameRelation(
+                        old_msgid=previous_msgid,
+                        old_msgctxt=previous_msgctxt,
+                        new_msgid=target.msgid,
+                        new_msgctxt=target.msgctxt,
+                        status=RenameRelation.UNCLAIMED,
+                        reason='target_translated',
+                        old_entry=source,
+                        new_entry=target,
+                    ))
+                    continue
+            elif not _adopt_translation(target, source):
+                unclaimed.append(RenameRelation(
+                    old_msgid=previous_msgid,
+                    old_msgctxt=previous_msgctxt,
+                    new_msgid=target.msgid,
+                    new_msgctxt=target.msgctxt,
+                    status=RenameRelation.UNCLAIMED,
+                    reason='incompatible_plural',
+                    old_entry=source,
+                    new_entry=target,
+                ))
+                continue
+            # Record the old key on the adopted entry so that the relation
+            # survives in the PO file and a later merge reports it again.
+            # An unchanged context is not repeated, as gettext does.
+            target.previous_msgid = previous_msgid
+            target.previous_msgctxt = recorded_ctxt
+            target.previous_msgid_plural = source.msgid_plural or None
+            adopted.append(RenameRelation(
+                old_msgid=previous_msgid,
+                old_msgctxt=previous_msgctxt,
+                new_msgid=target.msgid,
+                new_msgctxt=target.msgctxt,
+                status=RenameRelation.ADOPTED,
+                old_entry=source,
+                new_entry=target,
+            ))
+
         # ok, now we must "obsolete" entries that are not in the refpot anymore
         for entry in self:
             if entry.msgid_with_context not in refpot_msgids:
-                entry.obsolete = True
+                if not entry.obsolete:
+                    entry.obsolete = True
+                    report.obsoleted += 1
+
+        report.adopted = adopted
+        report.unclaimed = unclaimed
+        self.merge_report = report
+        return report
+
+    @staticmethod
+    def _merge_target(entries):
+        """
+        Return the entry that an exact key match should be merged into.
+
+        When a key is duplicated, prefer a live entry; otherwise keep the
+        first entry in file order. This only resolves identical keys, rename
+        claims are resolved by :meth:`merge` without relying on ordering.
+        """
+        if not entries:
+            return None
+        for entry in entries:
+            if not entry.obsolete:
+                return entry
+        return entries[0]
 # }}}
 # class MOFile {{{
 

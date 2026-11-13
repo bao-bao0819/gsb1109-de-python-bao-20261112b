@@ -1,0 +1,33 @@
+# German translation with translations from an older extraction.
+msgid ""
+msgstr ""
+"Project-Id-Version: rename demo\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: de\n"
+
+#: src/file.c:10
+msgid "Save file"
+msgstr "Datei speichern"
+
+#: src/file.c:20
+msgctxt "menu"
+msgid "Open"
+msgstr "Öffnen"
+
+#: src/file.c:30
+#, fuzzy
+msgid "Delete row"
+msgstr "Zeile löschen"
+
+#: src/file.c:40
+msgid "%d file"
+msgid_plural "%d files"
+msgstr[0] "%d Datei"
+msgstr[1] "%d Dateien"
+
+#: src/file.c:50
+#, fuzzy
+msgid "Close window"
+msgstr "Fenster schließen"

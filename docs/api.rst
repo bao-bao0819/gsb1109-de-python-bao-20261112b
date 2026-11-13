@@ -40,6 +40,20 @@ The ``POFile`` class
     :members:
 
 
+The ``MergeReport`` class
+-------------------------
+
+.. autoclass:: polib.MergeReport
+    :members:
+
+
+The ``RenameRelation`` class
+----------------------------
+
+.. autoclass:: polib.RenameRelation
+    :members:
+
+
 The ``MOFile`` class
 --------------------
 

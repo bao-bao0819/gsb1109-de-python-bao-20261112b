@@ -209,6 +209,40 @@ Getting the percent of translated entries
     print(po.percent_translated())
 
 
+Merging a catalog with a new template
+-------------------------------------
+
+:meth:`~polib.POFile.merge` behaves like the gettext ``msgmerge`` utility and
+returns a :class:`~polib.MergeReport`::
+
+    import polib
+
+    po = polib.pofile('path/to/catalog.po')
+    pot = polib.pofile('path/to/catalog.pot')
+    report = po.merge(pot)
+
+    for relation in report.adopted:
+        print('carried %r -> %r' % (relation.old_key, relation.new_key))
+    for relation in report.unclaimed:
+        print('needs a decision %r -> %r (%s)' % (
+            relation.old_key, relation.new_key, relation.reason))
+
+When the extraction tool renamed a message key, the new template carries the
+old key in ``previous_msgid``/``previous_msgctxt``. The merge then carries the
+old translation over to the new key and keeps the entry fuzzy, because the
+translation still needs confirmation.
+
+A rename is only adopted when it is unambiguous: one old key for one new key.
+If one old key is claimed by several new keys (the key was split), or one new
+key is claimed by several old keys, no winner is picked based on file or read
+order. The relation is listed in ``report.unclaimed`` with a ``reason`` and the
+``candidates`` involved, and the new entry keeps an empty translation.
+
+Merging again with the same template does not create new entries and does not
+obsolete entries that are already recorded as obsolete; ``report.created`` and
+``report.obsoleted`` only count the records added or retired by that call.
+
+
 Compiling po to mo files and reversing mo files to po files
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

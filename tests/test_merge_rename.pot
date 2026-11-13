@@ -1,0 +1,46 @@
+# Extracted template with renamed message keys.
+msgid ""
+msgstr ""
+"Project-Id-Version: rename demo\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: src/file.c:11
+#| msgid "Save file"
+msgid "Save document"
+msgstr ""
+
+#: src/file.c:21
+#| msgid "Open"
+msgctxt "menu"
+msgid "Open document"
+msgstr ""
+
+#: src/file.c:31
+#| msgid "Delete row"
+msgid "Delete selected row"
+msgstr ""
+
+#: src/file.c:32
+#| msgid "Delete row"
+msgid "Delete all rows"
+msgstr ""
+
+#: src/file.c:41
+#| msgid "%d file"
+#| msgid_plural "%d files"
+msgid "%d document"
+msgid_plural "%d documents"
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/file.c:51
+#| msgid "Close window"
+msgid "Close document"
+msgstr ""
+
+#: src/file.c:60
+#| msgid "Print preview"
+msgid "Preview document"
+msgstr ""
