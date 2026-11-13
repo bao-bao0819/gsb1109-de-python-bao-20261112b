@@ -273,34 +273,66 @@ def to_sql(self, connection_or_string, table_name, overwrite=False,
         The minimum length of text columns.
     :param col_len_multiplier:
         Multiply the maximum column length by this multiplier to accomodate larger values in later runs.
+
+    The import is wrapped in a single transaction. If the caller already has
+    an open transaction on the connection, the import joins it via a
+    savepoint: when a chunk fails (for example on a constraint violation),
+    the whole import--including earlier chunks and the table creation--is
+    rolled back to that savepoint while the surrounding transaction stays
+    open and usable, so the caller can record the failure on the same
+    connection and commit or roll back itself. If no transaction is active,
+    a new transaction is opened and, on failure, rolled back entirely.
+
+    A connection supplied by the caller is never committed: on success the
+    import is left in the open transaction for the caller to commit or roll
+    back. Only when a connection string is given does this method open a
+    short-lived connection and commit a successful import itself.
     """
     engine, connection = get_engine_and_connection(connection_or_string)
+    should_commit = engine is not None
 
-    dialect = connection.engine.dialect.name
-    sql_table = make_sql_table(self, table_name, dialect=dialect, db_schema=db_schema, constraints=constraints,
-                               unique_constraint=unique_constraint, connection=connection,
-                               min_col_len=min_col_len, col_len_multiplier=col_len_multiplier)
+    # Join an existing caller-owned transaction with a savepoint so that a
+    # failed import can be undone without discarding the caller's statements.
+    nested = connection.in_transaction()
+    transaction = connection.begin_nested() if nested else connection.begin()
 
-    if create:
-        if overwrite:
-            sql_table.drop(bind=connection, checkfirst=True)
+    try:
+        dialect = connection.engine.dialect.name
+        sql_table = make_sql_table(self, table_name, dialect=dialect, db_schema=db_schema, constraints=constraints,
+                                   unique_constraint=unique_constraint, connection=connection,
+                                   min_col_len=min_col_len, col_len_multiplier=col_len_multiplier)
 
-        sql_table.create(bind=connection, checkfirst=create_if_not_exists)
+        if create:
+            if overwrite:
+                sql_table.drop(bind=connection, checkfirst=True)
 
-    if insert:
-        insert = sql_table.insert()
-        for prefix in prefixes:
-            insert = insert.prefix_with(prefix)
-        if chunk_size is None:
-            connection.execute(insert, [dict(zip(self.column_names, row)) for row in self.rows])
-        else:
-            number_of_rows = len(self.rows)
-            for index in range((number_of_rows - 1) // chunk_size + 1):
-                end_index = (index + 1) * chunk_size
-                if end_index > number_of_rows:
-                    end_index = number_of_rows
-                connection.execute(insert, [dict(zip(self.column_names, row)) for row in
-                                            self.rows[index * chunk_size:end_index]])
+            sql_table.create(bind=connection, checkfirst=create_if_not_exists)
+
+        if insert:
+            insert = sql_table.insert()
+            for prefix in prefixes:
+                insert = insert.prefix_with(prefix)
+            if chunk_size is None:
+                connection.execute(insert, [dict(zip(self.column_names, row)) for row in self.rows])
+            else:
+                number_of_rows = len(self.rows)
+                for index in range((number_of_rows - 1) // chunk_size + 1):
+                    end_index = (index + 1) * chunk_size
+                    if end_index > number_of_rows:
+                        end_index = number_of_rows
+                    connection.execute(insert, [dict(zip(self.column_names, row)) for row in
+                                                self.rows[index * chunk_size:end_index]])
+
+        if nested:
+            # Release the savepoint; the caller's transaction remains open.
+            transaction.commit()
+        elif should_commit:
+            # We opened this transaction from a connection string.
+            transaction.commit()
+        # Otherwise leave the transaction open for the caller to finish.
+    except Exception:
+        transaction.rollback()
+        raise
 
     try:
         return sql_table

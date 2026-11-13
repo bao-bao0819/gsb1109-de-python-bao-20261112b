@@ -1,8 +1,10 @@
 from decimal import Decimal
 from textwrap import dedent
+import os
+import tempfile
 
 import agate
-from sqlalchemy import create_engine
+from sqlalchemy import Column, Integer, MetaData, Table, Text, create_engine, inspect, insert, text
 from sqlalchemy.exc import IntegrityError
 
 import agatesql
@@ -276,3 +278,87 @@ class TestSQL(agate.AgateTestCase):
         finally:
             connection.close()
             engine.dispose()
+
+    def _make_bookkeeping_tables(self, connection):
+        metadata = MetaData()
+        files = Table('import_files', metadata,
+                      Column('id', Integer, primary_key=True), Column('name', Text))
+        failures = Table('import_failures', metadata,
+                         Column('id', Integer, primary_key=True), Column('reason', Text))
+        metadata.create_all(connection)
+        return files, failures
+
+    def test_chunk_failure_rolls_back_import_within_outer_transaction(self):
+        # The third chunk violates the UNIQUE constraint.
+        rows = ((1, 'a'), (2, 'b'), (3, 'a'))
+        table = agate.Table(rows, ['number', 'textcol'], [agate.Number(), agate.Text()])
+
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+        files, failures = self._make_bookkeeping_tables(connection)
+
+        # The outer transaction registers the file before the import.
+        connection.execute(insert(files), {'id': 1, 'name': 'data.csv'})
+        connection.commit()
+        connection.execute(insert(files), {'id': 2, 'name': 'data.csv'})
+
+        with self.assertRaises(IntegrityError):
+            table.to_sql(connection, 'rollback_test', chunk_size=1, unique_constraint=['textcol'])
+
+        # Earlier chunks and the table itself are rolled back...
+        self.assertFalse(inspect(connection).has_table('rollback_test'))
+        # ...but the outer transaction is still open and keeps the file registration.
+        self.assertTrue(connection.in_transaction())
+        self.assertEqual(connection.execute(files.select()).fetchall(), [(1, 'data.csv'), (2, 'data.csv')])
+
+        # The same connection can still record why the import failed.
+        connection.execute(insert(failures), {'id': 1, 'reason': 'unique constraint violation'})
+        self.assertEqual(connection.execute(failures.select()).fetchall(),
+                         [(1, 'unique constraint violation')])
+
+        # The caller's final rollback discards both the registration and the failure reason.
+        connection.rollback()
+        self.assertEqual(connection.execute(files.select()).fetchall(), [(1, 'data.csv')])
+        self.assertEqual(connection.execute(failures.select()).fetchall(), [])
+
+        connection.close()
+        engine.dispose()
+
+    def test_connection_string_commits_successful_import(self):
+        rows = ((1, 'a'), (2, 'b'))
+        table = agate.Table(rows, ['number', 'textcol'], [agate.Number(), agate.Text()])
+
+        handle, path = tempfile.mkstemp(suffix='.db')
+        os.close(handle)
+        os.remove(path)
+        connection_string = 'sqlite:///%s' % path
+
+        try:
+            table.to_sql(connection_string, 'commit_test')
+
+            engine = create_engine(connection_string)
+            with engine.connect() as connection:
+                result = connection.execute(text('SELECT COUNT(*) FROM commit_test')).fetchone()
+                self.assertEqual(result[0], len(rows))
+            engine.dispose()
+        finally:
+            os.remove(path)
+
+    def test_existing_connection_is_not_committed(self):
+        rows = ((1, 'a'), (2, 'b'))
+        table = agate.Table(rows, ['number', 'textcol'], [agate.Number(), agate.Text()])
+
+        engine = create_engine(self.connection_string)
+        connection = engine.connect()
+
+        table.to_sql(connection, 'no_commit_test')
+        # The import is left uncommitted in an open transaction for the caller.
+        self.assertTrue(connection.in_transaction())
+
+        connection.rollback()
+        # The imported rows are discarded by the caller's rollback.
+        self.assertEqual(
+            connection.execute(text('SELECT COUNT(*) FROM no_commit_test')).fetchone()[0], 0)
+
+        connection.close()
+        engine.dispose()
