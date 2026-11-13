@@ -89,6 +89,45 @@ Gpxpy is a GPX parser and by using it you have access to all the data from the o
 
     moving_data = gpx.get_moving_data(raw=True)
 
+## Station dwell detection
+
+`gpxpy.station` detects when a vehicle arrives at and leaves a fixed station, even when parked GPS receivers occasionally jump a point outside the geofence. Entry and exit radii are configured separately (hysteresis), and a departure is only confirmed after a sustained run of consecutive outside observations:
+
+```python
+import gpxpy
+import gpxpy.station
+
+gpx = gpxpy.parse(open('track.gpx'))
+
+config = gpxpy.station.StationConfig(
+    latitude=46.2451,
+    longitude=14.3552,
+    entry_radius=100.0,        # inside this radius counts as an arrival
+    exit_radius=150.0,         # farther than this counts as an outside observation
+    min_outside_observations=3,
+    min_outside_seconds=30.0,  # both conditions must hold to confirm a departure
+    max_gap_seconds=300.0,     # longer sampling gaps become unknown intervals
+)
+
+result = gpxpy.station.detect_station_dwells(gpx, config)
+
+for dwell in result.dwells:
+    print(dwell.arrival_time, dwell.departure_time, dwell.dwell_seconds, dwell.complete)
+
+for interval in result.unknown_intervals:
+    print(interval.start_time, interval.end_time, interval.reason)
+```
+
+A single out-of-fence point while parked does not end the visit because it does not form a sustained outside run. Sampling gaps longer than `max_gap_seconds`, as well as track/segment switches, are returned as unknown intervals and split a visit instead of being interpolated over. Dwells whose departure is never confirmed have `complete=False`, `dwell_seconds=None` and an `incomplete_reason` (`unknown_gap`, `unknown_segment` or `end_of_data`); `confirmed_inside_seconds` always reports the time supported by observations known to be inside.
+
+The same analysis is available from the command line:
+
+```
+./station_dwell track.gpx --lat 46.2451 --lon 14.3552 \
+    --entry-radius 100 --exit-radius 150 \
+    --min-outside-observations 3 --min-outside-seconds 30 --max-gap-seconds 300
+```
+
 ## Pull requests
 
 Branches:

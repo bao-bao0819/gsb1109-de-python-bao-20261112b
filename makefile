@@ -50,3 +50,4 @@ analyze-xsd:
 .PHONY: mypy
 mypy:
 	mypy --strict . gpxinfo
+	mypy --strict station_dwell

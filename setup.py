@@ -43,5 +43,5 @@ setup(
         "Programming Language :: Python :: 3.14",
         "Programming Language :: Python :: 3.15",
     ],
-    scripts=['gpxinfo'],
+    scripts=['gpxinfo', 'station_dwell'],
 )

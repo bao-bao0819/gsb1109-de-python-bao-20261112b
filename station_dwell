@@ -1,0 +1,110 @@
+#!/usr/bin/env python
+
+"""
+Command line utility for station dwell detection in GPX track files.
+
+Detects arrivals at, departures from and confirmed dwell seconds around one
+station (lat/lon). Entry and exit geofence radii are configured separately;
+sustained outside observations are required to confirm a departure, while
+sampling gaps and segment switches are reported as unknown intervals.
+"""
+
+import argparse as mod_argparse
+import sys as mod_sys
+from typing import List, Optional, Sequence
+
+import gpxpy as mod_gpxpy
+
+from gpxpy.station import (
+    StationConfig,
+    StationDwell,
+    UnknownInterval,
+    detect_station_dwells,
+)
+
+
+def _format_time(value: Optional[object]) -> str:
+    if value is None:
+        return 'unconfirmed'
+    return value.isoformat() if hasattr(value, 'isoformat') else str(value)
+
+
+def _print_unknown_intervals(intervals: List[UnknownInterval]) -> None:
+    if not intervals:
+        print('Unknown intervals: none')
+        return
+    print(f'Unknown intervals ({len(intervals)}):')
+    for interval in intervals:
+        print(f'  {interval.start_time.isoformat()} -> {interval.end_time.isoformat()} '
+              f'({interval.duration_seconds:.0f}s, {interval.reason})')
+
+
+def _print_dwell(dwell: StationDwell, index: int) -> None:
+    status = 'complete' if dwell.complete else f'incomplete ({dwell.incomplete_reason})'
+    print(f'Dwell {index}: [{status}]')
+    print(f'  arrival:            {_format_time(dwell.arrival_time)}')
+    print(f'  departure:          {_format_time(dwell.departure_time)}')
+    print(f'  end of known data:  {_format_time(dwell.end_time)}')
+    if dwell.dwell_seconds is None:
+        print('  dwell seconds:      n/a (departure unconfirmed)')
+    else:
+        print(f'  dwell seconds:      {dwell.dwell_seconds:.0f}')
+    print(f'  confirmed inside:   {dwell.confirmed_inside_seconds:.0f}s')
+
+
+def build_parser() -> mod_argparse.ArgumentParser:
+    parser = mod_argparse.ArgumentParser(
+        description='Detect station arrivals, departures and dwell seconds from a GPX track.',
+    )
+    parser.add_argument('gpx_file', help='path to the GPX file')
+    parser.add_argument('--lat', type=float, required=True, help='station latitude')
+    parser.add_argument('--lon', type=float, required=True, help='station longitude')
+    parser.add_argument('--entry-radius', type=float, required=True,
+                        help='entry geofence radius in meters')
+    parser.add_argument('--exit-radius', type=float, required=True,
+                        help='exit geofence radius in meters')
+    parser.add_argument('--min-outside-observations', type=int, default=3,
+                        help='consecutive outside observations needed to confirm departure')
+    parser.add_argument('--min-outside-seconds', type=float, default=30.0,
+                        help='minimum span in seconds of the outside run to confirm departure')
+    parser.add_argument('--max-gap-seconds', type=float, default=300.0,
+                        help='longer sampling gaps are reported as unknown intervals')
+    parser.add_argument('--min-dwell-seconds', type=float, default=0.0,
+                        help='confirmed dwells shorter than this are discarded')
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    with open(args.gpx_file, encoding='utf-8') as gpx_file:
+        gpx = mod_gpxpy.parse(gpx_file)
+
+    config = StationConfig(
+        latitude=args.lat,
+        longitude=args.lon,
+        entry_radius=args.entry_radius,
+        exit_radius=args.exit_radius,
+        min_outside_observations=args.min_outside_observations,
+        min_outside_seconds=args.min_outside_seconds,
+        max_gap_seconds=args.max_gap_seconds,
+        min_dwell_seconds=args.min_dwell_seconds,
+    )
+
+    result = detect_station_dwells(gpx, config)
+
+    print(f'Station: ({config.latitude}, {config.longitude}), '
+          f'entry radius {config.entry_radius}m, exit radius {config.exit_radius}m')
+    _print_unknown_intervals(result.unknown_intervals)
+    if not result.dwells:
+        print('Dwells: none')
+    else:
+        print(f'Dwells ({len(result.dwells)}):')
+        for index, dwell in enumerate(result.dwells, start=1):
+            _print_dwell(dwell, index)
+
+    return 0
+
+
+if __name__ == '__main__':
+    mod_sys.exit(main())

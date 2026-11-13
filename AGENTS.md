@@ -4,7 +4,7 @@
 
 - Run all tests: `make test` or `python3 -m unittest test`
 - Run single test: `python3 -m unittest test.GPXTests.test_method_name`
-- Run mypy (strict): `make mypy` → `mypy --strict . gpxinfo`
+- Run mypy (strict): `make mypy` → `mypy --strict . gpxinfo` then `mypy --strict station_dwell` (extensionless scripts are checked separately to avoid mypy's duplicate `__main__` module error)
 - Full verification: `make mypy-and-tests` (runs mypy → gpxinfo → tests)
 - Build for PyPI: `make pypi-upload`
 

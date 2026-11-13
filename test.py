@@ -30,8 +30,13 @@ import datetime as mod_datetime
 import random as mod_random
 import math as mod_math
 import sys as mod_sys
+import io as mod_io
+import tempfile as mod_tempfile
+import contextlib as mod_contextlib
+import importlib.util as mod_importlib_util
 import unittest as mod_unittest
 import xml.dom.minidom as mod_minidom
+from importlib.machinery import SourceFileLoader
 
 try:
     import xml.etree.cElementTree as mod_etree
@@ -44,6 +49,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.station as mod_station
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3723,6 +3729,323 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+
+STATION_BASE_TIME = mod_datetime.datetime(2026, 11, 13, 8, 0, 0)
+
+
+def station_at(seconds: float) -> mod_datetime.datetime:
+    return STATION_BASE_TIME + mod_datetime.timedelta(seconds=seconds)
+
+
+def station_point(meters_from_station: float, seconds: float) -> mod_gpx.GPXTrackPoint:
+    # One degree of latitude is geo.ONE_DEGREE meters; the station is at (0, 0).
+    return mod_gpx.GPXTrackPoint(
+        latitude=meters_from_station / mod_geo.ONE_DEGREE,
+        longitude=0.0,
+        time=station_at(seconds),
+    )
+
+
+def station_gpx_with_segments(segments: List[List[mod_gpx.GPXTrackPoint]]) -> mod_gpx.GPX:
+    gpx = mod_gpx.GPX()
+    track = mod_gpx.GPXTrack()
+    gpx.tracks.append(track)
+    for segment_points in segments:
+        track.segments.append(mod_gpx.GPXTrackSegment(points=list(segment_points)))
+    return gpx
+
+
+def station_gpx_with_tracks(tracks: List[List[List[mod_gpx.GPXTrackPoint]]]) -> mod_gpx.GPX:
+    gpx = mod_gpx.GPX()
+    for segments in tracks:
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        for segment_points in segments:
+            track.segments.append(mod_gpx.GPXTrackSegment(points=list(segment_points)))
+    return gpx
+
+
+def station_config(**overrides: Any) -> mod_station.StationConfig:
+    values: dict[str, Any] = dict(
+        latitude=0.0,
+        longitude=0.0,
+        entry_radius=100.0,
+        exit_radius=150.0,
+        min_outside_observations=3,
+        min_outside_seconds=30.0,
+        max_gap_seconds=300.0,
+        min_dwell_seconds=0.0,
+    )
+    values.update(overrides)
+    return mod_station.StationConfig(**values)
+
+
+class StationDwellTests(mod_unittest.TestCase):
+
+    def test_basic_arrival_departure_and_dwell_seconds(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(200, 0), station_point(200, 10),
+            station_point(20, 20), station_point(20, 30), station_point(20, 40),
+            station_point(200, 50), station_point(200, 60), station_point(200, 70), station_point(200, 80),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        dwell = result.dwells[0]
+        self.assertTrue(dwell.complete)
+        self.assertEqual(station_at(20), dwell.arrival_time)
+        self.assertEqual(station_at(50), dwell.departure_time)
+        self.assertEqual(30.0, dwell.dwell_seconds)
+        self.assertAlmostEqual(20.0, dwell.confirmed_inside_seconds)
+        self.assertEqual([], result.unknown_intervals)
+
+    def test_single_outside_jump_while_parked_keeps_one_dwell(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(20, 0), station_point(20, 10), station_point(20, 20),
+            station_point(500, 30),
+            station_point(20, 40), station_point(20, 50),
+            station_point(200, 60), station_point(200, 70), station_point(200, 80), station_point(200, 90),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        dwell = result.dwells[0]
+        self.assertTrue(dwell.complete)
+        self.assertEqual(station_at(0), dwell.arrival_time)
+        self.assertEqual(station_at(60), dwell.departure_time)
+        self.assertEqual(60.0, dwell.dwell_seconds)
+
+    def test_entry_and_exit_radii_are_separate(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(120, 0), station_point(120, 10), station_point(120, 20),
+            station_point(20, 30), station_point(20, 40),
+            station_point(120, 50), station_point(120, 60), station_point(120, 70),
+            station_point(200, 80), station_point(200, 90), station_point(200, 100), station_point(200, 110),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        dwell = result.dwells[0]
+        self.assertEqual(station_at(30), dwell.arrival_time)
+        self.assertEqual(station_at(80), dwell.departure_time)
+        self.assertEqual(50.0, dwell.dwell_seconds)
+
+    def test_departure_needs_enough_consecutive_outside_points(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(20, 0), station_point(20, 10), station_point(20, 20),
+            station_point(200, 30), station_point(200, 55),
+            station_point(20, 65),
+            station_point(200, 75), station_point(200, 85), station_point(200, 95), station_point(200, 105),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        self.assertEqual(station_at(75), result.dwells[0].departure_time)
+
+    def test_departure_needs_outside_run_duration(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(20, 0), station_point(20, 10),
+            station_point(200, 20), station_point(200, 21), station_point(200, 22),
+            station_point(20, 30), station_point(20, 40),
+            station_point(200, 50), station_point(200, 60), station_point(200, 70), station_point(200, 80),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        self.assertEqual(station_at(50), result.dwells[0].departure_time)
+
+    def test_in_out_in_five_seconds_is_one_dwell(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(20, 0),
+            station_point(200, 5),
+            station_point(20, 10),
+            station_point(200, 20), station_point(200, 30), station_point(200, 40), station_point(200, 50),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        dwell = result.dwells[0]
+        self.assertEqual(station_at(0), dwell.arrival_time)
+        self.assertEqual(station_at(20), dwell.departure_time)
+
+    def test_in_out_in_half_hour_is_split_with_unknown_gap(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(20, 0),
+            station_point(200, 1800),
+            station_point(20, 1805),
+            station_point(200, 1815), station_point(200, 1825), station_point(200, 1835), station_point(200, 1845),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(2, len(result.dwells))
+        first, second = result.dwells
+        self.assertFalse(first.complete)
+        self.assertEqual(mod_station.UNKNOWN_GAP, first.incomplete_reason)
+        self.assertEqual(station_at(0), first.arrival_time)
+        self.assertEqual(station_at(0), first.end_time)
+        self.assertIsNone(first.dwell_seconds)
+        self.assertTrue(second.complete)
+        self.assertEqual(station_at(1805), second.arrival_time)
+        self.assertEqual(station_at(1815), second.departure_time)
+
+        self.assertEqual(1, len(result.unknown_intervals))
+        unknown = result.unknown_intervals[0]
+        self.assertEqual(mod_station.GAP, unknown.reason)
+        self.assertEqual(station_at(0), unknown.start_time)
+        self.assertEqual(station_at(1800), unknown.end_time)
+        self.assertAlmostEqual(1800.0, unknown.duration_seconds)
+
+    def test_segment_switch_is_unknown_and_closes_dwell(self) -> None:
+        gpx = station_gpx_with_segments([
+            [station_point(20, 0), station_point(20, 10), station_point(20, 20)],
+            [station_point(20, 30), station_point(20, 40),
+             station_point(200, 50), station_point(200, 60), station_point(200, 70), station_point(200, 80)],
+        ])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(2, len(result.dwells))
+        first, second = result.dwells
+        self.assertFalse(first.complete)
+        self.assertEqual(mod_station.UNKNOWN_SEGMENT, first.incomplete_reason)
+        self.assertEqual(station_at(20), first.end_time)
+        self.assertTrue(second.complete)
+        self.assertEqual(station_at(30), second.arrival_time)
+        self.assertEqual(station_at(50), second.departure_time)
+
+        self.assertEqual(1, len(result.unknown_intervals))
+        self.assertEqual(mod_station.SEGMENT, result.unknown_intervals[0].reason)
+        self.assertAlmostEqual(10.0, result.unknown_intervals[0].duration_seconds)
+
+    def test_track_switch_is_unknown_and_closes_dwell(self) -> None:
+        gpx = station_gpx_with_tracks([
+            [[station_point(20, 0), station_point(20, 10)]],
+            [[station_point(20, 20),
+              station_point(200, 30), station_point(200, 40), station_point(200, 50), station_point(200, 60)]],
+        ])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(2, len(result.dwells))
+        self.assertFalse(result.dwells[0].complete)
+        self.assertEqual(mod_station.UNKNOWN_SEGMENT, result.dwells[0].incomplete_reason)
+        self.assertTrue(result.dwells[1].complete)
+        self.assertEqual(1, len(result.unknown_intervals))
+        self.assertEqual(mod_station.SEGMENT, result.unknown_intervals[0].reason)
+
+    def test_gap_while_outside_is_unknown_without_creating_dwell(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(200, 0), station_point(200, 10),
+            station_point(200, 400),
+            station_point(20, 410), station_point(20, 420),
+            station_point(200, 430), station_point(200, 440), station_point(200, 450), station_point(200, 460),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        self.assertTrue(result.dwells[0].complete)
+        self.assertEqual(station_at(410), result.dwells[0].arrival_time)
+        self.assertEqual(1, len(result.unknown_intervals))
+        self.assertEqual(mod_station.GAP, result.unknown_intervals[0].reason)
+        self.assertAlmostEqual(390.0, result.unknown_intervals[0].duration_seconds)
+
+    def test_dwell_open_at_end_of_data_is_incomplete(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(20, 0), station_point(20, 10), station_point(20, 20),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        dwell = result.dwells[0]
+        self.assertFalse(dwell.complete)
+        self.assertEqual(mod_station.END_OF_DATA, dwell.incomplete_reason)
+        self.assertIsNone(dwell.departure_time)
+        self.assertIsNone(dwell.dwell_seconds)
+        self.assertEqual(station_at(20), dwell.end_time)
+        self.assertAlmostEqual(20.0, dwell.confirmed_inside_seconds)
+
+    def test_empty_track_has_no_dwells(self) -> None:
+        result = mod_station.detect_station_dwells(mod_gpx.GPX(), station_config())
+        self.assertEqual([], result.dwells)
+        self.assertEqual([], result.unknown_intervals)
+
+    def test_points_without_time_are_ignored(self) -> None:
+        gpx = station_gpx_with_segments([[
+            mod_gpx.GPXTrackPoint(latitude=0.0, longitude=0.0),
+            station_point(20, 0), station_point(20, 10),
+            mod_gpx.GPXTrackPoint(latitude=0.0, longitude=0.0),
+            station_point(200, 20), station_point(200, 30), station_point(200, 40), station_point(200, 50),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, station_config())
+
+        self.assertEqual(1, len(result.dwells))
+        self.assertEqual(station_at(0), result.dwells[0].arrival_time)
+        self.assertEqual(station_at(20), result.dwells[0].departure_time)
+
+    def test_dwells_shorter_than_minimum_are_filtered(self) -> None:
+        config = station_config(min_outside_seconds=0.0, min_dwell_seconds=60.0)
+        gpx = station_gpx_with_segments([[
+            station_point(20, 0),
+            station_point(200, 10), station_point(200, 11), station_point(200, 12),
+        ]])
+
+        result = mod_station.detect_station_dwells(gpx, config)
+
+        self.assertEqual([], result.dwells)
+
+    def test_invalid_configuration_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            mod_station.detect_station_dwells(mod_gpx.GPX(), station_config(entry_radius=0.0))
+        with self.assertRaises(ValueError):
+            mod_station.detect_station_dwells(mod_gpx.GPX(), station_config(min_outside_observations=0))
+        with self.assertRaises(ValueError):
+            mod_station.detect_station_dwells(mod_gpx.GPX(), station_config(max_gap_seconds=0.0))
+
+    def test_station_dwell_cli_reports_dwells(self) -> None:
+        gpx = station_gpx_with_segments([[
+            station_point(200, 0),
+            station_point(20, 10), station_point(20, 20),
+            station_point(200, 30), station_point(200, 40), station_point(200, 50), station_point(200, 60),
+        ]])
+        temp = mod_tempfile.NamedTemporaryFile(mode='w', suffix='.gpx', delete=False)
+        try:
+            temp.write(gpx.to_xml())
+            temp.close()
+
+            cli_path = mod_os.path.join(mod_os.path.dirname(mod_os.path.abspath(__file__)),
+                                        'station_dwell')
+            loader = SourceFileLoader('station_dwell_cli', cli_path)
+            spec = mod_importlib_util.spec_from_loader(loader.name, loader)
+            assert spec is not None
+            cli = mod_importlib_util.module_from_spec(spec)
+            loader.exec_module(cli)
+
+            output = mod_io.StringIO()
+            with mod_contextlib.redirect_stdout(output):
+                exit_code = cli.main([
+                    temp.name,
+                    '--lat', '0', '--lon', '0',
+                    '--entry-radius', '100', '--exit-radius', '150',
+                ])
+            text = output.getvalue()
+        finally:
+            mod_os.remove(temp.name)
+
+        self.assertEqual(0, exit_code)
+        self.assertIn('Dwell 1', text)
+        self.assertIn('complete', text)
+
 
 if __name__ == '__main__':
     mod_unittest.main()
