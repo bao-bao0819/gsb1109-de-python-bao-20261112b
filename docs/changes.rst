@@ -3,6 +3,20 @@ Changes
 
 .. currentmodule:: xlwt
 
+Unreleased
+----------
+
+- Add :mod:`xlwt.RowOutline`, a cost-centre row outline planner. It keeps
+  ranges that BIFF can represent as one nested outline, reports crossing
+  ranges (cross-managed centres) and nesting chains deeper than the eight
+  BIFF levels as conflicts instead of silently dropping one side, lets the
+  caller choose the surviving group with
+  :meth:`~xlwt.RowOutline.OutlinePlan.select`, applies the planned outline
+  levels to worksheet rows with
+  :meth:`~xlwt.RowOutline.OutlinePlan.apply`, and can re-compute every
+  subtotal from the original detail rows with
+  :func:`~xlwt.RowOutline.verify_subtotals`.
+
 1.3.0 (22 August 2017)
 ----------------------
 

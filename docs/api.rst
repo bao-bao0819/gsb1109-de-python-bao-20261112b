@@ -10,6 +10,9 @@ API Reference
 .. automodule:: xlwt.Row
    :members:
 
+.. automodule:: xlwt.RowOutline
+   :members:
+
 .. automodule:: xlwt.Column
    :members:
 
