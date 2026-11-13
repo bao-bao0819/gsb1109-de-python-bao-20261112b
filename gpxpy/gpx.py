@@ -2513,6 +2513,24 @@ class GPX:
                    ,key=lambda x: x.location.distance_2d(location) if x is not None else mod_math.inf
                    ,default=None)
 
+    def check_roadbook(self, roadbook: List[Any]) -> Any:
+        """
+        Check this track against an ordered roadbook of stations.
+
+        Every roadbook entry is a RoadbookStation or a
+        (latitude, longitude, radius[, name]) tuple with the radius in
+        meters. Stations must be visited in the given order, the matched
+        visit times must strictly increase, and repeated stations with
+        the same coordinates require the track to leave and re-enter the
+        station radius between the two visits.
+
+        Returns a RoadbookResult telling how many stations were
+        completed, the last confirmable station and the time windows of
+        all confirmed visits.
+        """
+        from . import roadbook as mod_roadbook
+        return mod_roadbook.check_roadbook(self.walk(only_points=True), roadbook)
+
     def add_elevation(self, delta: float) -> None:
         """
         Adjusts elevation data of GPX data.

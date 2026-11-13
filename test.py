@@ -44,6 +44,7 @@ import gpxpy.gpxxml as mod_gpxxml
 import gpxpy.gpxfield as mod_gpxfield
 import gpxpy.parser as mod_parser
 import gpxpy.geo as mod_geo
+import gpxpy.roadbook as mod_roadbook
 
 from gpxpy.utils import make_str
 from gpxpy.utils import total_seconds
@@ -3723,6 +3724,153 @@ class GPXTests(mod_unittest.TestCase):
         self.assertAlmostEqual(waypoint_orig.latitude, waypoint.latitude)
         self.assertAlmostEqual(waypoint_orig.longitude, waypoint.longitude)
         self.assertAlmostEqual(waypoint_orig.elevation, waypoint.elevation) # type: ignore
+
+    def _roadbook_gpx(self, locations: List[Tuple[float, float]]) -> Tuple[mod_gpx.GPX, mod_datetime.datetime]:
+        gpx = mod_gpx.GPX()
+        track = mod_gpx.GPXTrack()
+        gpx.tracks.append(track)
+        segment = mod_gpx.GPXTrackSegment()
+        track.segments.append(segment)
+        start = mod_datetime.datetime(2026, 1, 1, 12, 0, 0)
+        for i, (latitude, longitude) in enumerate(locations):
+            segment.points.append(mod_gpx.GPXTrackPoint(
+                latitude=latitude, longitude=longitude,
+                time=start + mod_datetime.timedelta(seconds=60 * i)))
+        return gpx, start
+
+    def test_roadbook_completed_with_repeated_station(self) -> None:
+        # Roadbook A, B, A, C. The track circles around A first (leaving
+        # and re-entering the radius once), then goes to B, returns to A
+        # and finally continues to C. The two A visits must be matched
+        # as two separate visits.
+        gpx, start = self._roadbook_gpx([
+            (45.001, 14.0),    # 0: circling around A
+            (45.0, 14.001),    # 1
+            (44.999, 14.0),    # 2
+            (45.0, 13.999),    # 3
+            (45.002, 14.0),    # 4: briefly outside A's radius
+            (45.001, 14.0),    # 5: back inside while still circling
+            (45.0, 14.01),     # 6: travelling to B
+            (45.0, 14.02),     # 7: at B
+            (45.001, 14.02),   # 8: at B
+            (45.0, 14.01),     # 9: travelling back
+            (45.0, 14.001),    # 10: back at A
+            (45.0, 14.0),      # 11: back at A
+            (45.01, 14.0),     # 12: travelling to C
+            (45.02, 14.0),     # 13: at C
+            (45.021, 14.0),    # 14: at C
+        ])
+        roadbook = [
+            mod_roadbook.RoadbookStation(45.0, 14.0, 150, name='A'),
+            mod_roadbook.RoadbookStation(45.0, 14.02, 150, name='B'),
+            mod_roadbook.RoadbookStation(45.0, 14.0, 150, name='A'),
+            mod_roadbook.RoadbookStation(45.02, 14.0, 150, name='C'),
+        ]
+
+        result = gpx.check_roadbook(roadbook)
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.stations_completed, 4)
+        self.assertEqual(result.stations_total, 4)
+        self.assertEqual(result.last_station_index, 3)
+        self.assertIsNone(result.next_station_index)
+        self.assertEqual(len(result.visits), 4)
+
+        # Matched times strictly increase:
+        times = [visit.time for visit in result.visits]
+        self.assertEqual(times, sorted(times))
+        self.assertEqual(len(set(times)), 4)
+
+        # The first A visit is the first circling run, the second A
+        # visit is the return from B -- not the same presence window:
+        first_a, second_a = result.visits[0], result.visits[2]
+        self.assertEqual(first_a.enter_time, start)
+        self.assertEqual(first_a.exit_time, start + mod_datetime.timedelta(seconds=3 * 60))
+        self.assertEqual(second_a.enter_time, start + mod_datetime.timedelta(seconds=10 * 60))
+        self.assertEqual(second_a.exit_time, start + mod_datetime.timedelta(seconds=11 * 60))
+        self.assertTrue(first_a.exit_time < second_a.enter_time)
+
+        for visit in result.visits:
+            self.assertTrue(visit.enter_time <= visit.time <= visit.exit_time)
+
+    def test_roadbook_unfinished_reports_last_station_and_windows(self) -> None:
+        # Same as above but the track never continues to C.
+        gpx, start = self._roadbook_gpx([
+            (45.001, 14.0),    # 0: at A
+            (45.0, 14.001),    # 1: at A
+            (45.0, 14.01),     # 2: travelling to B
+            (45.0, 14.02),     # 3: at B
+            (45.0, 14.01),     # 4: travelling back
+            (45.0, 14.0),      # 5: back at A
+        ])
+        roadbook = [
+            (45.0, 14.0, 150),
+            (45.0, 14.02, 150),
+            (45.0, 14.0, 150),
+            (45.02, 14.0, 150),
+        ]
+
+        result = gpx.check_roadbook(roadbook)
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.stations_completed, 3)
+        self.assertEqual(result.last_station_index, 2)
+        self.assertEqual(result.next_station_index, 3)
+        self.assertEqual(len(result.visits), 3)
+        # All confirmed visit time windows:
+        self.assertEqual([v.enter_time for v in result.visits], [
+            start,
+            start + mod_datetime.timedelta(seconds=3 * 60),
+            start + mod_datetime.timedelta(seconds=5 * 60),
+        ])
+        self.assertEqual([v.exit_time for v in result.visits], [
+            start + mod_datetime.timedelta(seconds=1 * 60),
+            start + mod_datetime.timedelta(seconds=3 * 60),
+            start + mod_datetime.timedelta(seconds=5 * 60),
+        ])
+
+    def test_roadbook_repeated_station_requires_exit_and_reentry(self) -> None:
+        # Staying inside the radius the whole time is a single visit:
+        gpx, _ = self._roadbook_gpx([
+            (45.0, 14.0),
+            (45.001, 14.0),
+            (45.0, 14.001),
+            (44.999, 14.0),
+        ])
+        roadbook = [(45.0, 14.0, 150), (45.0, 14.0, 150)]
+        result = gpx.check_roadbook(roadbook)
+        self.assertFalse(result.completed)
+        self.assertEqual(result.stations_completed, 1)
+        self.assertEqual(result.last_station_index, 0)
+
+        # Leaving and re-entering the radius counts as two visits:
+        gpx, _ = self._roadbook_gpx([
+            (45.0, 14.0),
+            (45.001, 14.0),
+            (45.01, 14.0),
+            (45.0, 14.0),
+            (45.001, 14.0),
+        ])
+        result = gpx.check_roadbook(roadbook)
+        self.assertTrue(result.completed)
+        self.assertEqual(result.stations_completed, 2)
+        self.assertTrue(result.visits[0].exit_time < result.visits[1].enter_time)
+
+    def test_roadbook_visit_times_must_strictly_increase(self) -> None:
+        # The track reaches B before A, so the roadbook A, B can only
+        # confirm A -- the earlier presence at B must not be matched.
+        gpx, _ = self._roadbook_gpx([
+            (45.0, 14.02),     # 0: at B
+            (45.0, 14.01),     # 1: travelling
+            (45.0, 14.0),      # 2: at A
+            (45.001, 14.0),    # 3: at A
+        ])
+        roadbook = [(45.0, 14.0, 150), (45.0, 14.02, 150)]
+        result = gpx.check_roadbook(roadbook)
+        self.assertFalse(result.completed)
+        self.assertEqual(result.stations_completed, 1)
+        self.assertEqual(result.last_station_index, 0)
+        self.assertEqual(result.next_station_index, 1)
 
 if __name__ == '__main__':
     mod_unittest.main()
