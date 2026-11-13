@@ -493,6 +493,50 @@ class TestBaseFile(unittest.TestCase):
         self.assertEqual(entry1.msgstr, u('une cha\u00eene sans contexte'))
         self.assertEqual(entry2.msgstr, u('une cha\u00eene avec contexte'))
 
+    def test_find6(self):
+        """
+        Test that no context, an empty context and a non-empty context are
+        distinct identities, both in PO files and after an MO roundtrip.
+        """
+        data = u('''msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\\n"
+
+msgid "shared"
+msgstr "no context"
+
+msgctxt ""
+msgid "shared"
+msgstr "empty context"
+
+msgctxt "menu"
+msgid "shared"
+msgstr "menu context"
+''')
+        pofile = polib.pofile(data)
+        self.assertIsNone(pofile.find('shared').msgctxt)
+        self.assertEqual(pofile.find('shared', msgctxt=None).msgstr,
+                         u('no context'))
+        self.assertEqual(pofile.find('shared', msgctxt='').msgstr,
+                         u('empty context'))
+        self.assertEqual(pofile.find('shared', msgctxt='menu').msgstr,
+                         u('menu context'))
+
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            pofile.save_as_mofile(tmpfile)
+            mofile = polib.mofile(tmpfile)
+        finally:
+            os.remove(tmpfile)
+
+        self.assertIsNone(mofile.find('shared').msgctxt)
+        self.assertEqual(mofile.find('shared', msgctxt=None).msgstr,
+                         u('no context'))
+        self.assertEqual(mofile.find('shared', msgctxt='').msgstr,
+                         u('empty context'))
+        self.assertEqual(mofile.find('shared', msgctxt='menu').msgstr,
+                         u('menu context'))
+
     def test_save1(self):
         pofile = polib.POFile()
         self.assertRaises(IOError, pofile.save)

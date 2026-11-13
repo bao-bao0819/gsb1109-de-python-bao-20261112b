@@ -488,7 +488,10 @@ class _BaseFile(list):
 
         ``msgctxt``
             string, allows specifying a specific message context for the
-            search.
+            search. Use ``None`` to look up an entry without any msgctxt and
+            ``''`` to look up an entry with an explicitly empty msgctxt. When
+            omitted, entries without a msgctxt are preferred, falling back to
+            the first match.
         """
         if include_obsolete_entries:
             entries = self[:]
@@ -503,12 +506,13 @@ class _BaseFile(list):
         if len(matches) == 1:
             return matches[0]
         elif len(matches) > 1:
-            if not msgctxt:
-                # find the entry with no msgctx
+            if msgctxt is False:
+                # find the entry with no msgctxt
                 e = None
                 for m in matches:
-                    if not m.msgctxt:
+                    if m.msgctxt is None:
                         e = m
+                        break
                 if e:
                     return e
                 # fallback to the first entry found
@@ -578,7 +582,7 @@ class _BaseFile(list):
             # For each string, we need size and file offset.  Each string is
             # NUL terminated; the NUL does not count into the size.
             msgid = b('')
-            if e.msgctxt:
+            if e.msgctxt is not None:
                 # Contexts are stored by storing the concatenation of the
                 # context, a <EOT> byte, and the original string
                 msgid = self._encode(e.msgctxt + '\4')
@@ -953,7 +957,7 @@ class _BaseEntry(object):
 
     @property
     def msgid_with_context(self):
-        if self.msgctxt:
+        if self.msgctxt is not None:
             return '%s%s%s' % (self.msgctxt, "\x04", self.msgid)
         return self.msgid
 # }}}
