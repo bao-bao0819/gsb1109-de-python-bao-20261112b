@@ -13,6 +13,13 @@ import csv
 import pyexcel_io.service as service
 import pyexcel_io._compact as compact
 import pyexcel_io.constants as constants
+from pyexcel_io.column_contract import (
+    CSVColumnContractError,
+    ColumnContract,
+    ColumnRule,
+    normalise_header_rows,
+    normalise_headers,
+)
 from pyexcel_io.plugin_api import ISheet
 
 DEFAULT_SEPARATOR = "__"
@@ -26,6 +33,21 @@ BOM_LITTLE_ENDIAN = b"\xff\xfe"
 BOM_BIG_ENDIAN = b"\xfe\ff"
 LITTLE_ENDIAN = 0
 BIG_ENDIAN = 1
+
+CONTRACT_KEYWORDS = (
+    "column_contract",
+    "input_contract",
+    "column_rules",
+    "column_types",
+    "columns",
+    "contract",
+)
+HEADER_KEYWORDS = (
+    "header_rows",
+    "header_row_count",
+    "headers",
+    "header",
+)
 
 
 class CSVMemoryMapIterator(object):
@@ -93,6 +115,16 @@ class CSVMemoryMapIterator(object):
         pass
 
 
+class _ContractRow(list):
+    """A row whose contracted cells must not be auto-detected again."""
+
+    def __init__(self, values, converted_positions, source_row, data_row):
+        super(_ContractRow, self).__init__(values)
+        self.converted_positions = set(converted_positions)
+        self.source_row = source_row
+        self.data_row = data_row
+
+
 class CSVSheetReader(ISheet):
     """generic csv file reader"""
 
@@ -119,7 +151,80 @@ class CSVSheetReader(ISheet):
         self.__pep_0515_off = pep_0515_off
         self.__ignore_nan_text = ignore_nan_text
         self.__default_float_nan = default_float_nan
+        self.__contract = self.__extract_contract(keywords)
+        self.__explicit_header_rows = "header_rows" in keywords
+        self.__header_rows = self.__extract_header_rows(keywords)
+        self.__headers = self.__extract_headers(keywords)
+        self.__header_values = []
+        self.__bound_contract = None
+        self.__rows_consumed = 0
+        self.__data_row = 0
+        self.__row_iterator = None
+        self.__read_violations = []
+        self.__read_number = 0
         self._keywords = keywords
+
+    @staticmethod
+    def __extract_contract(keywords):
+        found = []
+        for keyword in CONTRACT_KEYWORDS:
+            if keyword not in keywords:
+                continue
+            value = keywords.pop(keyword)
+            if value is None:
+                continue
+            found.append(value)
+        if len(found) > 1:
+            raise TypeError(
+                "Specify the csv column contract only once"
+            )
+        if not found:
+            return None
+        return ensure_contract(found[0])
+
+    @staticmethod
+    def __extract_header_rows(keywords):
+        value = keywords.pop("header_rows", None)
+        value_from_alias = keywords.pop("header_row_count", None)
+        if value is None:
+            value = value_from_alias
+        elif value_from_alias is not None:
+            raise TypeError(
+                "Specify either header_rows or header_row_count, not both"
+            )
+        if value is None:
+            return None
+        return normalise_header_rows(value)
+
+    @staticmethod
+    def __extract_headers(keywords):
+        value = keywords.pop("headers", None)
+        alias = keywords.pop("header", None)
+        if value is None:
+            value = alias
+        elif alias is not None:
+            raise TypeError("Specify either headers or header, not both")
+        if value is None:
+            return None
+        return normalise_headers(value)
+
+    @property
+    def column_contract(self):
+        return self.__contract
+
+    @property
+    def input_contract(self):
+        return self.__contract
+
+    @property
+    def contract_violations(self):
+        if self.__contract is None:
+            return []
+        return self.__read_violations
+
+    @property
+    def errors(self):
+        return self.contract_violations
 
     def get_file_handle(self):
         """return me unicode reader for csv"""
@@ -127,13 +232,125 @@ class CSVSheetReader(ISheet):
 
     def row_iterator(self):
         self.__file_handle = self.get_file_handle()
-        return csv.reader(self.__file_handle, **self._keywords)
+        self.__read_number += 1
+        if self.__read_number > 1:
+            self.__header_values = []
+            self.__bound_contract = None
+            self.__rows_consumed = 0
+            self.__data_row = 0
+        if self.__contract is not None:
+            self.__contract.begin_read()
+        csv_keywords = {
+            key: value
+            for key, value in self._keywords.items()
+            if key not in CONTRACT_KEYWORDS
+            and key not in HEADER_KEYWORDS
+        }
+        self.__row_iterator = csv.reader(
+            self.__file_handle, **csv_keywords
+        )
+        self.__read_violations = []
+        if self.__contract is not None:
+            self.__prepare_contract()
+        return self.__iter_rows()
+
+    def __prepare_contract(self):
+        if self.__headers is not None:
+            self.__header_values = [list(row) for row in self.__headers]
+            self.__bound_contract = self.__contract.bind(
+                self.__header_values
+            )
+            if self.__explicit_header_rows and self.__header_rows:
+                self.__consume_rows(self.__header_rows)
+            return
+        if self.__explicit_header_rows:
+            count = self.__header_rows or 0
+            if count:
+                self.__prepare_headers(count)
+            else:
+                self.__bound_contract = self.__contract.bind(
+                    self.__header_values
+                )
+            return
+        contract = self.__contract
+        if contract.headers:
+            self.__header_values = [list(row) for row in contract.headers]
+            self.__bound_contract = contract.bind(self.__header_values)
+            return
+        if contract.header_rows and contract.consume_header_rows:
+            self.__prepare_headers(contract.header_rows)
+            return
+        self.__bound_contract = contract.bind(self.__header_values)
+
+    def __consume_rows(self, count):
+        for _ in range(count):
+            try:
+                next(self.__row_iterator)
+            except StopIteration:
+                break
+            self.__rows_consumed += 1
+
+    def __prepare_headers(self, count):
+        self.__header_rows = count
+        for position in range(count):
+            try:
+                header = next(self.__row_iterator)
+            except StopIteration:
+                break
+            self.__rows_consumed += 1
+            self.__header_values.append(list(header))
+            if position == count - 1:
+                self.__bound_contract = self.__contract.bind(
+                    self.__header_values
+                )
+        if self.__bound_contract is None:
+            self.__bound_contract = self.__contract.bind(
+                self.__header_values
+            )
+
+    def __iter_rows(self):
+        for row in self.__row_iterator:
+            row = self.__apply_contract(row)
+            yield row
+
+    def __apply_contract(self, row):
+        if self.__contract is None:
+            return row
+        if self.__bound_contract is None:
+            self.__bound_contract = self.__contract.bind(
+                self.__header_values
+            )
+        source_row = self.__rows_consumed
+        line_number = source_row + 1
+        converted, violations = self.__bound_contract.convert_row(
+            row,
+            data_row=self.__data_row,
+            source_row=source_row,
+            line_number=line_number,
+        )
+        if violations:
+            self.__read_violations.extend(violations)
+            if self.__contract.strict:
+                self.close()
+                raise CSVColumnContractError(violations)
+        self.__data_row += 1
+        self.__rows_consumed += 1
+        return _ContractRow(
+            converted,
+            self.__bound_contract.position_rules.keys(),
+            source_row,
+            self.__data_row - 1,
+        )
 
     def column_iterator(self, row):
-        for element in row:
-            if element is not None and element != "":
-                element = self.__convert_cell(element)
-            yield element
+        converted_positions = getattr(row, "converted_positions", ())
+        for column, element in enumerate(row):
+            if column in converted_positions:
+                yield element
+            elif element is not None and element != "":
+                yield self.__convert_cell(element)
+            else:
+                yield element
 
     def __convert_cell(self, csv_cell_text):
         ret = None
@@ -160,6 +377,37 @@ class CSVSheetReader(ISheet):
     def close(self):
         if self.__file_handle:
             self.__file_handle.close()
+
+
+def ensure_contract(value):
+    """Turn a contract-like value into a :class:`ColumnContract`."""
+    if isinstance(value, ColumnContract):
+        return value
+    if isinstance(value, ColumnRule):
+        return ColumnContract(rules=[value])
+    if isinstance(value, dict):
+        known = set(
+            (
+                "rules",
+                "header_rows",
+                "headers",
+                "strict",
+                "on_error",
+                "missing_column",
+                "consume_header_rows",
+            )
+        )
+        if known.intersection(value):
+            return ColumnContract(**value)
+        return ColumnContract(rules=value)
+    if isinstance(value, (list, tuple)):
+        return ColumnContract(rules=value)
+    raise TypeError(
+        "Unsupported csv column contract %r" % (value,)
+    )
+
+
+csv_column_contract = ensure_contract
 
 
 # else: means the generator has been run

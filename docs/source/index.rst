@@ -192,6 +192,7 @@ get_data(.., library='pyexcel-ods')
    :maxdepth: 2
 
    plaincsv
+   column_contract
    pagination
    renderer
    extendedcsv

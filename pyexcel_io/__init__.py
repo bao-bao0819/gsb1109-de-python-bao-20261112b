@@ -13,6 +13,18 @@ import logging
 import pyexcel_io.plugins as plugins
 
 from .io import get_data, iget_data, save_data  # noqa
+from .column_contract import (  # noqa
+    ColumnContract,
+    ColumnRule,
+    HeaderSelector,
+    PositionSelector,
+    make_contract,
+)
+from .exceptions import (  # noqa
+    ColumnContractConfigError,
+    ColumnContractViolation,
+    CSVColumnContractError,
+)
 from ._compact import NullHandler
 
 logging.getLogger(__name__).addHandler(NullHandler())  # noqa

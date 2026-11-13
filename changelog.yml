@@ -2,6 +2,11 @@ name: pyexcel-io
 organisation: pyexcel
 releases:
 - changes:
+  - action: added
+    details:
+    - "CSV readers accept column level input contracts selected by header path\
+      \ or original column position, with per-type conversion, empty/missing\
+      \ reporting and violation records that retain the original cell text."
   - action: updated
     details:
     - "`#56`: fix regex error when loading multi-file CSV from a directory with special\
