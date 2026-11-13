@@ -988,18 +988,65 @@ class FitReader:
     @staticmethod
     def _resolve_subfield(field, def_mesg, raw_values):
         # resolve into (field, parent) ie (subfield, field) or (field, none)
-        if field.subfields:
-            for sub_field in field.subfields:
-                # go through reference fields for this sub field
-                for ref_field in sub_field.ref_fields:
-                    # go through field defs AND their raw values
-                    for field_def, raw_value in zip(
-                            def_mesg.field_defs, raw_values):
-                        # if there's a definition number AND raw value match on
-                        # the reference field, then we return this subfield
-                        if (field_def.def_num == ref_field.def_num and
-                                ref_field.raw_value == raw_value):
-                            return sub_field, field
+        if not field.subfields:
+            return field, None
+
+        # Index the raw values carried by this message by field definition
+        # number. Doing so makes subfield resolution independent from the order
+        # in which fields are declared in the definition message: a reference
+        # field does not have to appear before the field it qualifies.
+        #
+        # Only the so-called "native" fields are considered here since
+        # reference fields always point to native fields, and they happen to be
+        # listed first in the definition message.
+        native_field_defs = def_mesg.field_defs
+        native_raw_values = raw_values[:len(native_field_defs)]
+        message_values = {}
+        for field_def, field_raw_value in zip(
+                native_field_defs, native_raw_values):
+            message_values.setdefault(field_def.def_num, []).append(
+                field_raw_value)
+
+        matched_subfields = []
+        for sub_field in field.subfields:
+            # Group this subfield's reference fields by the definition number
+            # of the field they point to.
+            #
+            # * reference fields sharing the same definition number are
+            #   alternative values for that one field, hence they are combined
+            #   with a logical OR (e.g. the *garmin_product* subfield matches
+            #   when *manufacturer* is one of several values);
+            # * reference fields pointing to distinct definition numbers all
+            #   have to be satisfied, hence the groups are combined with a
+            #   logical AND.
+            expected_values = {}
+            for ref_field in sub_field.ref_fields:
+                expected_values.setdefault(
+                    ref_field.def_num, []).append(ref_field.raw_value)
+
+            # A subfield is selected only when every referenced field is
+            # present in this message and carries one of the expected raw
+            # values. Matching is keyed by definition number, not by position,
+            # so a reference field never has to appear before the field it
+            # qualifies.
+            is_match = True
+            for ref_def_num, ref_raw_values in expected_values.items():
+                message_raw_values = message_values.get(ref_def_num)
+                if message_raw_values is None or not any(
+                        value in ref_raw_values
+                        for value in message_raw_values):
+                    is_match = False
+                    break
+
+            if is_match:
+                matched_subfields.append(sub_field)
+
+        # The subfield is selected only when the match is unambiguous. If the
+        # reference field is missing, its value is unknown, or several
+        # subfields could match at once, the base field is kept untouched so
+        # the original (raw) value is preserved.
+        if len(matched_subfields) == 1:
+            return matched_subfields[0], field
 
         return field, None
 
