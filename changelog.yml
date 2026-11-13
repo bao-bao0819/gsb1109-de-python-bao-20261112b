@@ -2,6 +2,16 @@ name: pyexcel-io
 organisation: pyexcel
 releases:
 - changes:
+  - action: added
+    details:
+    - QuerysetsReader supports detail_path to expand nested lists row by row
+      (e.g. an order's parcels and each parcel's scans stay aligned), keep_empty
+      to retain rows for empty sub-lists, and raises
+      UnalignedListCombinationError when selected columns traverse independent
+      lists, unless the combination is confirmed with allow_cartesian=True.
+  version: 0.6.9
+  date: tbd
+- changes:
   - action: updated
     details:
     - "`#56`: fix regex error when loading multi-file CSV from a directory with special\

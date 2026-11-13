@@ -248,3 +248,25 @@ What if we read a subset per each table
    >>> mysession.close()
    >>> import os
    >>> os.unlink('sqlalchemy.db')
+
+Export nested lists along a detail path
+----------------------------------------------------------------------------------
+
+When the queried objects nest lists, e.g. an order has many parcels and each
+parcel has many scans, :class:`~pyexcel_io.database.querysets.QuerysetsReader`
+can flatten them along a `detail_path`. Each row then lines a parcel up with
+its own scans::
+
+    reader = QuerysetsReader(
+        orders,
+        ["order_no", "parcels__number", "parcels__scans__time"],
+        detail_path="parcels__scans",
+    )
+
+A parcel whose scan list is empty is skipped unless `keep_empty=True` is
+given, in which case it keeps one row with empty scan columns.
+
+Columns that traverse a second, independent list, e.g. `notes__text` on the
+same order, cannot be paired with the parcels. Exporting them together would
+multiply rows silently, so :class:`UnalignedListCombinationError` is raised
+unless the caller confirms the combination with `allow_cartesian=True`.
