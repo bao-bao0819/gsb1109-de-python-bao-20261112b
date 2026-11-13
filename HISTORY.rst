@@ -5,6 +5,18 @@ Change Log
 ==========
 
 
+Unreleased
+==========
+
+* New ``fitdecode.hr`` module to index the per-beat observations carried by
+  ``hr`` messages: beats are keyed by their raw 1024-Hz ``event_timestamp``
+  tick so device precision is preserved and beats within the same second stay
+  distinct, overlapping re-transmissions add a source reference instead of
+  duplicating the observation, conflicting ``filtered_bpm`` measurements are
+  retained (never averaged) and each source traces back to its original ``hr``
+  message
+
+
 v0.11.0 (2025-08-06)
 ====================
 

@@ -8,6 +8,7 @@ Reference
     reference/reader
     reference/processors
     reference/records
+    reference/hr
     reference/types
     reference/exceptions
     reference/utils
