@@ -35,6 +35,11 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('-b', '--bullets', default='*+-',
                         help="A string of bullet styles to use; the bullet will "
                         "alternate based on nesting level.")
+    parser.add_argument('--clauses', action='store_true',
+                        help="Clause collection mode: ordered lists preserve the "
+                        "HTML numbering (start/reversed/value), nested lists keep "
+                        "their own counters with full clause-number paths, and "
+                        "paragraphs between items do not consume a number.")
     parser.add_argument('--strong-em-symbol', default=ASTERISK,
                         choices=(ASTERISK, UNDERSCORE),
                         help="Use * or _ to convert strong and italics text"),

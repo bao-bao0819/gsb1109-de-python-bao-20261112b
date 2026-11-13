@@ -79,6 +79,25 @@ bullets
   lists are nested. Otherwise, the bullet will alternate based on nesting
   level. Defaults to ``'*+-'``.
 
+clauses
+  A boolean enabling clause collection mode for ordered lists, as used for
+  numbered documents such as association bylaws. When enabled, the converted
+  numbers match the rendered HTML exactly:
+
+  - ``<ol start>`` and ``<ol reversed>`` set the first item's number (a
+    reversed list without ``start`` counts down from the number of its direct
+    ``<li>`` children).
+  - An explicit ``<li value>`` overrides the number, and every following item
+    continues from it (forward or backward in a reversed list).
+  - Each nested ordered list keeps its own counter, while every item still
+    carries its full clause-number path. A list such as
+    ``<ol start="10"><li>a<ol><li>b</li></ol></li><li>c</li></ol>`` converts
+    to ``10. a``, ``10.1. b`` and ``11. c``.
+  - Paragraphs and other non-item elements between list items never consume a
+    number.
+
+  Defaults to ``False``, which preserves the legacy numbering.
+
 strong_em_symbol
   In markdown, both ``*`` and ``_`` are used to encode **strong** or
   *emphasized* texts. Either of these symbols can be chosen by the options

@@ -177,6 +177,10 @@ class MarkdownConverter(object):
         autolinks = True
         bs4_options = 'html.parser'
         bullets = '*+-'  # An iterable of bullet types.
+        # Clause collection mode: ordered-list items keep their HTML ordinal
+        # values (including start/reversed/value) and carry a full clause
+        # number path, with each nested list keeping its own counter.
+        clauses = False
         code_language = ''
         code_language_callback = None
         convert = None
@@ -216,6 +220,67 @@ class MarkdownConverter(object):
 
         # Initialize the conversion function cache
         self.convert_fn_cache = {}
+
+    @staticmethod
+    def _parse_int_attr(value, default=None):
+        """Parse an HTML integer attribute (e.g. start/value), tolerating sign."""
+        if value is None:
+            return default
+        match = re.match(r'^\s*([+-]?\d+)\s*$', str(value))
+        return int(match.group(1)) if match else default
+
+    def _ol_starting_value(self, list_el):
+        """
+        Return the ordinal of the first item of an <ol> in clause collection
+        mode. A reversed list without an explicit start counts down from the
+        number of its direct <li> children; explanation paragraphs and nested
+        lists between the items are not counted.
+        """
+        start = self._parse_int_attr(list_el.get('start'))
+        if start is not None:
+            return start
+        if list_el.has_attr('reversed'):
+            return sum(1 for child in list_el.children
+                       if isinstance(child, Tag) and child.name == 'li')
+        return 1
+
+    def _li_ordinal(self, el):
+        """
+        Resolve the ordinal of an <li> inside an <ol> following the HTML spec.
+        An explicit <li value> wins and every following item continues from it;
+        otherwise the counter advances from the list start, stepping backward
+        for reversed lists. Non-<li> siblings never advance the counter.
+        """
+        explicit = self._parse_int_attr(el.get('value'))
+        if explicit is not None:
+            return explicit
+
+        list_el = el.parent
+        step = -1 if list_el.has_attr('reversed') else 1
+        distance = 0
+        for sibling in el.previous_siblings:
+            if not isinstance(sibling, Tag) or sibling.name != 'li':
+                continue
+            sibling_value = self._parse_int_attr(sibling.get('value'))
+            if sibling_value is not None:
+                return sibling_value + step * (distance + 1)
+            distance += 1
+        return self._ol_starting_value(list_el) + step * distance
+
+    def _clause_path(self, el):
+        """
+        Build the clause-number path of an <li>: the ordinals of this item and
+        every enclosing ordered-list item, outermost first. Each list keeps its
+        own counter, so nested annotation lists number independently.
+        """
+        ordinals = []
+        node = el
+        while isinstance(node, Tag) and node.name == 'li':
+            if isinstance(node.parent, Tag) and node.parent.name == 'ol':
+                ordinals.append(self._li_ordinal(node))
+            node = node.find_parent('li')
+        ordinals.reverse()
+        return ordinals
 
     def convert(self, html):
         soup = BeautifulSoup(html, **self.options['bs4_options'])
@@ -633,11 +698,18 @@ class MarkdownConverter(object):
         # determine list item bullet character to use
         parent = el.parent
         if parent is not None and parent.name == 'ol':
-            if parent.get("start") and str(parent.get("start")).isnumeric():
-                start = int(parent.get("start"))
+            if self.options['clauses']:
+                # Clause collection mode: each <ol> keeps its own counter and
+                # every item carries its full clause-number path, honoring
+                # start/reversed/value exactly as the browser would.
+                bullet = '.'.join(str(number)
+                                  for number in self._clause_path(el)) + '.'
             else:
-                start = 1
-            bullet = '%s.' % (start + len(el.find_previous_siblings('li')))
+                if parent.get("start") and str(parent.get("start")).isnumeric():
+                    start = int(parent.get("start"))
+                else:
+                    start = 1
+                bullet = '%s.' % (start + len(el.find_previous_siblings('li')))
         else:
             depth = -1
             while el:
