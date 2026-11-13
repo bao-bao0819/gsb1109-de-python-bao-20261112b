@@ -1,0 +1,53 @@
+{
+  "sections": [
+    {
+      "key": "intro",
+      "id": "intro",
+      "title": "介绍",
+      "markdown_file": "md/intro.md",
+      "reading_record": {"status": "done", "reader": "alice", "at": "2026-10-02"}
+    },
+    {
+      "key": "install",
+      "id": "install",
+      "title": "安装",
+      "markdown_file": "md/install.md",
+      "reading_record": {"status": "done", "reader": "bob", "at": "2026-10-03"}
+    },
+    {
+      "key": "usage",
+      "id": "usage",
+      "title": "使用方法",
+      "markdown_file": "md/usage.md",
+      "reading_record": {"status": "done", "reader": "alice", "at": "2026-10-04"}
+    },
+    {
+      "key": "limits-a",
+      "id": "limits-a",
+      "title": "限制",
+      "markdown_file": "md/limits-a.md",
+      "reading_record": {"status": "done", "reader": "carol", "at": "2026-10-05"}
+    },
+    {
+      "key": "limits-b",
+      "id": "limits-b",
+      "title": "限制",
+      "markdown_file": "md/limits-b.md",
+      "reading_record": {"status": "done", "reader": "dave", "at": "2026-10-05"}
+    },
+    {
+      "key": "misc",
+      "id": "misc",
+      "title": "杂项",
+      "markdown_file": "md/misc.md",
+      "reading_record": {"status": "done", "reader": "bob", "at": "2026-10-06"}
+    },
+    {
+      "key": "legacy",
+      "id": "legacy",
+      "title": "旧版说明",
+      "markdown_file": "md/legacy.md",
+      "reading_record": {"status": "done", "reader": "alice", "at": "2026-10-07"}
+    }
+  ]
+}
