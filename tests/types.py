@@ -20,6 +20,7 @@ MarkdownConverter(
     escape_asterisks=True,
     escape_underscores=True,
     escape_misc=False,
+    footnotes=True,
     heading_style=UNDERLINED,
     keep_inline_images_in=[],
     newline_style=SPACES,

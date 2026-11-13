@@ -55,6 +55,10 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--no-escape-underscores', dest='escape_underscores',
                         action='store_false',
                         help="Do not escape '_' to '\\_' in text.")
+    parser.add_argument('--no-footnotes', dest='footnotes',
+                        action='store_false',
+                        help="Do not resolve footnote/table-note references "
+                             "into Markdown footnotes; keep <sup> output.")
     parser.add_argument('-i', '--keep-inline-images-in',
                         default=[],
                         nargs='*',

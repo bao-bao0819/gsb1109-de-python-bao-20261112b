@@ -27,6 +27,7 @@ def markdownify(
     escape_asterisks: bool = ...,
     escape_underscores: bool = ...,
     escape_misc: bool = ...,
+    footnotes: bool = ...,
     heading_style: str = ...,
     keep_inline_images_in: list[str] = ...,
     newline_style: str = ...,
@@ -55,6 +56,7 @@ class MarkdownConverter:
         escape_asterisks: bool = ...,
         escape_underscores: bool = ...,
         escape_misc: bool = ...,
+        footnotes: bool = ...,
         heading_style: str = ...,
         keep_inline_images_in: list[str] = ...,
         newline_style: str = ...,
@@ -71,6 +73,10 @@ class MarkdownConverter:
         ...
   
     def convert(self, html: str) -> str:
+        ...
+
+    @property
+    def footnote_unresolved(self) -> dict[str, dict[str, object]]:
         ...
 
     def convert_soup(self, soup: Incomplete) -> str:

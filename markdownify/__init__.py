@@ -172,6 +172,94 @@ def _next_block_content_sibling(el):
     return None
 
 
+# Symbols conventionally used as footnote/table-note markers
+FOOTNOTE_MARKER_SYMBOLS = '*†‡§¶#'
+
+# Block-level elements that may carry a footnote clause
+FOOTNOTE_NOTE_TAGS = ('p', 'li', 'td', 'dt', 'dd', 'div')
+
+# Control-character sentinels used to keep footnote reference positions while
+# the rest of the document is converted
+re_footnote_token = re.compile(r'\x1afnref:(\d+)\x1a')
+
+
+def _footnote_token(index):
+    return '\x1afnref:%d\x1a' % index
+
+
+def _split_href_fragment(href):
+    """Split an href into (page part, fragment); an empty page stays empty."""
+    if href is None:
+        return None, None
+    if '#' in href:
+        page, _, fragment = href.partition('#')
+        return page, fragment
+    return href, ''
+
+
+def _sanitize_footnote_label(label):
+    """Make an id usable as a markdown footnote label."""
+    sanitized = re.sub(r'[^A-Za-z0-9_-]', '-', label).strip('-')
+    return sanitized or 'note'
+
+
+def _footnote_marker(el):
+    """Return the marker token (e.g. '*', '1') that opens a note element."""
+    text = el.get_text(strip=True)
+    if not text:
+        return ''
+    if text[0] in FOOTNOTE_MARKER_SYMBOLS:
+        return text[0]
+    return text.split()[0].rstrip('.:：、)）')
+
+
+def _inside_footnote_def(el):
+    """Whether the element sits inside a container marked as a footnote def."""
+    parent = el.parent
+    while isinstance(parent, Tag):
+        classes = parent.get('class') or []
+        if any('footnote' in class_name.lower() for class_name in classes):
+            return True
+        parent_id = parent.get('id')
+        if parent_id and re.match(r'^(fn|footnote|note)[-_]?', parent_id, re.IGNORECASE):
+            return True
+        parent = parent.parent
+    return False
+
+
+def _is_footnote_ref(el):
+    """
+    Return whether a <sup> element is an explicit footnote reference rather
+    than an ordinary superscript.
+
+    An anchored <sup> always cites its href. A bare <sup> counts when it
+    carries a conventional marker symbol anywhere, or a short numeric/letter
+    marker inside a table cell (the rate-table case). Markers inside known
+    footnote containers are clause labels/backrefs, not references.
+    """
+    if el is None or el.name != 'sup':
+        return False
+    if el.find('a', href=True) is not None:
+        return not _inside_footnote_def(el)
+    text = el.get_text(strip=True)
+    if not text or _inside_footnote_def(el):
+        return False
+    if any(symbol in text for symbol in FOOTNOTE_MARKER_SYMBOLS):
+        return True
+    if re.fullmatch(r'[0-9A-Za-z]{1,3}', text) and el.find_parent(['td', 'th']):
+        return True
+    return False
+
+
+def _footnote_ref_href(el):
+    """Return the href explicitly targeted by a footnote reference, else None."""
+    anchor = el.find('a', href=True)
+    if anchor is None:
+        return None
+    href = anchor.get('href')
+    return href.strip() if href and href.strip() else None
+
+
 class MarkdownConverter(object):
     class DefaultOptions:
         autolinks = True
@@ -184,6 +272,7 @@ class MarkdownConverter(object):
         escape_asterisks = True
         escape_underscores = True
         escape_misc = False
+        footnotes = True
         heading_style = UNDERLINED
         keep_inline_images_in = []
         newline_style = SPACES
@@ -217,12 +306,328 @@ class MarkdownConverter(object):
         # Initialize the conversion function cache
         self.convert_fn_cache = {}
 
+        # Footnote resolution state, reset per document in convert()
+        self._footnote_ref_index = 0      # sentinel counter
+        self._footnote_rendering = False  # True while rendering definitions
+
     def convert(self, html):
         soup = BeautifulSoup(html, **self.options['bs4_options'])
         return self.convert_soup(soup)
 
     def convert_soup(self, soup):
-        return self.process_tag(soup, parent_tags=set())
+        if self.options['footnotes']:
+            self._reset_footnote_state()
+            self._collect_footnote_defs(soup)
+            self._mark_referenced_notes(soup)
+        text = self.process_tag(soup, parent_tags=set())
+        if self.options['footnotes']:
+            text = self._append_footnote_section(text)
+        return text
+
+    def _reset_footnote_state(self):
+        self._footnote_unresolved = {}    # target -> {'target', 'fallback', 'external'}
+        self._footnote_label_order = []   # labels in first-reference order
+        self._footnote_ref_index = 0
+        self._footnote_rendering = False
+        self._footnote_anchor_meta = {}      # href fragment -> definition meta
+        self._footnote_marker_meta = {}      # (scope, marker) -> definition meta
+        self._footnote_meta_by_label = {}    # label -> definition meta
+        self._footnote_ref_results = {}      # sentinel index -> ('ref', label) | ('text', fallback)
+        self._footnote_referenced_labels = set()
+        self._footnote_render_scope = None
+        self._footnote_note_els = set()
+        self._footnote_suppress_els = set()
+
+    @property
+    def footnote_unresolved(self):
+        """Targets whose clause could not be confirmed within the document."""
+        return dict(getattr(self, '_footnote_unresolved', {}))
+
+    # -- Footnote definitions ------------------------------------------------
+
+    def _is_note_named(self, el):
+        """Whether an element is itself named like a footnote container/item."""
+        classes = el.get('class') or []
+        if any('footnote' in name.lower() or 'table-note' in name.lower()
+               for name in classes):
+            return True
+        el_id = el.get('id')
+        return bool(el_id and re.match(r'^(fn|footnote|note)[-_]?', el_id, re.IGNORECASE))
+
+    def _unique_footnote_label(self, base):
+        label = base
+        suffix = 2
+        while label in self._footnote_meta_by_label:
+            label = '%s-%d' % (base, suffix)
+            suffix += 1
+        return label
+
+    def _next_marker_label(self):
+        number = len([meta for meta in self._footnote_meta_by_label.values()
+                      if meta['kind'] == 'marker']) + 1
+        return self._unique_footnote_label('fn%d' % number)
+
+    def _register_footnote_meta(self, el, marker, scope, kind):
+        el_id = (el.get('id') or '').strip()
+        if el_id:
+            base = _sanitize_footnote_label(el_id)
+        elif kind == 'marker':
+            base = self._next_marker_label()
+        elif marker:
+            base = _sanitize_footnote_label(marker)
+        else:
+            base = 'note'
+        label = self._unique_footnote_label(base)
+        meta = {
+            'label': label,
+            'el': el,
+            'marker': marker,
+            'scope': scope,
+            'kind': kind,
+        }
+        self._footnote_meta_by_label[label] = meta
+        self._footnote_note_els.add(el)
+        if el_id:
+            self._footnote_anchor_meta.setdefault(el_id, meta)
+        if marker and (scope, marker) not in self._footnote_marker_meta:
+            self._footnote_marker_meta[(scope, marker)] = meta
+        return meta
+
+    def _associated_table(self, el):
+        """The table a marker-led note belongs to, else None (document scope)."""
+        table = el.find_parent('table')
+        if table is not None:
+            return table
+
+        def table_behind(node):
+            # Follow a chain of marker-note blocks back to the table they annotate
+            sibling = _prev_block_content_sibling(node)
+            while isinstance(sibling, Tag):
+                if sibling.name == 'table':
+                    return sibling
+                if sibling in self._footnote_note_els:
+                    sibling = _prev_block_content_sibling(sibling)
+                    continue
+                break
+            return None
+
+        found = table_behind(el)
+        if found is not None:
+            return found
+        # Notes wrapped in list/container elements still annotate the table
+        # immediately preceding that container
+        for ancestor in el.parents:
+            found = table_behind(ancestor)
+            if found is not None:
+                return found
+        return None
+
+    def _in_note_container(self, el):
+        for ancestor in el.parents:
+            classes = ancestor.get('class') or []
+            if any('note' in name.lower() or 'footnote' in name.lower()
+                   for name in classes):
+                return True
+        return False
+
+    def _has_table_or_note_context(self, el):
+        return (el.find_parent('table') is not None
+                or self._associated_table(el) is not None
+                or self._in_note_container(el))
+
+    def _is_marker_note(self, el):
+        """Whether a block element opens with a footnote/table-note marker."""
+        if el.name not in FOOTNOTE_NOTE_TAGS or _inside_footnote_def(el):
+            return False
+        text = el.get_text(strip=True)
+        marker = _footnote_marker(el)
+        if not marker or len(text) <= len(marker):
+            return False
+        if marker in FOOTNOTE_MARKER_SYMBOLS:
+            return self._has_table_or_note_context(el)
+        # Bare numeric/letter markers: ordinary list numbering must never be
+        # mistaken for a note, and a real note must sit next to its table.
+        if el.name == 'li':
+            return False
+        if not re.fullmatch(r'[0-9A-Za-z]{1,3}', marker):
+            return False
+        if text[len(marker)] not in ' .:：、)）':
+            return False
+        return bool(self._associated_table(el) or self._in_note_container(el))
+
+    def _collect_footnote_defs(self, soup):
+        # Explicit footnote containers/items, keyed by their id
+        for el in soup.find_all(_inside_footnote_def):
+            el_id = (el.get('id') or '').strip()
+            if el_id and el_id not in self._footnote_anchor_meta:
+                marker = _footnote_marker(el)
+                scope = self._note_scope_for(el)
+                self._register_footnote_meta(el, marker, scope, 'anchor')
+        for el in soup.find_all(FOOTNOTE_NOTE_TAGS):
+            el_id = (el.get('id') or '').strip()
+            if el_id and el_id not in self._footnote_anchor_meta and self._is_note_named(el):
+                marker = _footnote_marker(el)
+                scope = self._note_scope_for(el)
+                self._register_footnote_meta(el, marker, scope, 'anchor')
+        # Marker-led note clauses (e.g. a '*' paragraph under a rate table)
+        for el in soup.find_all(FOOTNOTE_NOTE_TAGS):
+            if el not in self._footnote_note_els and self._is_marker_note(el):
+                marker = _footnote_marker(el)
+                scope = self._note_scope_for(el)
+                if (scope, marker) not in self._footnote_marker_meta:
+                    self._register_footnote_meta(el, marker, scope, 'marker')
+
+    def _mark_referenced_notes(self, soup):
+        """Pre-scan references so only clauses actually cited leave the flow."""
+        for ref in soup.find_all('sup'):
+            if not _is_footnote_ref(ref):
+                continue
+            for label in self._labels_for_ref(ref):
+                meta = self._footnote_meta_by_label.get(label)
+                if meta is not None:
+                    self._footnote_suppress_els.add(meta['el'])
+
+    def _note_scope_for(self, el):
+        table = self._associated_table(el)
+        return id(table) if table is not None else None
+
+    # -- Footnote references -------------------------------------------------
+
+    def _ref_scope(self, el):
+        if self._footnote_rendering and self._footnote_render_scope is not None:
+            return self._footnote_render_scope
+        table = el.find_parent('table')
+        return id(table) if table is not None else None
+
+    def _lookup_marker(self, scope, marker):
+        meta = self._footnote_marker_meta.get((scope, marker))
+        if meta is None and scope is not None:
+            meta = self._footnote_marker_meta.get((None, marker))
+        return meta['label'] if meta is not None else None
+
+    def _record_unresolved(self, target, fallback, external=False):
+        self._footnote_unresolved[target] = {
+            'target': target,
+            'fallback': fallback,
+            'external': external,
+        }
+
+    def _labels_for_ref(self, el):
+        """All footnote labels an explicit reference can be confirmed to cite."""
+        labels = []
+        href = _footnote_ref_href(el)
+        if href is not None:
+            _, fragment = _split_href_fragment(href)
+            if fragment and fragment in self._footnote_anchor_meta:
+                labels.append(self._footnote_anchor_meta[fragment]['label'])
+            elif fragment:
+                label = self._lookup_marker(
+                    self._ref_scope(el), el.get_text(strip=True))
+                if label:
+                    labels.append(label)
+            return labels
+        marker = el.get_text(strip=True)
+        symbols = [symbol for symbol in FOOTNOTE_MARKER_SYMBOLS if symbol in marker]
+        # A single <sup> may carry several markers, each its own condition.
+        if len(symbols) > 1:
+            for symbol in symbols:
+                label = self._lookup_marker(self._ref_scope(el), symbol)
+                if label:
+                    labels.append(label)
+            return labels
+        label = self._lookup_marker(self._ref_scope(el), marker)
+        if label is None and symbols:
+            label = self._lookup_marker(self._ref_scope(el), symbols[0])
+        if label:
+            labels.append(label)
+        return labels
+
+    def _convert_footnote_ref(self, el, text):
+        text = (text or '').strip()
+        labels = self._labels_for_ref(el)
+        index = self._footnote_ref_index
+        self._footnote_ref_index += 1
+        items = []
+        if labels:
+            for label in labels:
+                items.append(('ref', label))
+                if label not in self._footnote_label_order:
+                    self._footnote_label_order.append(label)
+                self._footnote_referenced_labels.add(label)
+        else:
+            href = _footnote_ref_href(el)
+            fallback = text or href or ''
+            if href is not None:
+                page, _ = _split_href_fragment(href)
+                self._record_unresolved(href, fallback, external=bool(page))
+            else:
+                self._record_unresolved(el.get_text(strip=True), fallback)
+            items.append(('text', fallback))
+        self._footnote_ref_results[index] = items
+        return _footnote_token(index)
+
+    def _resolve_footnote_tokens(self, text):
+        def replace_token(match):
+            items = self._footnote_ref_results[int(match.group(1))]
+            return ''.join(
+                '[^%s]' % value if kind == 'ref' else value
+                for kind, value in items)
+        return re_footnote_token.sub(replace_token, text)
+
+    # -- Footnote section rendering ------------------------------------------
+
+    def _strip_leading_marker(self, text, marker):
+        stripped = text.lstrip()
+        # The marker may have been escaped during conversion (e.g. '*' -> '\\*')
+        pattern = r'^(?:\\)?' + re.escape(marker) + r'[ .:：、)）]*'
+        updated = re.sub(pattern, '', stripped, count=1)
+        return updated if updated else text
+
+    def _remove_backrefs(self, el):
+        for anchor in el.find_all('a', href=True):
+            href = anchor.get('href', '')
+            classes = anchor.get('class') or []
+            is_backref = (
+                any('backref' in name.lower() for name in classes)
+                or re.match(r'#(fn)?ref', href) is not None)
+            if is_backref:
+                anchor.replace_with('')
+
+    def _render_footnote_def(self, meta):
+        el = meta['el']
+        self._remove_backrefs(el)
+        self._footnote_rendering = True
+        self._footnote_render_scope = meta.get('scope')
+        if el.name == 'li':
+            rendered = ''.join(
+                self.process_element(child, parent_tags=set())
+                for child in el.children
+                if _is_block_content_element(child))
+        else:
+            rendered = self.process_element(el, parent_tags=set())
+        self._footnote_rendering = False
+        self._footnote_render_scope = None
+        rendered = rendered.strip()
+        if meta.get('marker'):
+            rendered = self._strip_leading_marker(rendered, meta['marker'])
+        rendered = self._resolve_footnote_tokens(rendered)
+        lines = rendered.split('\n')
+        if len(lines) > 1:
+            rendered = lines[0] + '\n' + '\n'.join(
+                ('    ' + line if line.strip() else line) for line in lines[1:])
+        return rendered
+
+    def _append_footnote_section(self, text):
+        text = self._resolve_footnote_tokens(text)
+        labels = [label for label in self._footnote_label_order
+                  if label in self._footnote_referenced_labels]
+        if not labels:
+            return text
+        blocks = []
+        for label in labels:
+            meta = self._footnote_meta_by_label[label]
+            blocks.append('[^%s]: %s' % (label, self._render_footnote_def(meta)))
+        return text.rstrip() + '\n\n' + '\n'.join(blocks) + '\n\n'
 
     def process_element(self, node, parent_tags=None):
         if isinstance(node, NavigableString):
@@ -234,6 +639,14 @@ class MarkdownConverter(object):
         # For the top-level element, initialize the parent context with an empty set.
         if parent_tags is None:
             parent_tags = set()
+
+        # Footnote clauses are rendered once in the footnote section; while that
+        # section is being rendered, the same elements must convert normally.
+        if (self.options['footnotes']
+                and not self._footnote_rendering
+                and isinstance(node, Tag)
+                and node in self._footnote_suppress_els):
+            return ''
 
         # Collect child elements to process, ignoring whitespace-only text elements
         # adjacent to the inner/outer boundaries of block elements.
@@ -321,6 +734,9 @@ class MarkdownConverter(object):
         convert_fn = self.get_conv_fn_cached(node.name)
         if convert_fn is not None:
             text = convert_fn(node, text, parent_tags=parent_tags)
+
+        if self.options['footnotes'] and self._footnote_ref_results:
+            text = self._resolve_footnote_tokens(text)
 
         return text
 
@@ -720,7 +1136,15 @@ class MarkdownConverter(object):
 
     convert_sub = abstract_inline_conversion(lambda self: self.options['sub_symbol'])
 
-    convert_sup = abstract_inline_conversion(lambda self: self.options['sup_symbol'])
+    _convert_sup_default = abstract_inline_conversion(
+        lambda self: self.options['sup_symbol'])
+
+    def convert_sup(self, el, text, parent_tags):
+        if (self.options['footnotes']
+                and '_noformat' not in parent_tags
+                and _is_footnote_ref(el)):
+            return self._convert_footnote_ref(el, text)
+        return self._convert_sup_default(el, text, parent_tags)
 
     def convert_table(self, el, text, parent_tags):
         return '\n\n' + text.strip() + '\n\n'

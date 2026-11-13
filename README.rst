@@ -132,6 +132,20 @@ escape_misc
   that sometimes have Markdown significance in text.
   Defaults to ``False``.
 
+footnotes
+  Resolve footnote and table-note references into Markdown footnotes.
+  When enabled (the default), an explicit ``<sup><a href="#id">…</a></sup>``
+  reference is linked to the clause carrying that id, while a bare marker
+  ``<sup>`` (such as ``*`` or ``1``) inside a table cell is linked to the
+  marker-led clause belonging to that table. Clauses are emitted once in a
+  trailing ``[^label]:`` footnote section, in first-reference order; the same
+  cell may carry several conditions and one clause may cite another. A bare
+  marker symbol is never treated as a source by itself: references whose
+  clause lives on another page or cannot be confirmed keep their original
+  link or text, and are reported on
+  ``MarkdownConverter.footnote_unresolved``. Set to ``False`` to keep the
+  previous ``<sup>`` behavior.
+
 keep_inline_images_in
   Images are converted to their alt-text when the images are located inside
   headlines or table cells. If some inline images should be converted to
