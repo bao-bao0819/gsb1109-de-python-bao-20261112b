@@ -41,6 +41,9 @@ except ImportError:
 from mrjob.py2 import PY2
 from mrjob.util import safeeval
 
+from mrjob.canonical import canonicalize
+from mrjob.canonical import decanonicalize
+
 
 try:
     import rapidjson
@@ -279,6 +282,63 @@ elif simplejson:
 else:
     JSONProtocol = StandardJSONProtocol
     JSONValueProtocol = StandardJSONValueProtocol
+
+
+class CanonicalJSONProtocol(object):
+    """Encode ``(key, value)`` as a canonical JSON key and a plain JSON
+    value separated by a tab.
+
+    Use this as the internal (or output) protocol when mappers written in
+    different languages feed the same reducer. Keys that mean the same
+    thing -- ``1`` versus ``1.0``, or an object whose members are in a
+    different order -- are normalized to identical bytes before the
+    shuffle, so Hadoop groups them together. Arrays keep their order, and
+    booleans never compare equal to numbers.
+
+    The normalization rules live in :py:mod:`mrjob.canonical`; every
+    mapper language has to implement the same rules. Keys that cannot be
+    normalized safely (duplicate object members, numbers beyond source
+    precision) raise a
+    :py:class:`~mrjob.canonical.CanonicalKeyError` at write time instead
+    of silently landing in the wrong group.
+    """
+
+    _last_key_encoded = None
+    _last_key_decoded = None
+
+    def read(self, line):
+        raw_key, raw_value = line.split(b'\t', 1)
+
+        if raw_key != self._last_key_encoded:
+            self._last_key_encoded = raw_key
+            self._last_key_decoded = decanonicalize(raw_key)
+
+        if PY2:
+            value = json.loads(raw_value)
+        else:
+            value = json.loads(raw_value.decode('utf_8'))
+
+        return (self._last_key_decoded, value)
+
+    def write(self, key, value):
+        if PY2:
+            raw_value = json.dumps(value)
+        else:
+            raw_value = json.dumps(value).encode('utf_8')
+
+        return canonicalize(key) + b'\t' + raw_value
+
+
+class CanonicalJSONValueProtocol(object):
+    """Like :py:class:`CanonicalJSONProtocol`, but for jobs that shuffle
+    on a single canonical JSON value (the key is read in as ``None``).
+    """
+
+    def read(self, line):
+        return (None, decanonicalize(line))
+
+    def write(self, key, value):
+        return canonicalize(value)
 
 
 class PickleProtocol(_KeyCachingProtocol):

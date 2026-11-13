@@ -366,6 +366,41 @@ read or write key-value pairs where the key and value are JSON-enoded bytes.
 
 See :py:mod:`mrjob.protocol` for the full list of protocols built-in to mrjob.
 
+Sharing a reducer across languages
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When a mapper written in another language shares one of your reducers,
+plain |JSONProtocol| keys are unreliable: the other language may write
+``1.0`` where Python writes ``1``, or order an object's members
+differently. Because Hadoop groups on raw bytes, those keys miss each
+other.
+
+Set the internal (or output) protocol to
+:py:class:`~mrjob.protocol.CanonicalJSONProtocol`. Both sides then emit
+the same bytes for the same key: objects are sorted by member name,
+``1`` and ``1.0`` merge, while array order stays significant and
+booleans stay a category of their own::
+
+    from mrjob.protocol import CanonicalJSONProtocol
+
+    class MRSharedReducerJob(MRJob):
+
+        INTERNAL_PROTOCOL = CanonicalJSONProtocol
+
+The exact rules live in :py:mod:`mrjob.canonical`; hand the other
+language's author that module's docstring, since it is the whole
+contract. Roll the protocol out one batch at a time and keep
+not-yet-migrated batches in a separate key namespace, as shown in
+:file:`mrjob/examples/mr_canonical_key_groups.py`.
+
+Two kinds of legacy keys cannot be grouped safely: objects with
+duplicate members, and numbers that lost digits to double-precision
+rounding. Rather than guess, the protocol raises
+:py:class:`~mrjob.canonical.CanonicalKeyError`. Use
+:py:class:`~mrjob.canonical.Quarantine` with
+:py:func:`~mrjob.canonical.canonical_shuffle_key` to record the owning
+partition and re-process those records from the original data.
+
 .. rubric:: Footnotes
 
 .. [#py3] Experienced Pythonistas might notice that a ``str`` is a bytestring

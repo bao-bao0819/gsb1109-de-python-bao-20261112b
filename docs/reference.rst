@@ -5,6 +5,7 @@ Reference
     :maxdepth: 1
 
     utils-ami.rst
+    utils-canonical.rst
     utils-cat.rst
     cmd.rst
     utils-compat.rst

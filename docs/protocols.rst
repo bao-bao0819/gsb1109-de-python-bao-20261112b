@@ -64,6 +64,34 @@ JSON
 .. autoclass:: SimpleJSONValueProtocol
 .. autoclass:: StandardJSONValueProtocol
 
+Canonical JSON
+--------------
+Use these when mappers written in more than one language feed the same
+reducer. Plain JSON keys group on raw bytes, so ``1`` and ``1.0``, or an
+object with reordered members, land in different groups even though they
+mean the same thing. The canonical protocols normalize semantically equal
+keys to the same bytes before the shuffle.
+
+The normalization contract (shared by every mapper language) is:
+
+* object members are unordered; they are emitted sorted by Unicode
+  code point
+* arrays are ordered, so ``[1, 2]`` and ``[2, 1]`` stay separate
+* a missing field is simply absent; objects with the same present
+  fields group together
+* integers and whole-valued floats merge (``1`` == ``1.0``)
+* booleans are their own type: ``true`` never groups with ``1``
+* strings are RFC 8259 JSON text encoded as UTF-8
+
+Keys that cannot be normalized safely raise an error instead of grouping
+wrong: duplicate object members (parsers disagree on which wins) and
+numbers beyond source precision (distinct sources that rounding would
+collapse). See :py:mod:`mrjob.canonical` for the quarantine helpers that
+route such records back to their source partition.
+
+.. autoclass:: CanonicalJSONProtocol
+.. autoclass:: CanonicalJSONValueProtocol
+
 Repr
 ----
 .. autoclass:: ReprProtocol

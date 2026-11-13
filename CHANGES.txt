@@ -1,3 +1,17 @@
+v0.7.5 (unreleased)
+ * protocols:
+   * added CanonicalJSONProtocol and CanonicalJSONValueProtocol, which
+     normalize semantically equal JSON keys (1 vs 1.0, reordered object
+     members) to identical bytes so mappers in different languages can
+     share a reducer; array order stays significant and booleans stay
+     their own type
+   * new mrjob.canonical module implementing the canonical-json/1 key
+     protocol, including Quarantine and canonical_shuffle_key() to route
+     keys with duplicate object members or lost source precision back to
+     their source partition
+   * new mrjob/examples/mr_canonical_key_groups.py showing per-batch
+     rollout of the canonical protocol
+
 v0.7.4, 2020-09-17 -- Docker, concurrent steps, and pooling
  * library requirement changes:
    * [emr] requires boto3>=1.10.0, botocore>=1.13.26 (#2193)
