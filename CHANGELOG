@@ -2,6 +2,14 @@
 Changelog
 =========
 
+Unreleased
+----------
+ - Added pofile_mofile_mismatches() and the POFileEntryMismatch class to
+   verify the keys and translations reachable at runtime in an mo file
+   against the source po/pot catalog, ignoring comments, occurrences,
+   wrapping, fuzzy and obsolete entries and treating empty translations as
+   runtime-equivalent to missing keys
+
 Version 1.2.0 (2023/02/23)
 --------------------------
  - Added setter for the fuzzy property

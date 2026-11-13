@@ -24,8 +24,9 @@ import io
 
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
-__all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+__all__ = ['pofile', 'POFile', 'POFileEntryMismatch', 'POEntry', 'mofile',
+           'MOFile', 'MOEntry', 'default_encoding', 'escape', 'unescape',
+           'detect_encoding', 'pofile_mofile_mismatches', ]
 
 
 # the default encoding to use when encoding cannot be detected
@@ -1829,4 +1830,206 @@ class _MOFileParser(object):
         if len(tup) == 1:
             return tup[0]
         return tup
+# }}}
+# runtime catalog verification {{{
+
+
+# Human readable labels for the differences reported below.
+_MISMATCH_LABELS = {
+    'missing': 'runtime key missing (only in source catalog)',
+    'unexpected': 'unexpected runtime key (absent from source catalog)',
+    'translation': 'translation differs',
+    'plural_branch': 'plural branch differs',
+}
+
+
+class POFileEntryMismatch(object):
+    """
+    Describe a single difference between an entry expected by a source
+    catalog (a po/pot file) and what is actually reachable at runtime in a
+    compiled catalog (an mo file).
+
+    Attributes:
+
+    ``key``
+        the runtime lookup key, i.e. the ``msgid`` prefixed with the
+        ``msgctxt`` and the ``\\x04`` separator when the entry has a context.
+
+    ``msgctxt``
+        the message context, or ``None``.
+
+    ``kind``
+        one of ``"missing"``, ``"unexpected"``, ``"translation"`` or
+        ``"plural_branch"``.
+
+    ``plural_index``
+        for ``"plural_branch"`` mismatches, the index of the plural branch
+        (``msgstr[N]``); ``None`` otherwise.
+
+    ``expected``
+        the value found in the source catalog, or the empty string when the
+        runtime key is unexpected.
+
+    ``actual``
+        the value found at runtime, or the empty string when the key or the
+        plural branch is missing.
+    """
+
+    def __init__(self, key, kind, expected='', actual='', msgctxt=None,
+                 plural_index=None):
+        self.key = key
+        self.kind = kind
+        self.expected = expected
+        self.actual = actual
+        self.msgctxt = msgctxt
+        self.plural_index = plural_index
+
+    def __unicode__(self):
+        details = 'key=%r' % self.key
+        if self.msgctxt is not None:
+            details += ', msgctxt=%r' % self.msgctxt
+        if self.plural_index is not None:
+            details += ', plural_index=%d' % self.plural_index
+        if self.kind in ('translation', 'plural_branch'):
+            details += ', expected=%r, actual=%r' % (self.expected,
+                                                      self.actual)
+        return '<POFileEntryMismatch: %s (%s)>' % (
+            _MISMATCH_LABELS[self.kind], details)
+
+    if PY3:
+        def __str__(self):
+            return self.__unicode__()
+    else:
+        def __str__(self):
+            return unicode(self).encode('utf-8')
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __eq__(self, other):
+        if not isinstance(other, POFileEntryMismatch):
+            return NotImplemented
+        return (self.key, self.kind, self.expected, self.actual,
+                self.msgctxt, self.plural_index) == (
+            other.key, other.kind, other.expected, other.actual,
+            other.msgctxt, other.plural_index)
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self):
+        return hash((self.key, self.kind, self.plural_index))
+
+
+def _runtime_index(catalog):
+    """
+    Index the entries of a catalog by the runtime lookup key, keeping only the
+    entries that are actually reachable once the catalog is compiled.
+    """
+    index = {}
+    for entry in catalog:
+        if entry.obsolete or getattr(entry, 'fuzzy', False):
+            # obsolete entries are dropped and fuzzy entries are excluded by
+            # msgfmt, so neither one is reachable at runtime
+            continue
+        index[entry.msgid_with_context] = entry
+    return index
+
+
+def pofile_mofile_mismatches(pofile, mofile):
+    """
+    Compare the entries expected by a source catalog (a po/pot file) with the
+    keys that are actually reachable at runtime in a compiled catalog (an mo
+    file) and return the list of differences.
+
+    Only runtime semantics are compared: comments, source references
+    (occurrences), flags and line wrapping are intentionally ignored, and
+    fuzzy or obsolete source entries are not expected to be shipped, so their
+    absence from the mo file is never reported as a missing key. Entries that
+    only differ by their ``msgctxt`` are treated as distinct keys.
+
+    An empty translation is runtime-equivalent to a missing key: in both
+    cases the gettext lookup falls back to the ``msgid``. This matters
+    because compilers disagree on whether empty translations are kept
+    (``msgfmt`` keeps them while a catalog compiled through
+    :meth:`~polib.POFile.save_as_mofile` drops them), so ignoring empty
+    translations guarantees that two byte-different but lookup-equivalent
+    packages always produce the same result. When a plural branch
+    disappears, the returned mismatch points at the missing ``msgstr[N]``
+    index through its ``plural_index`` attribute.
+
+    Arguments:
+
+    ``pofile``
+        a :class:`~polib.POFile` instance, or a path or content string
+        accepted by :func:`~polib.pofile`.
+
+    ``mofile``
+        a :class:`~polib.MOFile` instance, or a path or content string
+        accepted by :func:`~polib.mofile`.
+
+    Return a list of :class:`~polib.POFileEntryMismatch` instances; an empty
+    list means the runtime catalog exposes exactly the expected keys and
+    translations.
+    """
+    if isinstance(pofile, POFile):
+        source = pofile
+    else:
+        source = _pofile_or_mofile(pofile, 'pofile')
+    if isinstance(mofile, MOFile):
+        runtime = mofile
+    else:
+        runtime = _pofile_or_mofile(mofile, 'mofile')
+
+    source_entries = _runtime_index(source)
+    runtime_entries = _runtime_index(runtime)
+    mismatches = []
+
+    for key in sorted(source_entries):
+        src_entry = source_entries[key]
+        rt_entry = runtime_entries.get(key)
+        rt_plurals = rt_entry.msgstr_plural if rt_entry is not None else {}
+        if src_entry.msgstr_plural or rt_plurals:
+            src_plurals = src_entry.msgstr_plural
+            for index in sorted(set(src_plurals) | set(rt_plurals)):
+                expected = src_plurals.get(index, '')
+                actual = rt_plurals.get(index, '')
+                # an empty branch is runtime-equivalent to an absent branch
+                if expected == actual:
+                    continue
+                mismatches.append(POFileEntryMismatch(
+                    key, 'plural_branch', expected=expected, actual=actual,
+                    msgctxt=src_entry.msgctxt, plural_index=index))
+        else:
+            expected = src_entry.msgstr
+            actual = rt_entry.msgstr if rt_entry is not None else ''
+            # an empty translation is runtime-equivalent to a missing key
+            if expected == actual:
+                continue
+            if rt_entry is None and actual == '':
+                kind = 'missing'
+            else:
+                kind = 'translation'
+            mismatches.append(POFileEntryMismatch(
+                key, kind, expected=expected, actual=actual,
+                msgctxt=src_entry.msgctxt))
+
+    for key in sorted(runtime_entries):
+        if key in source_entries:
+            continue
+        rt_entry = runtime_entries[key]
+        # an empty translation behaves like an absent key at runtime
+        if rt_entry.msgstr_plural:
+            if not any(rt_entry.msgstr_plural.values()):
+                continue
+        elif rt_entry.msgstr == '':
+            continue
+        mismatches.append(POFileEntryMismatch(
+            key, 'unexpected', actual=rt_entry.msgstr,
+            msgctxt=rt_entry.msgctxt))
+
+    return mismatches
 # }}}

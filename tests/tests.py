@@ -3,6 +3,7 @@
 
 import codecs
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -875,6 +876,215 @@ msgid "foo"
 msgstr "oof"
 ''')
         self.assertEqual(mo.__unicode__(), expected)
+
+
+def _swap_mo_endianness(binary):
+    _version, count = struct.unpack('<II', binary[4:12])
+    out = struct.pack('>I', polib.MOFile.MAGIC)
+    out += struct.pack('>iiiiii', *struct.unpack('<iiiiii', binary[4:28]))
+    out += struct.pack('>%di' % (4 * count),
+                       *struct.unpack('<%di' % (4 * count),
+                                      binary[28:28 + 16 * count]))
+    out += binary[28 + 16 * count:]
+    return out
+
+
+class TestPofileMofileMismatches(unittest.TestCase):
+    """
+    Tests for the runtime catalog verification helper.
+    """
+
+    def _source_po(self):
+        po = polib.POFile()
+        po.metadata = {
+            'Content-Type': 'text/plain; charset=UTF-8',
+            'Plural-Forms': 'nplurals=2; plural=(n != 1);',
+        }
+        po.append(polib.POEntry(
+            msgid='plain', msgstr='simple',
+            comment='translator comment', occurrences=[('src/app.py', 10)]))
+        po.append(polib.POEntry(msgctxt='ctx-a', msgid='same', msgstr='ta'))
+        po.append(polib.POEntry(msgctxt='ctx-b', msgid='same', msgstr='tb'))
+        po.append(polib.POEntry(msgid='fuzzy', msgstr='stale',
+                                flags=['fuzzy']))
+        po.append(polib.POEntry(msgid='obsolete', msgstr='gone',
+                                obsolete=True))
+        po.append(polib.POEntry(msgid='untranslated', msgstr=''))
+        po.append(polib.POEntry(
+            msgid='apple', msgid_plural='apples',
+            msgstr_plural={0: 'one apple', 1: 'many apples'}))
+        return po
+
+    def test_matching_catalogs_have_no_mismatch(self):
+        po = self._source_po()
+        mo = polib.mofile(po.to_binary())
+        self.assertEqual(polib.pofile_mofile_mismatches(po, mo), [])
+
+    def test_comments_occurrences_and_wrapping_are_ignored(self):
+        po = self._source_po()
+        mo = polib.mofile(po.to_binary())
+        other = self._source_po()
+        entry = other.find('plain')
+        entry.comment = 'a brand new comment'
+        entry.occurrences = [('elsewhere.py', 99)]
+        # a wrapped msgstr parses back to the same logical string
+        wrapped = polib.pofile(u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+
+msgid "long"
+msgstr ""
+"part one "
+"part two"
+'''))
+        self.assertEqual(wrapped.find('long').msgstr, 'part one part two')
+        self.assertEqual(polib.pofile_mofile_mismatches(other, mo), [])
+
+    def test_fuzzy_and_obsolete_are_not_reported_missing(self):
+        po = self._source_po()
+        mo = polib.mofile(po.to_binary())
+        keys = [m.key for m in polib.pofile_mofile_mismatches(po, mo)]
+        self.assertNotIn('fuzzy', keys)
+        self.assertNotIn('obsolete', keys)
+
+    def test_contexts_are_distinct_keys(self):
+        po = self._source_po()
+        mo = polib.MOFile()
+        for entry in polib.mofile(po.to_binary()):
+            if entry.msgctxt != 'ctx-b':
+                mo.append(entry)
+        mismatches = polib.pofile_mofile_mismatches(po, mo)
+        self.assertEqual(len(mismatches), 1)
+        mismatch = mismatches[0]
+        self.assertEqual(mismatch.kind, 'missing')
+        self.assertEqual(mismatch.key, 'ctx-b\x04same')
+        self.assertEqual(mismatch.msgctxt, 'ctx-b')
+
+    def test_missing_runtime_key(self):
+        po = self._source_po()
+        po.append(polib.POEntry(msgid='later', msgstr='future'))
+        mo = polib.mofile(self._source_po().to_binary())
+        mismatches = polib.pofile_mofile_mismatches(po, mo)
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0].kind, 'missing')
+        self.assertEqual(mismatches[0].key, 'later')
+
+    def test_unexpected_runtime_key(self):
+        po = self._source_po()
+        mo = polib.mofile(po.to_binary())
+        mo.append(polib.MOEntry(msgid='leftover', msgstr='still shipped'))
+        mismatches = polib.pofile_mofile_mismatches(po, mo)
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0].kind, 'unexpected')
+        self.assertEqual(mismatches[0].key, 'leftover')
+
+    def test_translation_differs(self):
+        po = self._source_po()
+        po.find('plain').msgstr = 'changed'
+        mo = polib.mofile(self._source_po().to_binary())
+        mismatches = polib.pofile_mofile_mismatches(po, mo)
+        self.assertEqual(len(mismatches), 1)
+        mismatch = mismatches[0]
+        self.assertEqual(mismatch.kind, 'translation')
+        self.assertEqual(mismatch.expected, 'changed')
+        self.assertEqual(mismatch.actual, 'simple')
+
+    def test_missing_plural_branch_is_pinpointed(self):
+        po = self._source_po()
+        mo = polib.mofile(po.to_binary())
+        del mo.find('apple').msgstr_plural[1]
+        mismatches = polib.pofile_mofile_mismatches(
+            po, polib.mofile(mo.to_binary()))
+        self.assertEqual(len(mismatches), 1)
+        mismatch = mismatches[0]
+        self.assertEqual(mismatch.kind, 'plural_branch')
+        self.assertEqual(mismatch.key, 'apple')
+        self.assertEqual(mismatch.plural_index, 1)
+        self.assertEqual(mismatch.expected, 'many apples')
+        self.assertEqual(mismatch.actual, '')
+
+    def test_changed_and_extra_plural_branches(self):
+        po = self._source_po()
+        mo = polib.mofile(po.to_binary())
+        mo.find('apple').msgstr_plural[0] = 'UNE pomme'
+        mismatches = polib.pofile_mofile_mismatches(
+            po, polib.mofile(mo.to_binary()))
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0].plural_index, 0)
+        self.assertEqual(mismatches[0].actual, 'UNE pomme')
+
+        mo = polib.mofile(self._source_po().to_binary())
+        mo.find('apple').msgstr_plural[2] = 'extra branch'
+        mismatches = polib.pofile_mofile_mismatches(
+            self._source_po(), polib.mofile(mo.to_binary()))
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0].plural_index, 2)
+        self.assertEqual(mismatches[0].expected, '')
+        self.assertEqual(mismatches[0].actual, 'extra branch')
+
+    def test_byte_different_equivalent_packages_agree(self):
+        po = self._source_po()
+        mo_le = polib.mofile(po.to_binary())
+        mo_be = polib.mofile(_swap_mo_endianness(po.to_binary()))
+        self.assertNotEqual(po.to_binary(), _swap_mo_endianness(
+            po.to_binary()))
+        self.assertEqual(
+            polib.pofile_mofile_mismatches(po, mo_le),
+            polib.pofile_mofile_mismatches(po, mo_be))
+
+        rebuilt = self._source_po()
+        rebuilt.metadata['X-Rebuilt-By'] = 'another toolchain'
+        mo_rebuilt = polib.mofile(rebuilt.to_binary())
+        self.assertNotEqual(po.to_binary(), rebuilt.to_binary())
+        self.assertEqual(polib.pofile_mofile_mismatches(po, mo_rebuilt), [])
+
+    def test_empty_translation_kept_or_dropped_agrees(self):
+        po = self._source_po()
+        dropped = polib.mofile(po.to_binary())
+        kept = polib.MOFile()
+        for entry in po:
+            if entry.obsolete or entry.fuzzy:
+                continue
+            kept.append(polib.MOEntry(
+                msgid=entry.msgid, msgstr=entry.msgstr,
+                msgid_plural=entry.msgid_plural,
+                msgstr_plural=dict(entry.msgstr_plural),
+                msgctxt=entry.msgctxt))
+        self.assertNotEqual(len(kept), len(dropped))
+        self.assertEqual(
+            polib.pofile_mofile_mismatches(po, kept),
+            polib.pofile_mofile_mismatches(po, dropped))
+
+    def test_accepts_strings_and_instances(self):
+        po_text = u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+
+msgid "foo"
+msgstr "bar"
+''')
+        po = polib.pofile(po_text)
+        self.assertEqual(
+            polib.pofile_mofile_mismatches(po_text, po.to_binary()), [])
+        self.assertEqual(
+            polib.pofile_mofile_mismatches(po, polib.mofile(po.to_binary())),
+            [])
+
+    def test_mismatch_representation(self):
+        mismatch = polib.POFileEntryMismatch(
+            'apple', 'plural_branch', expected='many apples', actual='',
+            plural_index=1)
+        self.assertEqual(
+            mismatch,
+            polib.POFileEntryMismatch(
+                'apple', 'plural_branch', expected='many apples', actual='',
+                plural_index=1))
+        self.assertNotEqual(mismatch, polib.POFileEntryMismatch(
+            'apple', 'plural_branch', actual='x', plural_index=1))
+        self.assertIn('plural branch differs', str(mismatch))
+        self.assertIn("'apple'", repr(mismatch))
+        self.assertEqual(hash(mismatch), hash(polib.POFileEntryMismatch(
+            'apple', 'plural_branch', plural_index=1)))
 
 
 if __name__ == '__main__':

@@ -15,6 +15,12 @@ The ``mofile`` function
 .. autofunction:: polib.mofile
 
 
+The ``pofile_mofile_mismatches`` function
+-----------------------------------------
+
+.. autofunction:: polib.pofile_mofile_mismatches
+
+
 The ``detect_encoding`` function
 --------------------------------
 
@@ -58,6 +64,13 @@ The ``MOEntry`` class
 ---------------------
 
 .. autoclass:: polib.MOEntry
+    :members:
+
+
+The ``POFileEntryMismatch`` class
+---------------------------------
+
+.. autoclass:: polib.POFileEntryMismatch
     :members:
 
 
